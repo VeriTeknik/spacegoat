@@ -31,6 +31,21 @@ def test_an_existing_directory_is_never_changed_and_a_shared_one_is_refused(tmp_
     assert stat.S_IMODE(os.stat(private).st_mode) == 0o700
 
 
+def test_a_key_is_never_under_its_name_half_written(tmp_path, monkeypatch):
+    store = FileKeyStore(tmp_path / "hub.key")
+    seen = []
+    real_link = os.link
+
+    def watch(source, target):
+        # At the moment of installing, the complete key is already on disk under the temporary name.
+        seen.append((store.path.exists(), b"END PRIVATE KEY" in open(source, "rb").read()))
+        real_link(source, target)
+
+    monkeypatch.setattr(os, "link", watch)
+    store.create()
+    assert seen == [(False, True)]
+
+
 def test_a_failed_write_leaves_no_empty_key_behind(tmp_path, monkeypatch):
     store = FileKeyStore(tmp_path / "hub.key")
 
@@ -42,6 +57,7 @@ def test_a_failed_write_leaves_no_empty_key_behind(tmp_path, monkeypatch):
         store.create()
     monkeypatch.undo()
     assert not store.path.exists()
+    assert list(tmp_path.iterdir()) == []       # no temporary file left either
     store.create()
     store.load()
 

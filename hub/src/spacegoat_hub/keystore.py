@@ -59,21 +59,23 @@ class FileKeyStore:
         pem = Ed25519PrivateKey.generate().private_bytes(
             serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
         )
-        try:
-            # O_EXCL: created by this call or not at all; 0600 from the first byte.
-            descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            raise KeyStoreError(f"a key already exists at {self.path}") from None
+        # Written whole to a temporary file first, then installed under its name in one step. `os.link` fails if the
+        # name exists, so a key is still never replaced; and there is no moment at which a half-written key sits
+        # under the real name, however the process ends.
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
             with os.fdopen(descriptor, "wb") as handle:
                 handle.write(pem)
                 handle.flush()
                 os.fsync(handle.fileno())
+            try:
+                os.link(temporary, self.path)
+            except FileExistsError:
+                raise KeyStoreError(f"a key already exists at {self.path}") from None
             fsync_directory(directory)
-        except BaseException:
-            # An empty file would block both the next keygen and every load.
-            self.path.unlink(missing_ok=True)
-            raise
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def load(self) -> Ed25519PrivateKey:
         try:

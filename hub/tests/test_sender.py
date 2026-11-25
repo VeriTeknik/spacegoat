@@ -78,6 +78,8 @@ def test_a_lost_answer_is_sent_again_and_the_service_counts_duplicates(service, 
     assert outbox.last_acked() == 0 and service.last_seq == 2
     clock.offset += first.wait_seconds + 1
     assert sender.step().kind == "sent"
+    # The very same two events went again (not an empty request that happens to be answered with lastSeq 2).
+    assert [request["events"] for request in service.requests] == [[1, 2], [1, 2]]
     assert outbox.last_acked() == 2
     assert [event["sourceSeq"] for event in service.accepted] == [1, 2]   # each exactly once
 

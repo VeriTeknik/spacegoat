@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from spacegoat_hub.agent import Agent, load_config
 from spacegoat_hub.cli import main
 from spacegoat_hub.keystore import FileKeyStore
+from spacegoat_hub.signing import public_key_text
 
 from .fake_service import FakeService
 
@@ -48,6 +49,8 @@ def test_keygen_prints_the_public_key_and_never_the_private_one(tmp_path, capsys
     out = capsys.readouterr().out
     public = next(line.split()[-1] for line in out.splitlines() if "ed25519:" in line)
     Ed25519PublicKey.from_public_bytes(__import__("base64").urlsafe_b64decode(public.split(":")[1] + "="))
+    # It is the public half of the key that was written, not merely a well-formed key.
+    assert public == public_key_text(FileKeyStore(state / "hub.key").load())
     assert "hub-key-1" in out
     assert "PRIVATE" not in out and (state / "hub.key").read_text() not in out
     # A second keygen refuses: it would orphan a registered hub.
@@ -305,3 +308,8 @@ def test_the_installed_command_runs(tmp_path):
     env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
     done = subprocess.run([sys.executable, "-m", "spacegoat_hub", "--version"], capture_output=True, text=True, env=env)
     assert done.returncode == 0 and done.stdout.strip().startswith("spacegoat-hub ")
+    # And the console script the package declares, as it is installed beside this interpreter.
+    script = Path(sys.executable).parent / "spacegoat-hub"
+    assert script.exists(), "the project is not installed in this environment (run `uv sync`)"
+    installed = subprocess.run([str(script), "--version"], capture_output=True, text=True)
+    assert installed.returncode == 0 and installed.stdout == done.stdout

@@ -98,7 +98,7 @@ An event that has them carries three extra fields, all three or none:
 |---|---|
 | `pii` | an object with the personal fields the event kind allows |
 | `piiNonce` | 64 lowercase hex characters, fresh random for each event |
-| `piiCommitment` | `sha256hex(piiNonce + "|" + canonicalJson(pii))` |
+| `piiCommitment` | `sha256hex(piiNonce + "\|" + canonicalJson(pii))`, where the separator is one vertical bar character |
 
 Only the commitment is signed.
 The service keeps the personal data apart from the event and deletes it after its retention period; the event and its signature stay verifiable.
