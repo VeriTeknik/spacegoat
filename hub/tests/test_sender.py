@@ -128,6 +128,39 @@ def test_rate_limited_waits_as_long_as_it_is_told(service, outbox, vector_key):
     assert sender.step().kind == "sent"
 
 
+def test_retry_after_as_a_date_is_honoured_and_a_very_long_one_is_capped_at_an_hour(service, outbox, vector_key):
+    from email.utils import formatdate
+    fill(outbox, 1)
+    clock = Clock()
+    sender = make_sender(service, outbox, vector_key, clock)
+    later = formatdate(clock() + 90, usegmt=True)
+    service.script.append(("status", 429, {"error": "rate_limited"}, {"Retry-After": later}))
+    assert 88 <= sender.step().wait_seconds <= 91
+    clock.offset += 100
+    service.script.append(("status", 429, {"error": "rate_limited"}, {"Retry-After": "86400"}))
+    assert sender.step().wait_seconds == 3600
+
+
+def test_an_answer_cut_off_half_way_is_a_retry_not_a_crash(service, outbox, vector_key):
+    fill(outbox, 1)
+    sender = make_sender(service, outbox, vector_key)
+    service.script.append(("truncate",))
+    assert sender.step().kind == "retry_later"
+    assert outbox.last_acked() == 0
+
+
+def test_a_batch_stays_under_the_uncompressed_limit_too(service, outbox, vector_key, monkeypatch):
+    from spacegoat_hub import sender as sender_module
+    monkeypatch.setattr(sender_module, "MAX_UNCOMPRESSED_BYTES", 3000)
+    for _ in range(30):
+        outbox.append("site.device_appeared", AT, {**SEEN, "deviceClass": "printer"}, pii={"hostname": "a" * 200})
+    sender = make_sender(service, outbox, vector_key)
+    while outbox.pending(1):
+        assert sender.step().kind == "sent"
+    assert max(len(request["events"]) for request in service.requests) < 30
+    assert len(service.accepted) == 30
+
+
 def test_unavailable_backs_off_longer_each_time_up_to_five_minutes(service, outbox, vector_key):
     fill(outbox, 1)
     clock = Clock()

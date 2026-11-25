@@ -15,7 +15,6 @@ else can still say truthfully where it stood (`declare_reset`).
 from __future__ import annotations
 
 import json
-import os
 import secrets
 import sqlite3
 from pathlib import Path
@@ -25,7 +24,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from . import clock, signing
 from .canonical import canonical_json
-from .keystore import fsync_directory
+from .keystore import private_file
 
 RESET_REASONS = ("queue_lost", "reinstall")
 
@@ -41,9 +40,7 @@ class Outbox:
         self.key_id = key_id
         self._key = private_key
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if not self.path.exists():
-            os.close(os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
-            fsync_directory(self.path.parent)
+        private_file(self.path)
         # isolation_level=None: transactions are opened and closed here, explicitly.
         self._db = sqlite3.connect(self.path, isolation_level=None)
         self._db.execute("PRAGMA journal_mode=WAL")

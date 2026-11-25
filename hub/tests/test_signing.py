@@ -75,7 +75,9 @@ def test_a_malformed_nonce_is_refused(nonce):
 
 
 @pytest.mark.parametrize(
-    "observed_at", ["2026-11-24T10:00:00Z", "2026-11-24T13:00:00.000+03:00", "2026-11-24 10:00:00.000Z", ""]
+    "observed_at",
+    ["2026-11-24T10:00:00Z", "2026-11-24T13:00:00.000+03:00", "2026-11-24 10:00:00.000Z", "",
+     "2026-13-01T10:00:00.000Z", "2026-02-30T10:00:00.000Z", "2026-11-24T25:00:00.000Z", "٢٠٢٦-11-24T10:00:00.000Z"],
 )
 def test_observed_at_is_utc_with_milliseconds(observed_at):
     with pytest.raises(ValueError):

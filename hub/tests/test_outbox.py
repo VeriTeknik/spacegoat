@@ -72,7 +72,7 @@ def test_pending_from_a_sequence_and_with_a_limit(tmp_path, vector_key):
 
 def test_personal_data_travels_as_the_triple_and_only_its_commitment_is_signed(tmp_path, vector_key):
     outbox = open_outbox(tmp_path, vector_key)
-    pii = {"mac": "0200005e1001", "hostname": "printer.example", "ip": "192.0.2.10"}
+    pii = {"mac": "00005e005301", "hostname": "printer.example", "ip": "192.0.2.10"}
     outbox.append("site.device_appeared", AT, {**SEEN, "deviceClass": "printer"}, pii=pii)
     outbox.append("site.device_appeared", AT, {**SEEN, "deviceClass": "printer"}, pii=pii)
     first, second = outbox.pending(10)

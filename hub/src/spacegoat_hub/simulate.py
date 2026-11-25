@@ -2,8 +2,8 @@
 """A simulated network, for running the agent end to end before any real observer exists.
 
 It is the same shape a real observer has: each poll returns what is on the network right now. Nothing here touches
-a network interface. The addresses are documentation ranges and the hardware addresses are locally administered
-examples; the names are under `.example`.
+a network interface. Every address is from a documentation range: IPv4 192.0.2.0/24, and the hardware addresses
+00-00-5E-00-53-xx that RFC 7042 sets aside for documentation; the names are under `.example`.
 """
 from __future__ import annotations
 
@@ -23,10 +23,10 @@ class Sighting:
 
 
 _DEVICES = (
-    Sighting("sim:printer", "sim:lan", "printer", "0200005e1001", "printer.example", "192.0.2.10"),
-    Sighting("sim:laptop", "sim:lan", "user_device", "0200005e1002", "laptop.example", "192.0.2.21"),
-    Sighting("sim:plc", "sim:lan", "ot", "0200005e1003", None, "192.0.2.50"),
-    Sighting("sim:switch", "sim:lan", "network", "0200005e1004", "switch.example", "192.0.2.2"),
+    Sighting("sim:printer", "sim:lan", "printer", "00005e005301", "printer.example", "192.0.2.10"),
+    Sighting("sim:laptop", "sim:lan", "user_device", "00005e005302", "laptop.example", "192.0.2.21"),
+    Sighting("sim:plc", "sim:lan", "ot", "00005e005303", None, "192.0.2.50"),
+    Sighting("sim:switch", "sim:lan", "network", "00005e005304", "switch.example", "192.0.2.2"),
 )
 
 

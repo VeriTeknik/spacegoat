@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .keystore import fsync_directory
+from .keystore import fsync_directory, private_file
 
 
 def write_atomic(path: Path, text: str) -> None:
@@ -53,9 +53,7 @@ class Pseudonyms:
     """identity (how the hub recognises a device or a segment locally) -> the random reference it reports."""
 
     def __init__(self, path: Path) -> None:
-        if not path.exists():
-            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
-            fsync_directory(path.parent)
+        private_file(path)
         self._db = sqlite3.connect(path, isolation_level=None)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=FULL")
@@ -80,6 +78,14 @@ class Pseudonyms:
         """What the hub last reported about `identity` (empty before its first report)."""
         row = self._db.execute("SELECT facts FROM refs WHERE scope = ? AND identity = ?", (scope, identity)).fetchone()
         return json.loads(row[0]) if row else {}
+
+    def forget_facts(self) -> None:
+        """
+        Forget what was reported, keep the references. After a lost queue the hub cannot know which of its reports
+        reached the service: it reports every device again (the service takes a repeated report as an update of
+        the same device, because the reference is the same) rather than stay silent about one that never arrived.
+        """
+        self._db.execute("UPDATE refs SET facts = '{}'")
 
     def remember(self, scope: str, identity: str, facts: dict[str, Any]) -> None:
         self.ref(scope, identity)

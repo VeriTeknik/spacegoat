@@ -22,4 +22,4 @@ The bytes are stated here rather than in the file so that secret scanners do not
 The first four `events` entries are also pinned, with the same signatures, in the test suite of the hub service.
 An implementation that reproduces every `messageHex` and every `signature` agrees with the service byte for byte.
 
-The addresses in the vectors are documentation ranges (`192.0.2.0/24`) and a locally administered example address; the names are under `.example`.
+The addresses in the vectors are documentation ranges (`192.0.2.0/24`, and hardware addresses `00-00-5E-00-53-xx`, RFC 7042); the names are under `.example`.

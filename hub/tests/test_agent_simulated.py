@@ -217,6 +217,37 @@ def test_the_reset_uses_the_number_the_service_holds_not_the_hubs_own_memory(hub
     assert second.status()["halted"] is None
 
 
+def test_after_a_lost_queue_every_device_is_reported_again_under_the_same_reference(hub):
+    # Reports that sat in the lost queue never reached the service. The hub cannot know which, so it tells all again.
+    first = run_simulated(hub["config"], steps=6)
+    before = {e["attributes"]["deviceRef"] for e in hub["service"].accepted if e["kind"] == "site.device_appeared"}
+    assert len(before) == 4
+    first.close()
+    for leftover in hub["state"].glob("outbox.sqlite*"):
+        leftover.unlink()
+    mark = len(hub["service"].accepted)
+    run_simulated(hub["config"], steps=6)
+    again = [e for e in hub["service"].accepted[mark:] if e["kind"] == "site.device_appeared"]
+    assert {e["attributes"]["deviceRef"] for e in again} == before
+
+
+def test_state_files_that_became_readable_by_others_are_closed_again(hub):
+    run_simulated(hub["config"], steps=3).close()
+    for name in ("outbox.sqlite", "pseudonyms.sqlite"):
+        os.chmod(hub["state"] / name, 0o644)
+    run_simulated(hub["config"], steps=1).close()
+    for name in ("outbox.sqlite", "pseudonyms.sqlite", "confirmed.json", "agent.json", "hub.key"):
+        assert (hub["state"] / name).stat().st_mode & 0o077 == 0, name
+
+
+def test_a_second_agent_on_the_same_state_directory_refuses_to_start(hub):
+    first = run_simulated(hub["config"], steps=1)
+    with pytest.raises(ValueError, match="already running"):
+        Agent(load_config(hub["config"]), simulate=True)
+    first.close()
+    Agent(load_config(hub["config"]), simulate=True).close()
+
+
 def test_everything_lost_is_declared_as_a_reinstall(hub):
     first = run_simulated(hub["config"], steps=5)
     held = hub["service"].last_seq
@@ -236,7 +267,7 @@ def test_what_an_observer_hands_over_is_checked_before_it_is_signed(hub, monkeyp
     class Odd:
         def poll(self):
             return [Sighting("odd:1", "odd:lan", "toaster", "02:00:5E:10:01:AA", "bad\x00name", "999.1.1.1"),
-                    Sighting("odd:2", "odd:lan", "printer", "0200005e1002", "x" * 300, "2001:DB8::1"),
+                    Sighting("odd:2", "odd:lan", "printer", "00005e005302", "x" * 300, "2001:DB8::1"),
                     Sighting("odd:3", "odd:lan", "iot", None, "caf\udce9", None)]
 
     monkeypatch.setattr(agent_module, "SimulatedObserver", Odd)
@@ -244,7 +275,7 @@ def test_what_an_observer_hands_over_is_checked_before_it_is_signed(hub, monkeyp
     appeared = [e for e in hub["service"].accepted if e["kind"] == "site.device_appeared"]
     assert [e["attributes"]["deviceClass"] for e in appeared] == ["unknown", "printer", "iot"]
     assert "pii" not in appeared[0]                                   # nothing of it was fit to send
-    assert appeared[1]["pii"] == {"mac": "0200005e1002", "ip": "2001:db8::1"}
+    assert appeared[1]["pii"] == {"mac": "00005e005302", "ip": "2001:db8::1"}
     assert "pii" not in appeared[2]
     assert agent.status()["halted"] is None
 

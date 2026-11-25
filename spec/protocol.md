@@ -128,7 +128,7 @@ Content-Encoding: gzip
       "kind": "site.device_appeared",
       "observedAt": "2026-11-24T10:00:00.123Z",
       "attributes": { "trustOrigin": "hub", "deviceRef": "<uuid v4>", "segmentRef": "<uuid v4>", "deviceClass": "printer" },
-      "pii": { "mac": "0200005e1001", "hostname": "printer.example", "ip": "192.0.2.10" },
+      "pii": { "mac": "00005e005301", "hostname": "printer.example", "ip": "192.0.2.10" },
       "piiNonce": "<64 hex>",
       "piiCommitment": "<64 hex>",
       "signature": "ed25519:<keyId>:<base64url>"

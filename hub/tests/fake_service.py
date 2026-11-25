@@ -78,6 +78,13 @@ class FakeService:
         record = {"headers": dict(handler.headers), "bytes": len(raw), "events": None}
         self.requests.append(record)
         step = self.script.pop(0) if self.script else None
+        if step and step[0] == "truncate":
+            handler.send_response(200)
+            handler.send_header("Content-Length", "500")
+            handler.end_headers()
+            handler.wfile.write(b'{"accepted": 1')
+            handler.connection.close()
+            return None
         if step and step[0] == "status":
             return self._reply(handler, step[1], step[2], step[3] if len(step) > 3 else None)
         headers = handler.headers

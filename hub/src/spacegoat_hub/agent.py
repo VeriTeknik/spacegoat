@@ -18,13 +18,21 @@ service refuses a request whose time is off by more than five minutes). And wher
 sequence: a hub that finds its own queue empty while the service holds a history declares that, as a reset, with
 the number the service gave; it never starts over as if nothing had happened.
 
+One agent runs on one state directory: a second one would hand out a second set of references and write into the
+same sequence. The agent holds a lock on the directory for as long as it runs and a second one refuses to start.
+
+The rule for devices whose identity keeps changing (protocol §9, the seven days) belongs to the real observers and
+is not in this version; the simulated network has only devices with lasting addresses.
+
 A halted agent observes nothing and appends nothing: a queue that grows while nothing can be delivered only makes
 the eventual backlog older than the service will accept.
 """
 from __future__ import annotations
 
+import fcntl
 import ipaddress
 import json
+import os
 import re
 import tomllib
 from collections.abc import Callable
@@ -89,6 +97,7 @@ class Agent:
         self._now = now
         self._observer = SimulatedObserver()
         key = FileKeyStore(config.state_dir / "hub.key").load()
+        self._lock = _lock_state_dir(config.state_dir)
         self._confirmed = Confirmed(config.state_dir / "confirmed.json")
         outbox_path = config.state_dir / "outbox.sqlite"
         self._outbox = Outbox(outbox_path, source_id=config.source_id, key_id=config.key_id, private_key=key)
@@ -104,6 +113,7 @@ class Agent:
     def close(self) -> None:
         self._outbox.close()
         self._pseudonyms.close()
+        os.close(self._lock)
 
     def tick(self) -> None:
         moment = self._now()
@@ -142,6 +152,7 @@ class Agent:
             # holds; the service records it and a person is told.
             reason = "queue_lost" if self._confirmed.read() > 0 else "reinstall"
             self._outbox.declare_reset(last_acked_seq=int(outcome.detail), reason=reason)
+            self._pseudonyms.forget_facts()
             self._confirmed.write(int(outcome.detail))
         elif outcome.kind != "sent":
             self._note(self._sender.problem or "service")
@@ -220,6 +231,17 @@ class Agent:
     def status(self) -> dict[str, Any]:
         counters = (self._outbox.last_assigned(), self._outbox.last_acked())
         return read_status(self._config, counters, halted=self._sender.halted, waiting_for=self._waiting_for)
+
+
+def _lock_state_dir(state_dir: Path) -> int:
+    """An exclusive lock for the life of the process (the kernel drops it when the process ends, however it ends)."""
+    descriptor = os.open(state_dir / "agent.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(descriptor)
+        raise ValueError(f"another agent is already running on {state_dir}") from None
+    return descriptor
 
 
 def _mac(value: str | None) -> str | None:

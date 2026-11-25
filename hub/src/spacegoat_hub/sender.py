@@ -20,6 +20,7 @@ and the last sequence number the service holds (`lastSeq`).
 from __future__ import annotations
 
 import gzip
+import http.client
 import json
 import math
 import time
@@ -41,6 +42,8 @@ INGEST_PATH = "/api/ops/evidence/ingest"
 HEARTBEAT_SECONDS = 240
 MAX_EVENTS = 500
 MAX_COMPRESSED_BYTES = 512 * 1024
+MAX_UNCOMPRESSED_BYTES = 4 * 1024 * 1024
+MAX_WAIT_SECONDS = 3600
 BACKOFF_FIRST_SECONDS = 5
 BACKOFF_MAX_SECONDS = 300
 REQUEST_TIMEOUT_SECONDS = 30
@@ -128,7 +131,7 @@ class Sender:
             self._batch_limit = max(1, len(events) // 2)
             return SendOutcome("retry_now")
         if status == 429:
-            return self._wait(_retry_after(headers))
+            return self._wait(_retry_after(headers, now))
         if error in HALT_ERRORS and status in (400, 409):
             return self._halt(str(error))
         # 5xx and anything this version does not know: the service's trouble, not a reason to stop for good.
@@ -137,8 +140,10 @@ class Sender:
     def _fit(self, events: list[dict]) -> tuple[bytes | None, list[dict]]:
         """The largest prefix of `events` whose compressed body is within the limit. One event that is not: None."""
         while True:
-            body = gzip.compress(canonical_json({"schemaVersion": 1, "events": events}).encode("utf-8"), mtime=0)
-            if len(body) <= self._max_bytes:
+            plain = canonical_json({"schemaVersion": 1, "events": events}).encode("utf-8")
+            body = gzip.compress(plain, mtime=0)
+            # Both limits: a batch that compresses well can be small on the wire and still too large once opened.
+            if len(body) <= self._max_bytes and len(plain) <= MAX_UNCOMPRESSED_BYTES:
                 return body, events
             if len(events) <= 1:
                 return None, events
@@ -167,8 +172,9 @@ class Sender:
                 status, raw, headers = response.status, response.read(MAX_ANSWER_BYTES), dict(response.headers)
         except urllib.error.HTTPError as error:
             status, raw, headers = error.code, error.read(MAX_ANSWER_BYTES), dict(error.headers)
-        except (urllib.error.URLError, OSError, TimeoutError):
-            # No answer: the request may or may not have arrived. Sending the same bytes again is always safe.
+        except (urllib.error.URLError, http.client.HTTPException, OSError, TimeoutError):
+            # No answer, or half of one: the request may or may not have arrived. Sending the same bytes again is
+            # always safe.
             return None, {}, {}
         self._read_clock(headers, now)
         return status, _json_object(raw), headers
@@ -227,9 +233,17 @@ def _json_object(raw: bytes) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _retry_after(headers: dict) -> int:
-    value = next((v for k, v in headers.items() if k.lower() == "retry-after"), "")
-    return max(1, min(3600, int(value))) if str(value).isdigit() else BACKOFF_FIRST_SECONDS
+def _retry_after(headers: dict, now: float) -> int:
+    """`Retry-After` as seconds or as an HTTP date. At most an hour: the hub owes a sign of life sooner than that."""
+    value = str(next((v for k, v in headers.items() if k.lower() == "retry-after"), "")).strip()
+    if value.isascii() and value.isdigit():
+        seconds = int(value)
+    else:
+        try:
+            seconds = math.ceil(parsedate_to_datetime(value).timestamp() - now)
+        except (TypeError, ValueError):
+            return BACKOFF_FIRST_SECONDS
+    return max(1, min(MAX_WAIT_SECONDS, seconds))
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):

@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import re
+from datetime import datetime
 from typing import Any
 
 from cryptography.hazmat.primitives import serialization
@@ -23,13 +24,25 @@ from .canonical import canonical_json
 
 EVENT_PREFIX = "vt-evidence-event/v1\n"
 REQUEST_PREFIX = "vt-machine/v1\n"
-OBSERVED_AT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z")
+# ASCII digits only: `\d` would also take digits of other scripts, which the service does not.
+OBSERVED_AT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z")
 KEY_ID = re.compile(r"[a-z0-9][a-z0-9-]{2,62}")
 NONCE_HEX = re.compile(r"[0-9a-f]{64}")
 
 
 def b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def is_observed_at(text: str) -> bool:
+    """The exact form, and a moment that exists: month 13 has the right shape and is still not a time."""
+    if not isinstance(text, str) or not OBSERVED_AT.fullmatch(text):
+        return False
+    try:
+        datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        return False
+    return True
 
 
 def pii_commitment(nonce_hex: str, pii: dict[str, Any]) -> str:
@@ -48,8 +61,8 @@ def event_signing_message(
     attributes: dict[str, Any],
     pii_commitment: str | None,
 ) -> bytes:
-    if not OBSERVED_AT.fullmatch(observed_at):
-        raise ValueError("observedAt must be UTC with millisecond precision, like 2026-11-24T10:00:00.123Z")
+    if not is_observed_at(observed_at):
+        raise ValueError("observedAt must be a real UTC time with millisecond precision, like 2026-11-24T10:00:00.123Z")
     body = canonical_json({
         "sourceId": source_id,
         "sourceSeq": source_seq,

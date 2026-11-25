@@ -24,6 +24,20 @@ def fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
+def private_file(path: Path) -> None:
+    """
+    Create `path` for its owner only, or, if it exists, make sure it still is: the hub's state files hold personal
+    data (queued events, what was last seen of each device). A file of the hub's own that has become readable by
+    others is closed again, not trusted as it is.
+    """
+    if path.exists():
+        if stat.S_IMODE(os.stat(path).st_mode) & 0o077:
+            os.chmod(path, 0o600)
+        return
+    os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    fsync_directory(path.parent)
+
+
 class KeyStoreError(Exception):
     """A key store fault. Its message never carries key material."""
 
