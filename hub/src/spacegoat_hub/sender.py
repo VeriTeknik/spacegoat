@@ -171,7 +171,11 @@ class Sender:
             with self._opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 status, raw, headers = response.status, response.read(MAX_ANSWER_BYTES), dict(response.headers)
         except urllib.error.HTTPError as error:
-            status, raw, headers = error.code, error.read(MAX_ANSWER_BYTES), dict(error.headers)
+            try:
+                status, raw, headers = error.code, error.read(MAX_ANSWER_BYTES), dict(error.headers)
+            except (http.client.HTTPException, OSError, TimeoutError):
+                # The status arrived and the body did not: half an answer is no answer.
+                return None, {}, {}
         except (urllib.error.URLError, http.client.HTTPException, OSError, TimeoutError):
             # No answer, or half of one: the request may or may not have arrived. Sending the same bytes again is
             # always safe.

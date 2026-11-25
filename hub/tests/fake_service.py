@@ -19,6 +19,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from spacegoat_hub import signing
+from spacegoat_hub.canonical import canonical_json
 
 PATH = "/api/ops/evidence/ingest"
 
@@ -33,7 +34,7 @@ class FakeService:
         self.last_seq = last_seq
         self.accepted: list[dict] = []
         # What is on record, by sequence number: a replay is compared with it, never taken on trust.
-        self._stored: dict[int, str] = {}
+        self._stored: dict[int, str] = {}   # sequence number -> the canonical text of the event on record
         self.requests: list[dict] = []
         # Each entry is consumed by one request: ("status", code, body, headers) answers without processing,
         # ("lose_answer",) processes the batch and then drops the connection, ("max_events", n) answers 413 above n.
@@ -78,6 +79,13 @@ class FakeService:
         record = {"headers": dict(handler.headers), "bytes": len(raw), "events": None}
         self.requests.append(record)
         step = self.script.pop(0) if self.script else None
+        if step and step[0] == "truncate_error":
+            handler.send_response(503)
+            handler.send_header("Content-Length", "500")
+            handler.end_headers()
+            handler.wfile.write(b'{"error": "unav')
+            handler.connection.close()
+            return None
         if step and step[0] == "truncate":
             handler.send_response(200)
             handler.send_header("Content-Length", "500")
@@ -117,7 +125,8 @@ class FakeService:
         duplicates = len(events) - len(fresh)
         for event in events:
             # A sequence number already on record must be the very event on record.
-            if event["sourceSeq"] <= self.last_seq and self._stored.get(event["sourceSeq"]) != event["signature"]:
+            # The whole event, not only its signature: a changed event under a reused signature is a conflict too.
+            if event["sourceSeq"] <= self.last_seq and self._stored.get(event["sourceSeq"]) != canonical_json(event):
                 return self._reply(handler, 409, {"error": "replay_conflict", "sourceSeq": event["sourceSeq"]})
         if fresh:
             first = fresh[0]
@@ -152,7 +161,7 @@ class FakeService:
             except InvalidSignature:
                 return self._reply(handler, 400, {"error": "schema"})
         self.accepted.extend(fresh)
-        self._stored.update({event["sourceSeq"]: event["signature"] for event in fresh})
+        self._stored.update({event["sourceSeq"]: canonical_json(event) for event in fresh})
         if fresh:
             self.last_seq = fresh[-1]["sourceSeq"]
         if step and step[0] == "lose_answer":

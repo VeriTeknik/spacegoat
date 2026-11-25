@@ -151,6 +151,38 @@ def test_an_answer_cut_off_half_way_is_a_retry_not_a_crash(service, outbox, vect
     assert outbox.last_acked() == 0
 
 
+def test_an_error_answer_cut_off_half_way_is_a_retry_too(service, outbox, vector_key):
+    fill(outbox, 1)
+    sender = make_sender(service, outbox, vector_key)
+    service.script.append(("truncate_error",))
+    assert sender.step().kind == "retry_later"
+    assert len(outbox.pending(10)) == 1 and sender.halted is None
+
+
+@pytest.mark.parametrize("reuse_signature", [False, True])
+def test_a_different_event_under_a_number_already_on_record_is_refused_by_the_service(
+    service, outbox, vector_key, tmp_path, reuse_signature
+):
+    import json
+    import sqlite3
+
+    fill(outbox, 1)
+    assert make_sender(service, outbox, vector_key).step().kind == "sent"
+    # A second queue for the same source, as a cloned or restored hub would have: its number 1 is another event.
+    clone = Outbox(tmp_path / "clone.sqlite", source_id=SOURCE, key_id="vector-key-1", private_key=vector_key)
+    clone.append("site.device_seen", "2026-11-25T11:11:11.000Z", SEEN)
+    if reuse_signature:
+        forged = {**clone.pending(1)[0], "signature": service.accepted[0]["signature"]}
+        clone.close()
+        with sqlite3.connect(tmp_path / "clone.sqlite") as connection:
+            connection.execute("UPDATE events SET body = ? WHERE seq = 1", (json.dumps(forged),))
+        clone = Outbox(tmp_path / "clone.sqlite", source_id=SOURCE, key_id="vector-key-1", private_key=vector_key)
+    sender = make_sender(service, clone, vector_key)
+    outcome = sender.step()
+    assert (outcome.kind, outcome.detail) == ("halted", "replay_conflict")
+    assert len(service.accepted) == 1 and len(clone.pending(10)) == 1
+
+
 def test_a_batch_stays_under_the_uncompressed_limit_too(service, outbox, vector_key, monkeypatch):
     from spacegoat_hub import sender as sender_module
     monkeypatch.setattr(sender_module, "MAX_UNCOMPRESSED_BYTES", 3000)

@@ -82,6 +82,15 @@ def test_a_failed_write_leaves_no_empty_key_behind(tmp_path, monkeypatch):
     store.load()
 
 
+def test_every_directory_keygen_creates_is_synced_into_its_parent(tmp_path, monkeypatch):
+    from spacegoat_hub import keystore
+    synced = []
+    real = keystore.fsync_directory
+    monkeypatch.setattr(keystore, "fsync_directory", lambda directory: (synced.append(directory), real(directory))[1])
+    FileKeyStore(tmp_path / "a" / "b" / "hub.key").create()
+    assert {tmp_path, tmp_path / "a", tmp_path / "a" / "b"} <= set(synced)
+
+
 def test_load_returns_the_key_that_was_created(tmp_path):
     store = FileKeyStore(tmp_path / "hub.key")
     store.create()

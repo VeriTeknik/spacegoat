@@ -59,8 +59,13 @@ class FileKeyStore:
                 # Whoever owns the directory can swap what is in it; the key would be theirs, not this user's.
                 raise KeyStoreError(f"{directory} belongs to another user")
         else:
+            # Each directory this call creates is synced into its parent: a key in a directory that a power cut
+            # removes again is a key the operator has already registered and the hub no longer has.
+            missing = [directory, *[p for p in directory.parents if not p.exists()]]
             directory.mkdir(parents=True, mode=0o700)
             os.chmod(directory, 0o700)
+            for created in missing:
+                fsync_directory(created.parent)
         pem = Ed25519PrivateKey.generate().private_bytes(
             serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
         )
