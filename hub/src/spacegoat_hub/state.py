@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
@@ -23,13 +24,17 @@ from .keystore import fsync_directory, private_file
 
 def write_atomic(path: Path, text: str) -> None:
     """Replace `path` so that a reader, or a power cut, sees the old content or the new, never half of one."""
-    temporary = path.with_name(path.name + ".tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    # mkstemp: an unpredictable name, created exclusively and 0600; never an existing file, never through a link.
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
     fsync_directory(path.parent)
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import stat
+import tempfile
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
@@ -51,8 +52,12 @@ class FileKeyStore:
         directory = self.path.parent
         if directory.exists():
             # Never change a directory this call did not create: it may be shared (`/tmp`, `/var/lib`).
-            if stat.S_IMODE(os.stat(directory).st_mode) & 0o077:
+            found = os.stat(directory)
+            if stat.S_IMODE(found.st_mode) & 0o077:
                 raise KeyStoreError(f"{directory} is open to other users; use one only the hub's user can enter")
+            if found.st_uid != os.geteuid():
+                # Whoever owns the directory can swap what is in it; the key would be theirs, not this user's.
+                raise KeyStoreError(f"{directory} belongs to another user")
         else:
             directory.mkdir(parents=True, mode=0o700)
             os.chmod(directory, 0o700)
@@ -62,15 +67,16 @@ class FileKeyStore:
         # Written whole to a temporary file first, then installed under its name in one step. `os.link` fails if the
         # name exists, so a key is still never replaced; and there is no moment at which a half-written key sits
         # under the real name, however the process ends.
-        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # mkstemp: a name nobody can predict, created exclusively (never an existing file, never through a link), 0600.
+        descriptor, name = tempfile.mkstemp(dir=directory, prefix=f".{self.path.name}.")
+        temporary = Path(name)
         try:
             with os.fdopen(descriptor, "wb") as handle:
                 handle.write(pem)
                 handle.flush()
                 os.fsync(handle.fileno())
             try:
-                os.link(temporary, self.path)
+                os.link(temporary, self.path, follow_symlinks=False)
             except FileExistsError:
                 raise KeyStoreError(f"a key already exists at {self.path}") from None
             fsync_directory(directory)
