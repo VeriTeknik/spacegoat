@@ -82,18 +82,9 @@ def test_a_lost_answer_is_sent_again_and_the_service_counts_duplicates(service, 
     assert [event["sourceSeq"] for event in service.accepted] == [1, 2]   # each exactly once
 
 
-def test_seq_gap_resends_from_where_the_service_stands(service, outbox, vector_key):
-    fill(outbox, 4)
-    sender = make_sender(service, outbox, vector_key)
-    service.script.append(("status", 409, {"error": "seq_gap", "expectedSeq": 3}))
-    assert sender.step().kind == "retry_now"
-    service.last_seq = 2                      # it had 1 and 2 already
-    assert sender.step().kind == "sent"
-    assert service.requests[-1]["events"] == [3, 4]
-    assert outbox.last_acked() == 4
-
-
-def test_seq_gap_for_events_the_hub_no_longer_has_halts(service, outbox, vector_key):
+def test_seq_gap_means_the_service_lost_events_and_halts(service, outbox, vector_key):
+    # The service can only ask for a number at or below what it already confirmed: it lost events. The hub has
+    # forgotten them, cannot send them again, and does not invent a sequence.
     fill(outbox, 3)
     outbox.ack(3)
     fill(outbox, 1)
@@ -165,7 +156,6 @@ def test_a_service_that_is_not_there_is_a_retry_not_a_crash(outbox, vector_key):
 
 @pytest.mark.parametrize(("status", "body", "reason"), [
     (400, {"error": "schema"}, "schema"),
-    (401, {"error": "unauthorized"}, "unauthorized"),
     (409, {"error": "replay_conflict", "sourceSeq": 1}, "replay_conflict"),
 ])
 def test_a_refusal_no_retry_can_fix_halts_and_keeps_the_events(service, outbox, vector_key, status, body, reason):
@@ -178,12 +168,91 @@ def test_a_refusal_no_retry_can_fix_halts_and_keeps_the_events(service, outbox, 
     assert len(outbox.pending(10)) == 2
 
 
-def test_a_wrong_key_is_refused_by_the_service_and_halts(service, outbox):
+def test_unauthorized_is_not_final_the_sender_says_so_and_tries_again_slowly(service, outbox):
+    # The service gives one answer for an unknown key and for a clock that is five minutes off. A clock corrects
+    # itself, so this must not stop the hub for good.
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    stranger = Ed25519PrivateKey.generate()
-    sender = Sender(base_url=service.base_url, source_id=SOURCE, key_id="vector-key-1", private_key=stranger,
-                    outbox=outbox, now=Clock())
-    assert (sender.step().kind, sender.halted) == ("halted", "unauthorized")
+    clock = Clock()
+    service.now = clock
+    sender = Sender(base_url=service.base_url, source_id=SOURCE, key_id="vector-key-1",
+                    private_key=Ed25519PrivateKey.generate(), outbox=outbox, now=clock)
+    outcome = sender.step()
+    assert (outcome.kind, outcome.wait_seconds) == ("retry_later", 300)
+    assert (sender.halted, sender.problem) == (None, "unauthorized")
+    assert sender.step().kind == "retry_later" and len(service.requests) == 1
+    clock.offset += 301
+    assert sender.step().kind == "retry_later" and len(service.requests) == 2
+
+
+def test_a_clock_that_is_off_is_measured_from_the_answer_and_recovers(service, outbox, vector_key):
+    hub_clock, service_clock = Clock(), Clock()
+    hub_clock.offset = -600                     # the hub is ten minutes behind
+    service.now = service_clock
+    sender = Sender(base_url=service.base_url, source_id=SOURCE, key_id="vector-key-1", private_key=vector_key,
+                    outbox=outbox, now=hub_clock)
+    assert sender.step().kind == "retry_later" and sender.problem == "unauthorized"
+    assert -602 <= sender.clock_skew_seconds <= -598
+    hub_clock.offset = 301                      # the clock was set; the wait is over
+    service_clock.offset = 301
+    assert sender.step().kind == "sent"
+    assert sender.problem is None and abs(sender.clock_skew_seconds) <= 2
+
+
+def test_a_redirect_is_never_followed(service, outbox, vector_key):
+    elsewhere = FakeService(source_id=SOURCE, key_id="vector-key-1", public_key=vector_key.public_key())
+    try:
+        fill(outbox, 2)
+        sender = make_sender(service, outbox, vector_key)
+        service.script.append(("status", 302, {}, {"Location": elsewhere.base_url + "/api/ops/evidence/ingest"}))
+        assert sender.step().kind == "retry_later"
+        assert elsewhere.requests == []          # the signed headers and the events went nowhere else
+        assert outbox.last_acked() == 0 and sender.halted is None
+    finally:
+        elsewhere.close()
+
+
+@pytest.mark.parametrize("body", [
+    {"lastSeq": 2}, {"accepted": 2, "duplicates": 0}, {"accepted": "2", "duplicates": 0, "lastSeq": 2},
+    {"accepted": 2, "duplicates": 0, "lastSeq": True}, {},
+])
+def test_a_200_that_is_not_the_services_answer_confirms_nothing(service, outbox, vector_key, body):
+    fill(outbox, 2)
+    sender = make_sender(service, outbox, vector_key)
+    service.script.append(("status", 200, body))
+    assert sender.step().kind == "retry_later"
+    assert outbox.last_acked() == 0 and len(outbox.pending(10)) == 2
+
+
+def test_an_answer_larger_than_the_cap_is_not_read_whole(service, outbox, vector_key):
+    fill(outbox, 1)
+    sender = make_sender(service, outbox, vector_key)
+    service.script.append(("status", 200, {"accepted": 1, "duplicates": 0, "lastSeq": 1, "pad": "x" * 200_000}))
+    assert sender.step().kind == "retry_later"   # cut off, so it is not valid JSON, so nothing is confirmed
+    assert outbox.last_acked() == 0
+
+
+def test_an_outbox_that_never_assigned_a_number_learns_where_the_service_stands(service, outbox, vector_key):
+    service.last_seq = 41
+    sender = make_sender(service, outbox, vector_key)
+    outcome = sender.step()
+    assert (outcome.kind, outcome.detail, sender.halted) == ("service_ahead", "41", None)
+    assert sender.service_last_seq == 41 and outbox.last_assigned() == 0
+
+
+@pytest.mark.parametrize("base_url", [
+    "http://hub.example", "http://localhost.evil.example", "http://127.0.0.1.evil.example:8080", "http://localhost@evil.example",
+    "https://user:pw@hub.example", "https://hub.example/prefix", "https://hub.example/?x=1", "https://hub.example/#f",
+    "ftp://hub.example", "https://", "hub.example", "https://hub.example:notaport",
+])
+def test_the_service_address_is_an_https_origin_and_nothing_else(outbox, vector_key, base_url):
+    with pytest.raises(ValueError):
+        Sender(base_url=base_url, source_id=SOURCE, key_id="vector-key-1", private_key=vector_key, outbox=outbox)
+
+
+@pytest.mark.parametrize("base_url", ["https://hub.example", "https://hub.example/", "https://hub.example:8443",
+                                      "http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080"])
+def test_accepted_service_addresses(outbox, vector_key, base_url):
+    Sender(base_url=base_url, source_id=SOURCE, key_id="vector-key-1", private_key=vector_key, outbox=outbox)
 
 
 def test_a_confirmation_ahead_of_the_hub_halts(service, outbox, vector_key):

@@ -14,7 +14,10 @@ MAX_SAFE_INTEGER = 2**53 - 1
 
 
 def _check(value: Any) -> None:
-    if value is None or isinstance(value, (str, bool)):
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, str):
+        _check_text(value)
         return
     if isinstance(value, int):
         if abs(value) > MAX_SAFE_INTEGER:
@@ -26,11 +29,19 @@ def _check(value: Any) -> None:
         return
     if isinstance(value, dict):
         for key, item in value.items():
-            if not isinstance(key, str) or not key.isascii() or not key.isprintable():
-                raise ValueError("object key must be printable ASCII text")
+            if not isinstance(key, str) or not key or not key.isascii() or not key.isprintable():
+                raise ValueError("object key must be non-empty printable ASCII text")
             _check(item)
         return
     raise ValueError(f"value of type {type(value).__name__} cannot be signed")
+
+
+def _check_text(text: str) -> None:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        # A lone surrogate (text decoded from bytes that were not UTF-8) has no UTF-8 form at all.
+        raise ValueError("text that is not valid Unicode cannot be signed") from None
 
 
 def canonical_json(value: Any) -> str:

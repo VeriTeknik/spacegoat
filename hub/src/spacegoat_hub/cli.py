@@ -61,18 +61,16 @@ def _run(args: argparse.Namespace) -> int:
 def _status(args: argparse.Namespace) -> int:
     try:
         config = load_config(args.config)
-        key = FileKeyStore(config.state_dir / "hub.key").load()
-    except (ValueError, KeyStoreError) as error:
+    except ValueError as error:
         print(str(error), file=sys.stderr)
         return 2
     try:
         saved = json.loads((config.state_dir / "agent.json").read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError):
         saved = {}
-    outbox_path = config.state_dir / "outbox.sqlite"
-    outbox = Outbox(outbox_path, source_id=config.source_id, key_id=config.key_id, private_key=key)
-    status = read_status(config, outbox, halted=saved.get("halted"), waiting_for=saved.get("waitingFor"))
-    outbox.close()
+    # Read-only: asking where the hub stands must not create a queue, take a lock from the agent or open the key.
+    counters = Outbox.read_counters(config.state_dir / "outbox.sqlite")
+    status = read_status(config, counters, halted=saved.get("halted"), waiting_for=saved.get("waitingFor"))
     print(json.dumps(status, indent=2))
     return 0
 

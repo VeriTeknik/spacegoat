@@ -18,6 +18,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .keystore import fsync_directory
+
 
 def write_atomic(path: Path, text: str) -> None:
     """Replace `path` so that a reader, or a power cut, sees the old content or the new, never half of one."""
@@ -28,6 +30,7 @@ def write_atomic(path: Path, text: str) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+    fsync_directory(path.parent)
 
 
 class Confirmed:
@@ -52,6 +55,7 @@ class Pseudonyms:
     def __init__(self, path: Path) -> None:
         if not path.exists():
             os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+            fsync_directory(path.parent)
         self._db = sqlite3.connect(path, isolation_level=None)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=FULL")

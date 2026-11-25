@@ -55,7 +55,7 @@ key_id    = "hub-key-1"
 state_dir = "/var/lib/spacegoat"
 ```
 
-Unknown keys are refused. `base_url` must be `https`.
+Unknown keys are refused. `base_url` is the service's origin only: `https`, a host and optionally a port; no path, query or credentials.
 
 ### 4. Run
 
@@ -79,6 +79,8 @@ All under `state_dir`, readable by its owner only:
 | `pseudonyms.sqlite` | Which random reference stands for which device, and what was last reported about it |
 | `agent.json` | Why the agent is waiting or halted |
 
+`keygen` creates the state directory for its owner only. It refuses a directory that other users can enter, and never changes the permissions of one that already exists.
+
 `pseudonyms.sqlite` holds what the hub last saw of each device, including its name and addresses.
 It is personal data: keep the state directory private, and take it with you if you move the hub to new hardware (the service then keeps recognising the same devices).
 
@@ -86,10 +88,15 @@ It is personal data: keep the state directory private, and take it with you if y
 
 - **No answer, or the service is down:** the same events are sent again later, with the same signatures. The service counts repeats; nothing is lost and nothing is recorded twice.
 - **Power cut:** an event is either fully in the queue or not there at all. The sequence continues without a gap.
-- **The queue is lost but `confirmed.json` is not:** the agent starts a new queue with a `site_source.reset` event that says where it stood. It never starts over silently.
-- **Everything is lost (a reinstall):** the service refuses the new sequence and the agent halts with `gap`. Declaring a reinstall is a deliberate step that this version does not automate.
-- **The service refuses a batch for good** (rejected content, unknown key, conflicting replay): the agent **halts** and makes no further request. Sending a refused batch for ever only buries the fault. `status` says why; after the fault is fixed, start the agent again and it continues from where it stood.
-- **The clock is not set:** nothing is produced. An event signed with a wrong time cannot be taken back.
+- **The queue is lost:** the agent asks the service where it stands and starts a new queue with a `site_source.reset` event at that number (`queue_lost` if it still remembers having been confirmed, `reinstall` if it remembers nothing). The service records it and a person is told. It never starts over silently.
+- **The service refuses a batch for good** (rejected content, a conflicting replay, a service that lost events): the agent **halts**. It makes no further request and produces no further events. Sending a refused batch for ever only buries the fault. `status` says why; after the fault is fixed, start the agent again and it continues from where it stood.
+- **`unauthorized`:** not final. The service gives that answer for an unknown key and for a clock more than five minutes off, and a clock corrects itself. The agent shows it in `status` and tries again every five minutes.
+- **The clock is wrong:** the agent's first request is an empty one; from the answer it learns the service's time. While its own clock is more than four minutes off (or not set at all), it produces nothing. An event signed with a wrong time cannot be taken back.
+- **A redirect, or an answer that is not the service's:** never followed, never taken as a confirmation.
+
+### Known limit
+
+The service refuses an event older than about 24.8 days. A hub that could not deliver for longer than that halts with `schema` when it reconnects, and this version cannot get past it by itself (see "Known gap in version 1" in the protocol).
 
 ## Layout
 

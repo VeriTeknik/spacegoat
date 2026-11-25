@@ -15,6 +15,15 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
+def fsync_directory(directory: Path) -> None:
+    """Make a file's creation or replacement in `directory` survive a power cut, not only its content."""
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 class KeyStoreError(Exception):
     """A key store fault. Its message never carries key material."""
 
@@ -25,8 +34,14 @@ class FileKeyStore:
 
     def create(self) -> None:
         """Generate a key. Never replaces one: a hub's key is its identity, and overwriting it orphans the hub."""
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.path.parent, 0o700)
+        directory = self.path.parent
+        if directory.exists():
+            # Never change a directory this call did not create: it may be shared (`/tmp`, `/var/lib`).
+            if stat.S_IMODE(os.stat(directory).st_mode) & 0o077:
+                raise KeyStoreError(f"{directory} is open to other users; use one only the hub's user can enter")
+        else:
+            directory.mkdir(parents=True, mode=0o700)
+            os.chmod(directory, 0o700)
         pem = Ed25519PrivateKey.generate().private_bytes(
             serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
         )
@@ -35,10 +50,16 @@ class FileKeyStore:
             descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
             raise KeyStoreError(f"a key already exists at {self.path}") from None
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(pem)
-            handle.flush()
-            os.fsync(handle.fileno())
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(pem)
+                handle.flush()
+                os.fsync(handle.fileno())
+            fsync_directory(directory)
+        except BaseException:
+            # An empty file would block both the next keygen and every load.
+            self.path.unlink(missing_ok=True)
+            raise
 
     def load(self) -> Ed25519PrivateKey:
         try:

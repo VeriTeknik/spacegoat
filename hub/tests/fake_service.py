@@ -12,6 +12,7 @@ import gzip
 import json
 import threading
 import time
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from cryptography.exceptions import InvalidSignature
@@ -31,6 +32,8 @@ class FakeService:
         self.source_id, self.key_id, self.public_key = source_id, key_id, public_key
         self.last_seq = last_seq
         self.accepted: list[dict] = []
+        # What is on record, by sequence number: a replay is compared with it, never taken on trust.
+        self._stored: dict[int, str] = {}
         self.requests: list[dict] = []
         # Each entry is consumed by one request: ("status", code, body, headers) answers without processing,
         # ("lose_answer",) processes the batch and then drops the connection, ("max_events", n) answers 413 above n.
@@ -43,6 +46,10 @@ class FakeService:
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_args):  # keep test output clean
                 pass
+
+            def date_time_string(self, timestamp=None):
+                # The Date header follows the service's clock, which a test may move.
+                return super().date_time_string(service.now() if timestamp is None else timestamp)
 
             def do_POST(self):  # noqa: N802
                 service._handle(self)
@@ -73,7 +80,10 @@ class FakeService:
         step = self.script.pop(0) if self.script else None
         if step and step[0] == "status":
             return self._reply(handler, step[1], step[2], step[3] if len(step) > 3 else None)
-        if handler.path != PATH or handler.headers.get("Content-Encoding") != "gzip" or handler.headers.get("Origin"):
+        headers = handler.headers
+        well_formed = (handler.path == PATH and headers.get("Content-Encoding") == "gzip" and not headers.get("Origin")
+                       and headers.get("Content-Type") == "application/json")
+        if not well_formed:
             return self._reply(handler, 400, {"error": "schema"})
         principal = handler.headers.get("X-VT-Principal", "")
         timestamp = handler.headers.get("X-VT-Timestamp", "")
@@ -82,7 +92,7 @@ class FakeService:
         try:
             if principal != f"source:{self.source_id}" or handler.headers.get("X-VT-Key-Id") != self.key_id:
                 raise InvalidSignature
-            if abs(self.now() - int(timestamp)) > 300:
+            if not (timestamp.isdigit() and len(timestamp) == 10) or abs(self.now() - int(timestamp)) > 300:
                 raise InvalidSignature
             self.public_key.verify(_unb64(handler.headers.get("X-VT-Signature", "")), message)
         except (InvalidSignature, ValueError):
@@ -98,10 +108,17 @@ class FakeService:
                                {"error": "too_large" if len(events) > limit else "schema"})
         fresh = [event for event in events if event["sourceSeq"] > self.last_seq]
         duplicates = len(events) - len(fresh)
+        for event in events:
+            # A sequence number already on record must be the very event on record.
+            if event["sourceSeq"] <= self.last_seq and self._stored.get(event["sourceSeq"]) != event["signature"]:
+                return self._reply(handler, 409, {"error": "replay_conflict", "sourceSeq": event["sourceSeq"]})
         if fresh:
             first = fresh[0]
             declares_gap = first["kind"] == "site_source.gap_declared"
             declared = declares_gap and first["attributes"]["fromSeq"] == self.last_seq + 1
+            reset_ok = first["kind"] != "site_source.reset" or first["attributes"].get("lastAckedSeq") == self.last_seq
+            if not reset_ok:
+                return self._reply(handler, 400, {"error": "schema"})
             if not declared and first["sourceSeq"] != self.last_seq + 1:
                 body = {"error": "seq_gap", "expectedSeq": self.last_seq + 1}
                 return self._reply(handler, 409, body)
@@ -116,7 +133,11 @@ class FakeService:
                 observed_at=event["observedAt"], attributes=event["attributes"],
                 pii_commitment=event.get("piiCommitment"))
             try:
-                if (scheme, key_id) != ("ed25519", self.key_id):
+                if (scheme, key_id) != ("ed25519", self.key_id) or event["attributes"].get("trustOrigin") != "hub":
+                    raise InvalidSignature
+                observed = datetime.strptime(event["observedAt"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+                # The service keeps the distance between observation and receipt in a signed 32-bit millisecond field.
+                if abs(self.now() - observed.timestamp()) * 1000 > 2**31 - 1:
                     raise InvalidSignature
                 self.public_key.verify(_unb64(signature), signed)
                 if "pii" in event and signing.pii_commitment(event["piiNonce"], event["pii"]) != event["piiCommitment"]:
@@ -124,6 +145,7 @@ class FakeService:
             except InvalidSignature:
                 return self._reply(handler, 400, {"error": "schema"})
         self.accepted.extend(fresh)
+        self._stored.update({event["sourceSeq"]: event["signature"] for event in fresh})
         if fresh:
             self.last_seq = fresh[-1]["sourceSeq"]
         if step and step[0] == "lose_answer":

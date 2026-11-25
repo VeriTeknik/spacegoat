@@ -48,6 +48,34 @@
         "t": "a\"b\\c/d"
       },
       "text": "{\"t\":\"a\\\"b\\\\c/d\"}"
+    },
+    {
+      "name": "control characters are escaped the short way where there is one",
+      "value": {
+        "t": "a\tb\nc\u0001d"
+      },
+      "text": "{\"t\":\"a\\tb\\nc\\u0001d\"}"
+    },
+    {
+      "name": "line separators U+2028 and U+2029 stay as they are",
+      "value": {
+        "t": "a b c"
+      },
+      "text": "{\"t\":\"a b c\"}"
+    },
+    {
+      "name": "text outside the basic plane stays as it is",
+      "value": {
+        "t": "🐐 goat"
+      },
+      "text": "{\"t\":\"🐐 goat\"}"
+    },
+    {
+      "name": "DEL stays as it is",
+      "value": {
+        "t": "ab"
+      },
+      "text": "{\"t\":\"ab\"}"
     }
   ],
   "events": [

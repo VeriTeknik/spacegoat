@@ -107,6 +107,7 @@ def test_stopping_mid_run_and_starting_again_loses_and_repeats_nothing(hub):
 def test_a_lost_outbox_is_declared_never_papered_over(hub):
     first = run_simulated(hub["config"], steps=8)
     confirmed = first.status()["lastAckedSeq"]
+    assert confirmed == hub["service"].last_seq
     first.close()
     for leftover in hub["state"].glob("outbox.sqlite*"):
         leftover.unlink()
@@ -143,11 +144,109 @@ def test_status_prints_counts_and_no_device(hub, capsys):
     assert "printer" not in out and "192.0.2" not in out and "0200" not in out
 
 
-def test_a_halted_agent_says_why_and_stays_halted_across_ticks(hub):
+def test_a_halted_agent_says_why_makes_no_request_and_produces_nothing_more(hub):
+    agent = run_simulated(hub["config"], steps=2)
+    hub["service"].script.append(("status", 400, {"error": "schema"}))
+    hub["service"].now = lambda: __import__("time").time() + 4 * 3600     # the next snapshot is due
+    agent._now = lambda: datetime.now(UTC) + timedelta(hours=4)
+    agent.tick()
+    assert agent.status()["halted"] == "schema"
+    requests, assigned = len(hub["service"].requests), agent.status()["lastAssignedSeq"]
+    for _ in range(5):
+        agent.tick()
+    # No knocking, and no queue growing behind a fault nothing can deliver past.
+    assert len(hub["service"].requests) == requests and agent.status()["lastAssignedSeq"] == assigned
+
+
+def test_unauthorized_does_not_stop_the_agent_for_good(hub):
     hub["service"].script.append(("status", 401, {"error": "unauthorized"}))
-    agent = run_simulated(hub["config"], steps=6)
-    assert agent.status()["halted"] == "unauthorized"
-    assert len(hub["service"].requests) == 1
+    agent = run_simulated(hub["config"], steps=3)
+    status = agent.status()
+    assert status["halted"] is None and status["waitingFor"] == "unauthorized"
+    assert status["lastAssignedSeq"] == 0          # nothing is produced before the service has answered
+    moved = {"by": 301}
+    agent._now = lambda: datetime.now(UTC) + timedelta(seconds=moved["by"])
+    hub["service"].now = lambda: __import__("time").time() + moved["by"]
+    agent.tick()
+    agent.tick()
+    assert agent.status()["waitingFor"] is None and hub["service"].accepted
+
+
+def test_a_clock_more_than_four_minutes_off_produces_nothing_until_it_is_right(hub):
+    off = {"seconds": -1800}                       # restored from the last shutdown, half an hour behind
+    agent = Agent(load_config(hub["config"]), simulate=True,
+                  now=lambda: datetime.now(UTC) + timedelta(seconds=off["seconds"]))
+    for _ in range(3):
+        agent.tick()
+    status = agent.status()
+    assert (status["waitingFor"], status["lastAssignedSeq"], status["halted"]) == ("clock", 0, None)
+    assert hub["service"].accepted == []
+    off["seconds"] = 301                           # the clock was set (and the slow retry is due)
+    hub["service"].now = lambda: __import__("time").time() + 301
+    for _ in range(3):
+        agent.tick()
+    assert agent.status()["waitingFor"] is None and hub["service"].accepted
+
+
+def test_status_never_creates_the_outbox_so_a_lost_one_is_still_recognised(hub, capsys):
+    first = run_simulated(hub["config"], steps=6)
+    confirmed = first.status()["lastAckedSeq"]
+    first.close()
+    for leftover in hub["state"].glob("outbox.sqlite*"):
+        leftover.unlink()
+    assert main(["status", "--config", str(hub["config"])]) == 0
+    assert not (hub["state"] / "outbox.sqlite").exists()
+    assert json.loads(capsys.readouterr().out)["lastAssignedSeq"] == 0
+    run_simulated(hub["config"], steps=4)
+    reset = next(event for event in hub["service"].accepted if event["kind"] == "site_source.reset")
+    assert reset["sourceSeq"] == confirmed + 1
+
+
+def test_the_reset_uses_the_number_the_service_holds_not_the_hubs_own_memory(hub):
+    # The last answer was lost: the service is one batch ahead of what the hub believes was confirmed.
+    first = run_simulated(hub["config"], steps=3)
+    first.close()
+    (hub["state"] / "confirmed.json").write_text('{"lastAckedSeq": 1}', encoding="utf-8")
+    for leftover in hub["state"].glob("outbox.sqlite*"):
+        leftover.unlink()
+    held = hub["service"].last_seq
+    assert held > 1
+    second = run_simulated(hub["config"], steps=4)
+    reset = next(event for event in hub["service"].accepted if event["kind"] == "site_source.reset")
+    assert (reset["sourceSeq"], reset["attributes"]["lastAckedSeq"]) == (held + 1, held)
+    assert second.status()["halted"] is None
+
+
+def test_everything_lost_is_declared_as_a_reinstall(hub):
+    first = run_simulated(hub["config"], steps=5)
+    held = hub["service"].last_seq
+    first.close()
+    for leftover in list(hub["state"].glob("outbox.sqlite*")) + [hub["state"] / "confirmed.json"]:
+        leftover.unlink()
+    second = run_simulated(hub["config"], steps=4)
+    reset = next(event for event in hub["service"].accepted if event["kind"] == "site_source.reset")
+    assert reset["attributes"] == {"trustOrigin": "hub", "lastAckedSeq": held, "reason": "reinstall"}
+    assert second.status()["halted"] is None
+
+
+def test_what_an_observer_hands_over_is_checked_before_it_is_signed(hub, monkeypatch):
+    from spacegoat_hub import agent as agent_module
+    from spacegoat_hub.simulate import Sighting
+
+    class Odd:
+        def poll(self):
+            return [Sighting("odd:1", "odd:lan", "toaster", "02:00:5E:10:01:AA", "bad\x00name", "999.1.1.1"),
+                    Sighting("odd:2", "odd:lan", "printer", "0200005e1002", "x" * 300, "2001:DB8::1"),
+                    Sighting("odd:3", "odd:lan", "iot", None, "caf\udce9", None)]
+
+    monkeypatch.setattr(agent_module, "SimulatedObserver", Odd)
+    agent = run_simulated(hub["config"], steps=3)
+    appeared = [e for e in hub["service"].accepted if e["kind"] == "site.device_appeared"]
+    assert [e["attributes"]["deviceClass"] for e in appeared] == ["unknown", "printer", "iot"]
+    assert "pii" not in appeared[0]                                   # nothing of it was fit to send
+    assert appeared[1]["pii"] == {"mac": "0200005e1002", "ip": "2001:db8::1"}
+    assert "pii" not in appeared[2]
+    assert agent.status()["halted"] is None
 
 
 def test_config_refuses_what_it_cannot_run_with(tmp_path):

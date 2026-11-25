@@ -24,7 +24,7 @@ def test_integers_stay_in_the_range_both_languages_agree_on():
         canonical_json(MAX_SAFE_INTEGER + 1)
 
 
-@pytest.mark.parametrize("key", ["ş", "a\nb", "tab\t", 1, None])
+@pytest.mark.parametrize("key", ["", "ş", "a\nb", "tab\t", 1, None])
 def test_object_keys_are_printable_ascii_text(key):
     with pytest.raises(ValueError):
         canonical_json({key: 1})
@@ -34,6 +34,11 @@ def test_object_keys_are_printable_ascii_text(key):
 def test_other_types_are_refused(value):
     with pytest.raises(ValueError):
         canonical_json(value)
+
+
+def test_text_that_is_not_unicode_is_refused_not_crashed_on():
+    with pytest.raises(ValueError):
+        canonical_json({"name": "caf\udce9"})
 
 
 def test_booleans_are_not_integers():

@@ -25,6 +25,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from . import clock, signing
 from .canonical import canonical_json
+from .keystore import fsync_directory
 
 RESET_REASONS = ("queue_lost", "reinstall")
 
@@ -42,6 +43,7 @@ class Outbox:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not self.path.exists():
             os.close(os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+            fsync_directory(self.path.parent)
         # isolation_level=None: transactions are opened and closed here, explicitly.
         self._db = sqlite3.connect(self.path, isolation_level=None)
         self._db.execute("PRAGMA journal_mode=WAL")
@@ -60,11 +62,41 @@ class Outbox:
                 raise OutboxError("this outbox belongs to another source")
             self._db.execute("COMMIT")
         except BaseException:
-            self._db.execute("ROLLBACK")
+            self._rollback()
             raise
 
     def close(self) -> None:
         self._db.close()
+
+    def _rollback(self) -> None:
+        # If the failure was the COMMIT itself, SQLite may already have rolled back; a second ROLLBACK then fails
+        # and would hide the error that matters.
+        try:
+            self._db.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+
+    @staticmethod
+    def read_counters(path: Path | str) -> tuple[int, int]:
+        """(last assigned, last confirmed) of the outbox at `path`, read-only; (0, 0) when there is none.
+
+        For `status`: it must not create the file (an empty outbox is how a lost one is recognised), take a write
+        lock away from the running agent, or need the private key.
+        """
+        if not Path(path).exists():
+            return 0, 0
+        connection = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True)
+        try:
+            rows = dict(connection.execute("SELECT key, value FROM meta").fetchall())
+        except sqlite3.Error:
+            return 0, 0
+        finally:
+            connection.close()
+        return int(rows.get("last_assigned", 0)), int(rows.get("last_acked", 0))
+
+    def oldest_pending_observed_at(self) -> str | None:
+        row = self._db.execute("SELECT body FROM events ORDER BY seq LIMIT 1").fetchone()
+        return None if row is None else json.loads(row[0])["observedAt"]
 
     def _meta(self, key: str) -> str | None:
         row = self._db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
@@ -108,14 +140,15 @@ class Outbox:
             self._db.execute("COMMIT")
             return seq
         except BaseException:
-            self._db.execute("ROLLBACK")
+            self._rollback()
             raise
 
     def declare_reset(self, *, last_acked_seq: int, reason: str) -> int:
         """
-        Start an empty outbox after a loss: the next event is `site_source.reset`, numbered right after what the
-        service last confirmed. Only an outbox that has never assigned a number may do this; a hub does not rewrite
-        a sequence it still holds.
+        Start an empty outbox after a loss: the next event is `site_source.reset`, numbered right after the last
+        sequence the SERVICE holds (the service accepts a reset only there, so the number is asked of the service,
+        never taken from the hub's own memory). Only an outbox that has never assigned a number may do this; a hub
+        does not rewrite a sequence it still holds.
         """
         if reason not in RESET_REASONS:
             raise OutboxError("unknown reset reason")
@@ -130,7 +163,7 @@ class Outbox:
             self._db.execute("COMMIT")
             return seq
         except BaseException:
-            self._db.execute("ROLLBACK")
+            self._rollback()
             raise
 
     def pending(self, limit: int, from_seq: int | None = None) -> list[dict[str, Any]]:
@@ -151,6 +184,6 @@ class Outbox:
                 self._set_meta("last_acked", str(last_seq))
             self._db.execute("COMMIT")
         except BaseException:
-            self._db.execute("ROLLBACK")
+            self._rollback()
             raise
 

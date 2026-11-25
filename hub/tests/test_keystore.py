@@ -17,6 +17,35 @@ def test_create_writes_a_key_only_its_owner_can_read(tmp_path):
     assert public_key_text(store.load()).startswith("ed25519:")
 
 
+def test_an_existing_directory_is_never_changed_and_a_shared_one_is_refused(tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o1777)
+    with pytest.raises(KeyStoreError, match="open to other users"):
+        FileKeyStore(shared / "hub.key").create()
+    assert stat.S_IMODE(os.stat(shared).st_mode) == 0o1777
+    assert not (shared / "hub.key").exists()
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    FileKeyStore(private / "hub.key").create()
+    assert stat.S_IMODE(os.stat(private).st_mode) == 0o700
+
+
+def test_a_failed_write_leaves_no_empty_key_behind(tmp_path, monkeypatch):
+    store = FileKeyStore(tmp_path / "hub.key")
+
+    def fail(_descriptor):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "fsync", fail)
+    with pytest.raises(OSError):
+        store.create()
+    monkeypatch.undo()
+    assert not store.path.exists()
+    store.create()
+    store.load()
+
+
 def test_load_returns_the_key_that_was_created(tmp_path):
     store = FileKeyStore(tmp_path / "hub.key")
     store.create()

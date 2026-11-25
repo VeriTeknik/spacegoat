@@ -27,7 +27,8 @@ Everything that is signed is signed over canonical JSON:
 - text is UTF-8 and is not escaped to ASCII (`"ş"` stays `"ş"`); `"` and `\` are escaped, `/` is not;
 - the only values are strings, integers, booleans, `null`, objects and arrays;
 - integers stay within ±(2^53 - 1);
-- object keys are printable ASCII.
+- object keys are non-empty printable ASCII;
+- text is valid Unicode (a lone surrogate has no UTF-8 form and is refused).
 
 A floating-point number has more than one spelling, so it is not allowed anywhere in a signed payload.
 An implementation refuses such a value; it does not round it.
@@ -60,6 +61,7 @@ Each event is signed over:
 ```
 
 - `observedAt` is UTC with millisecond precision and a literal `Z`: `2026-11-24T10:00:00.123Z`. No offset form is accepted.
+- `observedAt` must be within 2^31 - 1 milliseconds (about 24.8 days) of the moment the service receives the event, in either direction. An event outside that window is refused with `schema` (section 10).
 - `attributes` carries no personal data (section 6).
 - `piiCommitment` is `null` when the event has no personal data.
 
@@ -79,7 +81,9 @@ X-VT-Signature: base64url(Ed25519(
 
 - `path` is the request path including any query string.
 - `bodyBytes` are the exact bytes sent, that is, the compressed bytes when the body is compressed.
-- The timestamp must be within 300 seconds of the service's clock.
+- The timestamp is exactly ten digits and must be within 300 seconds of the service's clock.
+- Every answer carries a `Date` header; a hub compares it with its own clock (section 11).
+- A hub talks to one origin and never follows a redirect: the signed headers and the events would go with it.
 - No `Origin` header is sent.
 
 The signature binds the request to one hub, one endpoint, one moment and one body; it cannot be moved to another.
@@ -147,12 +151,15 @@ Four event kinds let a hub say what happened to its own sequence instead of hidi
 | Kind | When | Attributes |
 |---|---|---|
 | `site_source.gap_declared` | Events `fromSeq`..`toSeq` will never arrive | `fromSeq`, `toSeq`, `reason`: `operator` |
-| `site_source.reset` | The hub lost its queue or was reinstalled | `lastAckedSeq` (the last sequence the service confirmed), `reason`: `queue_lost` or `reinstall` |
+| `site_source.reset` | The hub lost its queue or was reinstalled | `lastAckedSeq`, `reason`: `queue_lost` or `reinstall` |
 | `site_source.input_lost` | The hub could not observe for a time | `reason`: `capture_stopped` or `capture_unreadable`, `toTime`, optional `fromTime` |
 | `site_source.event_dropped` | One event was refused for good and is replaced | `reason`: `operator`, `originalKind` |
 
 A `gap_declared` event carries the sequence number just after the gap.
-A `reset` event carries the next sequence number, as any other event does; the sequence does not restart.
+
+A `reset` event does not restart the sequence.
+Its `lastAckedSeq` must equal the last sequence number the **service** holds, and its own sequence number is that plus one; anything else is refused.
+A hub therefore asks before it declares: an empty request (section 7) is answered with `lastSeq`, and the hub uses that number, not its own memory of what was confirmed (the two differ whenever an answer was lost on the way back).
 Each of them is recorded and raises an alert for a person to look at. A hub never invents a sequence.
 
 All of them carry `trustOrigin: "hub"`.
@@ -197,22 +204,42 @@ A device with such an address starts as ephemeral; when the same address is seen
 |---|---|---|
 | 200 | `{ "accepted": n, "duplicates": m, "lastSeq": k }` | Forgets everything up to `k` |
 | 400 | `{ "error": "schema" }` | Stops sending and shows the fault locally; the answer never says which field |
-| 401 | `{ "error": "unauthorized" }` | Stops sending and shows the fault locally |
-| 409 | `{ "error": "seq_gap", "expectedSeq": k }` | Sends again from `k` |
+| 401 | `{ "error": "unauthorized" }` | Shows the fault locally and tries again slowly (every five minutes) |
+| 409 | `{ "error": "seq_gap", "expectedSeq": k }` | Stops sending: the service lost events it had confirmed |
 | 409 | `{ "error": "replay_conflict", "sourceSeq": s }` | Stops sending and shows the fault locally |
 | 413 | `{ "error": "too_large" }` | Splits the batch |
 | 429 | `{ "error": "rate_limited" }` with `Retry-After` | Waits |
 | 503 | `{ "error": "unavailable" }` | Backs off and tries again |
 
 An event the service has already accepted is counted in `duplicates` and changes nothing, so sending a batch again after a lost answer is always safe.
+The service compares a repeated event with the one it has on record; a different event under a number already used is a `replay_conflict`.
+
+`401` is the answer both for a key the service does not know and for a timestamp more than 300 seconds off.
+A clock corrects itself, so a hub does not treat `401` as final.
+
+A `200` confirms events only when it carries all three of `accepted`, `duplicates` and `lastSeq` as integers.
+Any other `200` (a proxy page, a captive portal) confirms nothing.
+
+`seq_gap` cannot ask for anything a hub still has: a hub forgets an event only after the service confirmed it, so the service can only be asking for events it lost.
 
 A hub that stops does not retry by itself: sending the same refused batch for ever only buries the fault.
 A person looks, and the hub continues from where it stood.
+A stopped hub also stops producing events: a queue that grows behind a fault only gets older.
+
+### Known gap in version 1
+
+An event is signed once and never changes, and the service refuses one older than about 24.8 days.
+A hub that could not deliver for longer than that therefore holds events the service will never take, and version 1 gives it no way to say so: the sequence kinds of section 8 carry only the reason `operator`.
+Until the protocol gains a reason for expired events, such a hub stops with `schema` and needs a person.
 
 ## 11. Liveness
 
 A hub sends at least one request every 300 seconds: a batch when it has events, a heartbeat otherwise.
 A hub that stays silent for three times that long raises an alert at the service.
+
+The first request of a run is a heartbeat.
+Its answer tells the hub two things it must not guess: the service's clock (`Date`) and where the service stands in the hub's sequence (`lastSeq`).
+A hub whose clock is more than a few minutes from the service's produces no events until it is right: an event signed with a wrong time cannot be taken back.
 
 ## 12. What a hub must not do
 
