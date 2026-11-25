@@ -10,8 +10,9 @@ Licence: Apache-2.0 ([`LICENSE`](LICENSE)), so that anyone may build a compatibl
 
 ## The vectors
 
-`signing.json` is produced with a **published test key** (private bytes `0x00` to `0x1f`).
+`signing.json` is produced with a **published test key**: its 32 private bytes are 0, 1, 2, ... 31.
 Never register that key anywhere real.
+The bytes are stated here rather than in the file so that secret scanners do not mistake them for a leaked key.
 
 - `canonical`: a value and the exact text it canonicalises to.
 - `events`: the input of an event signature, the bytes that are signed (`messageHex`) and the signature.

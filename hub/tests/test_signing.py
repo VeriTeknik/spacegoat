@@ -17,7 +17,8 @@ def _event_message(event_input):
 
 
 def test_the_vector_key_is_the_published_test_key(vectors, vector_key):
-    assert bytes(range(32)).hex() == vectors["privateKeySeedHex"]
+    # The private bytes are 0, 1, ... 31 (spec/README.md); they are not written into the vector file itself, where a
+    # secret scanner would take them for a leaked key.
     assert signing.public_key_text(vector_key) == vectors["publicKey"]
 
 

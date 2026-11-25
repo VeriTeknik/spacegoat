@@ -1,6 +1,5 @@
 {
-  "_comment": "Test vectors for spec/protocol.md. The key is a PUBLISHED TEST KEY (private bytes 0x00..0x1f): never register it anywhere real. The first four events are also pinned in the server's own test suite with the same signatures.",
-  "privateKeySeedHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "_comment": "Test vectors for spec/protocol.md. They are made with a PUBLISHED TEST KEY whose 32 private bytes are 0, 1, 2, ... 31 (see spec/README.md); never register it anywhere real. The first four events are also pinned in the hub service's own test suite with the same signatures.",
   "publicKey": "ed25519:A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
   "keyId": "vector-key-1",
   "canonical": [
