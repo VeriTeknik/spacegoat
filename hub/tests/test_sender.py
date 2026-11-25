@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """The sender against a service that checks signatures and sequence for real (tests/fake_service.py)."""
+from datetime import timedelta
+
 import pytest
 
+from spacegoat_hub import clock as clock_module
 from spacegoat_hub.outbox import Outbox
 from spacegoat_hub.sender import HEARTBEAT_SECONDS, Sender
 
 from .fake_service import FakeService
 
 SOURCE = "01234567-89ab-4cde-8fab-0123456789ab"
-AT = "2026-11-25T10:00:00.000Z"
+# Relative to today, never a fixed date: the service refuses an observation more than about 24.8 days from its
+# clock, so a literal date would make every test here fail a few weeks after it was written.
+AT = clock_module.observed_at_text(clock_module.now())
+EARLIER = clock_module.observed_at_text(clock_module.now() - timedelta(hours=1))
 SEEN = {"trustOrigin": "hub", "deviceRef": "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b",
         "segmentRef": "0c0c0c0c-0c0c-4c0c-8c0c-0c0c0c0c0c0c"}
 
@@ -159,6 +165,38 @@ def test_an_error_answer_cut_off_half_way_is_a_retry_too(service, outbox, vector
     assert len(outbox.pending(10)) == 1 and sender.halted is None
 
 
+def test_an_error_whose_body_cannot_be_read_is_a_retry(service, outbox, vector_key):
+    # Made to raise, not left to the HTTP library's mood: on some versions a short body is returned, not raised.
+    import http.client
+    import urllib.error
+    from email.message import Message
+
+    class Unreadable:
+        def read(self, *_args):
+            raise http.client.IncompleteRead(b"{", 499)
+
+        def close(self):
+            pass
+
+    class Opener:
+        def open(self, request, timeout):
+            raise urllib.error.HTTPError(request.full_url, 503, "Service Unavailable", Message(), Unreadable())
+
+    fill(outbox, 1)
+    sender = make_sender(service, outbox, vector_key)
+    sender._opener = Opener()
+    assert sender.step().kind == "retry_later"
+    assert len(outbox.pending(10)) == 1 and sender.halted is None and service.requests == []
+
+
+def test_the_fixed_dates_in_this_file_would_have_expired(service, outbox, vector_key):
+    # The guard behind AT above: an observation a month old is refused, so no test here may carry a literal date.
+    month_old = clock_module.observed_at_text(clock_module.now() - timedelta(days=30))
+    outbox.append("site.device_seen", month_old, SEEN)
+    sender = make_sender(service, outbox, vector_key)
+    assert (sender.step().kind, sender.halted) == ("halted", "schema")
+
+
 @pytest.mark.parametrize("reuse_signature", [False, True])
 def test_a_different_event_under_a_number_already_on_record_is_refused_by_the_service(
     service, outbox, vector_key, tmp_path, reuse_signature
@@ -170,7 +208,7 @@ def test_a_different_event_under_a_number_already_on_record_is_refused_by_the_se
     assert make_sender(service, outbox, vector_key).step().kind == "sent"
     # A second queue for the same source, as a cloned or restored hub would have: its number 1 is another event.
     clone = Outbox(tmp_path / "clone.sqlite", source_id=SOURCE, key_id="vector-key-1", private_key=vector_key)
-    clone.append("site.device_seen", "2026-11-25T11:11:11.000Z", SEEN)
+    clone.append("site.device_seen", EARLIER, SEEN)
     if reuse_signature:
         forged = {**clone.pending(1)[0], "signature": service.accepted[0]["signature"]}
         clone.close()
