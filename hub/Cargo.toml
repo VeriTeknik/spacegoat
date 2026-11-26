@@ -1,0 +1,39 @@
+[package]
+name = "spacegoat-hub"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "AGPL-3.0-or-later"
+description = "SpaceGoat hub agent: observes the local network and sends signed, ordered evidence to a hub service"
+repository = "https://github.com/VeriTeknik/spacegoat"
+publish = false
+
+[lib]
+name = "spacegoat_hub"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spacegoat-hub"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+ed25519-dalek = "3"
+serde_json = "1"
+sha2 = "0.11"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
