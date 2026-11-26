@@ -208,7 +208,7 @@ A device with such an address starts as ephemeral; when the same address is seen
 | 409 | `{ "error": "seq_gap", "expectedSeq": k }` | Stops sending: the service lost events it had confirmed |
 | 409 | `{ "error": "replay_conflict", "sourceSeq": s }` | Stops sending and shows the fault locally |
 | 413 | `{ "error": "too_large" }` | Splits the batch |
-| 429 | `{ "error": "rate_limited" }` with `Retry-After` | Waits |
+| 429 | `{ "error": "rate_limited" }` with `Retry-After` | Waits what `Retry-After` says, but never longer than its liveness interval (section 11) allows |
 | 503 | `{ "error": "unavailable" }` | Backs off and tries again |
 
 An event the service has already accepted is counted in `duplicates` and changes nothing, so sending a batch again after a lost answer is always safe.
@@ -236,6 +236,8 @@ Until the protocol gains a reason for expired events, such a hub stops with `sch
 
 A hub sends at least one request every 300 seconds: a batch when it has events, a heartbeat otherwise.
 A hub that stays silent for three times that long raises an alert at the service.
+A stopped hub (section 10) sends nothing, heartbeats included, so the service cannot tell it from a dead one: the silence alert is the signal.
+A hub that could not capture for a while declares it with `site_source.input_lost` when it resumes.
 
 The first request of a run is a heartbeat.
 Its answer tells the hub two things it must not guess: the service's clock (`Date`) and where the service stands in the hub's sequence (`lastSeq`).

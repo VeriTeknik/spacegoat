@@ -23,7 +23,7 @@ fn names_in(dir: &std::path::Path) -> Vec<String> {
     names
 }
 
-/// The PKCS#8 PEM the Python agent wrote for the published test key (RFC 8410 private key, no public key part).
+/// The PKCS#8 PEM of the published test key (RFC 8410 private key, no public key part), as other Ed25519 tools write it.
 const VECTOR_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
 MC4CAQAwBQYDK2VwBCIEIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f\n\
 -----END PRIVATE KEY-----\n";
@@ -131,8 +131,8 @@ fn a_directory_of_another_user_is_refused() {
 
 #[test]
 fn a_failed_create_leaves_no_key_and_no_temporary_file_behind() {
-    // Python failed `fsync` to get here; Rust cannot intercept a system call, so the failure after the temporary
-    // file was written is the refusal to replace an existing key and the refusal of another user's directory above.
+    // A system call cannot be made to fail from here, so the failure after the temporary file was written is the
+    // refusal to replace an existing key and the refusal of another user's directory above.
     let tmp = TempDir::new();
     let store = FileKeyStore::new(tmp.join("hub.key"));
     store.create().unwrap();
@@ -242,7 +242,7 @@ fn a_directory_at_the_key_name_is_not_a_key() {
 }
 
 #[test]
-fn the_key_file_is_the_pkcs8_pem_the_python_agent_wrote() {
+fn the_key_file_is_the_standard_pkcs8_pem() {
     let tmp = TempDir::new();
     let path = tmp.join("hub.key");
     std::fs::write(&path, VECTOR_KEY_PEM).unwrap();

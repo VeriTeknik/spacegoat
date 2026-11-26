@@ -11,8 +11,9 @@
 //! event is on disk and will be sent. There is no state in between.
 //!
 //! The file belongs to one source. It also remembers what the service last confirmed, so a hub that lost everything
-//! else can still say truthfully where it stood (`declare_reset`), and since when the hub has stopped capturing
-//! because too much waits (`stop_capture`, `resume_capture`): that mark lives and dies with the queue it is about.
+//! else can still say truthfully where it stood (`declare_reset`), and that the hub has stopped capturing, and since
+//! when if that is a trusted time (`stop_capture`, `resume_capture`): that mark lives and dies with the queue it is
+//! about, and survives a restart.
 //!
 //! A file that is not a database, or fails SQLite's own `quick_check`, is recognised as such (`database_is_damaged`)
 //! so the agent can set it aside and treat the queue as lost, rather than not start at all.
@@ -32,7 +33,7 @@ use crate::clock;
 use crate::fsutil::private_file;
 use crate::signing::{self, EventFields, SigningError};
 
-/// How long a write waits for another connection's lock (what Python's `sqlite3` waits by default).
+/// How long a write waits for another connection's lock.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why a queue was started again from the service's count (spec/protocol.md, `site_source.reset`).
@@ -79,7 +80,10 @@ impl fmt::Display for OutboxError {
             Self::Sqlite(error) => write!(f, "outbox database: {error}"),
             Self::Io(error) => write!(f, "outbox file: {error}"),
             Self::Signing(error) => write!(f, "the event cannot be signed: {error}"),
-            Self::AnotherSource => f.write_str("this outbox belongs to another source"),
+            Self::AnotherSource => f.write_str(
+                "outbox.sqlite belongs to another source: the source_id in the configuration is not the one recorded \
+                 in outbox.sqlite (check the configuration; a queue is never handed to another source)",
+            ),
             Self::AckAhead => f.write_str("the service confirmed a sequence ahead of anything this hub assigned"),
             Self::ResetOnNonEmpty => f.write_str("a reset is declared on an empty outbox only"),
             Self::Damaged(what) => write!(f, "the outbox is damaged: {what}"),
@@ -266,25 +270,34 @@ impl Outbox {
         Ok(seq)
     }
 
-    /// Since when (wall clock, Unix milliseconds) the hub has stopped capturing because its backlog is full; `None`
-    /// while it captures.
-    pub fn capture_stopped_at(&self) -> Result<Option<i64>, OutboxError> {
+    /// Whether the hub has stopped capturing (`Some`), and since when (wall clock, Unix milliseconds) when that was
+    /// a trusted time; `None` while it captures. The mark is `capture_stopped_at` in `meta`: a number, or empty when
+    /// the moment is not known.
+    pub fn capture_stop(&self) -> Result<Option<Option<i64>>, OutboxError> {
         match meta(&self.db, "capture_stopped_at")? {
             None => Ok(None),
+            Some(text) if text.is_empty() => Ok(Some(None)),
             Some(text) => text
                 .parse()
-                .map(Some)
+                .map(|at| Some(Some(at)))
                 .map_err(|_| OutboxError::Damaged("the capture mark is not a number")),
         }
     }
 
-    /// Record that the hub stopped capturing at `at` (wall clock, Unix milliseconds). An earlier mark is kept: the
-    /// loss began then.
-    pub fn stop_capture(&mut self, at: i64) -> Result<(), OutboxError> {
+    /// Record that the hub stopped capturing, at `at` (wall clock, Unix milliseconds) when that is a trusted time. An
+    /// earlier mark is kept: the loss began then.
+    pub fn stop_capture(&mut self, at: Option<i64>) -> Result<(), OutboxError> {
         self.db.execute(
             "INSERT INTO meta (key, value) VALUES ('capture_stopped_at', ?1) ON CONFLICT (key) DO NOTHING",
-            params![at.to_string()],
+            params![at.map(|at| at.to_string()).unwrap_or_default()],
         )?;
+        Ok(())
+    }
+
+    /// Clear the mark without saying anything: the stop was too short to declare.
+    pub fn clear_capture_stop(&mut self) -> Result<(), OutboxError> {
+        self.db
+            .execute("DELETE FROM meta WHERE key = 'capture_stopped_at'", [])?;
         Ok(())
     }
 
@@ -420,6 +433,14 @@ impl Signer<'_> {
 /// point of the file. Shared with the pseudonym store.
 pub(crate) fn open_durable(path: &Path) -> Result<Connection, rusqlite::Error> {
     let db = Connection::open(path)?;
+    // SQLite opens a file it may not write read-only and says so only at the first write: a store that cannot keep
+    // what it is given is refused here, at the start.
+    if db.is_readonly(rusqlite::MAIN_DB)? {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY),
+            Some("the database file cannot be written".to_owned()),
+        ));
+    }
     db.busy_timeout(BUSY_TIMEOUT)?;
     let mode: String = db.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") {
@@ -473,7 +494,7 @@ fn set_meta(db: &Connection, key: &str, value: &str) -> Result<(), rusqlite::Err
     Ok(())
 }
 
-/// A counter kept in `meta`; absent is 0 (as the Python read it), anything but a decimal number is damage.
+/// A counter kept in `meta`; absent is 0, anything but a decimal number is damage.
 fn counter(db: &Connection, key: &str) -> Result<u64, OutboxError> {
     match meta(db, key)? {
         None => Ok(0),

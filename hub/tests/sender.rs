@@ -209,7 +209,7 @@ fn rate_limited_waits_as_long_as_it_is_told() {
 }
 
 #[test]
-fn retry_after_as_a_date_is_honoured_and_a_very_long_one_is_capped_at_an_hour() {
+fn retry_after_as_a_date_is_honoured_and_a_long_one_is_capped_at_240_seconds() {
     let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
     let mut outbox = open_outbox(&tmp, "outbox.sqlite");
     fill(&mut outbox, &clock, 1);
@@ -228,7 +228,16 @@ fn retry_after_as_a_date_is_honoured_and_a_very_long_one_is_capped_at_an_hour() 
         json!({"error": "rate_limited"}),
         &[("Retry-After", "86400")],
     ));
-    assert_eq!(step(&mut sender), SendOutcome::RetryLater(3600));
+    assert_eq!(step(&mut sender), SendOutcome::RetryLater(240));
+    // A date further away than the cap is cut the same way.
+    clock.advance_seconds(241);
+    let far = http_date(clock.now() + 3_600_000);
+    service.push(Step::status_with(
+        429,
+        json!({"error": "rate_limited"}),
+        &[("Retry-After", &far)],
+    ));
+    assert_eq!(step(&mut sender), SendOutcome::RetryLater(240));
 }
 
 #[test]
@@ -256,7 +265,7 @@ fn an_error_answer_cut_off_half_way_is_a_retry_too() {
 
 #[test]
 fn an_error_whose_body_cannot_be_read_is_a_retry() {
-    // The Python test forced this with a stub opener; here it is a real answer whose body cannot be decoded: a
+    // A real answer whose body cannot be decoded: a
     // chunked 503 whose chunk size is not a number.
     let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
     let mut outbox = open_outbox(&tmp, "outbox.sqlite");
@@ -503,7 +512,7 @@ fn a_200_that_is_not_the_services_answer_confirms_nothing() {
         json!({"accepted": "2", "duplicates": 0, "lastSeq": 2}),
         json!({"accepted": 2, "duplicates": 0, "lastSeq": true}),
         json!({}),
-        // Beyond the Python list: a float, a negative number, and JSON that is not an object.
+        // A float, a negative number, and JSON that is not an object.
         json!({"accepted": 2, "duplicates": 0, "lastSeq": 2.0}),
         json!({"accepted": 2, "duplicates": 0, "lastSeq": -1}),
         json!([2, 0, 2]),
@@ -581,7 +590,6 @@ fn the_service_address_is_an_https_origin_and_nothing_else() {
         "https://",
         "hub.example",
         "https://hub.example:notaport",
-        // Beyond the Python list.
         "https://hub.example:99999",
         "https://hub.example:",
         "https://hub.example?x=1",
@@ -669,7 +677,7 @@ fn a_batch_stays_under_the_compressed_limit() {
 
 // ---- What the Rust port makes newly possible to get wrong ----
 
-/// The body is the stored event texts spliced in, byte for byte, in the form the Python agent sent
+/// The body is the stored event texts spliced in, byte for byte,
 /// (`canonical_json({"schemaVersion": 1, "events": [...]})`): never the events parsed and written again.
 #[test]
 fn the_request_body_is_the_stored_events_spliced_byte_for_byte() {
@@ -686,7 +694,7 @@ fn the_request_body_is_the_stored_events_spliced_byte_for_byte() {
     let expected = format!("{{\"events\":[{}],\"schemaVersion\":1}}", stored.join(","));
     let plain = service.requests()[0].plain.clone().unwrap();
     assert_eq!(String::from_utf8(plain).unwrap(), expected);
-    // And it is the canonical form of itself, as the Python body was.
+    // And it is the canonical form of itself.
     let parsed: Value = serde_json::from_str(&expected).unwrap();
     assert_eq!(spacegoat_hub::canonical::canonical_json(&parsed).unwrap(), expected);
 }
@@ -772,7 +780,7 @@ fn a_huge_retry_after_is_capped_and_does_not_overflow() {
         json!({"error": "rate_limited"}),
         &[("Retry-After", "99999999999999999999999999")],
     ));
-    assert_eq!(step(&mut sender), SendOutcome::RetryLater(3600));
+    assert_eq!(step(&mut sender), SendOutcome::RetryLater(240));
 }
 
 #[test]
@@ -1103,4 +1111,82 @@ fn counts_beyond_what_json_carries_exactly_are_no_answer() {
         json!({"accepted": 0, "duplicates": 0, "lastSeq": too_big - 1}),
     ));
     assert_eq!(step(&mut sender), SendOutcome::ServiceAhead(too_big - 1));
+}
+
+// ---- A refusal to a heartbeat refused nothing ----
+
+#[test]
+fn a_refusal_that_would_halt_a_batch_only_backs_off_after_a_heartbeat() {
+    for (status, body) in [
+        (400, json!({"error": "schema"})),
+        (409, json!({"error": "schema"})),
+        (409, json!({"error": "replay_conflict", "sourceSeq": 1})),
+        (409, json!({"error": "seq_gap", "expectedSeq": 1})),
+        (413, json!({"error": "too_large"})),
+    ] {
+        let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+        let mut sender = make_sender(&service, open_outbox(&tmp, "outbox.sqlite"), &clock);
+        service.push(Step::status(status, body.clone()));
+        assert_eq!(
+            sender.heartbeat().unwrap(),
+            SendOutcome::RetryLater(5),
+            "{status} {body}"
+        );
+        assert_eq!(sender.halted(), None, "{status} {body}");
+        // The next one is a heartbeat too, and the service is well again.
+        clock.advance_seconds(5);
+        assert_eq!(sender.heartbeat().unwrap(), SendOutcome::Sent(0), "{status} {body}");
+    }
+}
+
+// ---- What kind of trouble the service is in ----
+
+#[test]
+fn the_sender_says_which_kind_of_answer_confirmed_nothing_until_one_does() {
+    use spacegoat_hub::sender::ServiceTrouble;
+    let cases: Vec<(Step, ServiceTrouble)> = vec![
+        (
+            Step::status(503, json!({"error": "unavailable"})),
+            ServiceTrouble::Http(503),
+        ),
+        (
+            Step::status_with(429, json!({"error": "rate_limited"}), &[("Retry-After", "1")]),
+            ServiceTrouble::Http(429),
+        ),
+        (Step::status(302, json!({})), ServiceTrouble::Http(302)),
+        (Step::Truncate, ServiceTrouble::Unreadable),
+        (
+            Step::status(200, json!({"hello": "portal"})),
+            ServiceTrouble::NotConfirming,
+        ),
+        (Step::LoseAnswer, ServiceTrouble::NoConnection),
+    ];
+    for (answer, trouble) in cases {
+        let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+        let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+        fill(&mut outbox, &clock, 1);
+        let mut sender = make_sender(&service, outbox, &clock);
+        assert_eq!(sender.trouble(), None, "nothing asked yet");
+        service.push(answer);
+        assert!(matches!(step(&mut sender), SendOutcome::RetryLater(_)), "{trouble:?}");
+        assert_eq!(sender.trouble(), Some(trouble));
+        clock.advance_seconds(10);
+        assert!(matches!(step(&mut sender), SendOutcome::Sent(_)), "{trouble:?}");
+        assert_eq!(sender.trouble(), None, "a confirming answer clears it");
+    }
+    // Nobody there at all.
+    let (tmp, clock) = (TempDir::new(), TestClock::new());
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let mut sender = sender_with_key(
+        &format!("http://127.0.0.1:{port}"),
+        open_outbox(&tmp, "outbox.sqlite"),
+        &clock,
+        vector_key(),
+    );
+    assert!(matches!(sender.heartbeat().unwrap(), SendOutcome::RetryLater(_)));
+    assert_eq!(sender.trouble(), Some(ServiceTrouble::NoConnection));
+    assert_eq!(ServiceTrouble::Http(503).as_text(), "http_503");
+    assert_eq!(ServiceTrouble::NoConnection.as_text(), "no_connection");
+    assert_eq!(ServiceTrouble::Unreadable.as_text(), "unreadable");
+    assert_eq!(ServiceTrouble::NotConfirming.as_text(), "not_confirming");
 }

@@ -5,9 +5,11 @@
 //! leaves it, and is never printed. This store keeps it in a file only its owner can read; a hardware key store (TPM)
 //! is a later module behind the same two calls.
 //!
-//! The file is the PKCS#8 PEM the Python agent wrote (RFC 8410: an Ed25519 private key, no public key part, no
-//! encryption), so a state directory moves between the two implementations as it is. It is read strictly: exactly
-//! that structure, nothing before or after it.
+//! The file is a PKCS#8 PEM (RFC 8410: an Ed25519 private key, no public key part, no encryption), the form every
+//! Ed25519 tool reads. It is read strictly: exactly that structure, nothing before or after it.
+//!
+//! Beside it, `hub.key.id` holds the key id it was generated under (one line), so that `public-key` and `run` know it
+//! without being told. A state directory made before that file existed works as before.
 
 use std::fmt;
 use std::fs::OpenOptions;
@@ -33,6 +35,10 @@ const PKCS8_ED25519_PREFIX: [u8; 16] = [
 
 /// The key file is 119 bytes; anything much longer is not one, and is not read whole.
 const MAX_KEY_FILE: u64 = 4096;
+/// A key id is at most 63 characters and a newline.
+const MAX_KEY_ID_FILE: u64 = 256;
+/// What the key id file is called, beside the key: the key's name followed by this.
+pub const KEY_ID_SUFFIX: &str = ".id";
 
 #[derive(Debug)]
 pub enum KeyStoreError {
@@ -44,6 +50,12 @@ pub enum KeyStoreError {
     DirectoryOpenToOthers(PathBuf),
     /// The state directory belongs to another user.
     DirectoryOfAnotherUser(PathBuf),
+    /// The state directory's name is a file, not a directory.
+    NotADirectory(PathBuf),
+    /// The state directory belongs to this user, who cannot write it.
+    DirectoryNotWritable(PathBuf),
+    /// The key id file does not hold a key id.
+    NotAKeyId(PathBuf),
     /// The key file can be read or written by users other than its owner.
     Permissions(PathBuf),
     /// The key's name is a symbolic link, a directory or anything but a regular file.
@@ -65,6 +77,9 @@ impl fmt::Display for KeyStoreError {
                 path.display()
             ),
             Self::DirectoryOfAnotherUser(path) => write!(f, "{} belongs to another user", path.display()),
+            Self::NotADirectory(path) => write!(f, "{} is not a directory", path.display()),
+            Self::DirectoryNotWritable(path) => write!(f, "{} cannot be written by this user", path.display()),
+            Self::NotAKeyId(path) => write!(f, "{} does not hold a key id", path.display()),
             Self::Permissions(path) => write!(
                 f,
                 "the permissions of {} let others read the key; it must be 0600",
@@ -74,6 +89,19 @@ impl fmt::Display for KeyStoreError {
             Self::NotAKey(path) => write!(f, "{} does not hold a readable Ed25519 key", path.display()),
             Self::Io(path, error) => write!(f, "{}: {error}", path.display()),
         }
+    }
+}
+
+impl KeyStoreError {
+    /// Whether the error is about where the key lives (the state directory), rather than the key itself.
+    pub fn is_directory(&self) -> bool {
+        matches!(
+            self,
+            Self::DirectoryOpenToOthers(_)
+                | Self::DirectoryOfAnotherUser(_)
+                | Self::NotADirectory(_)
+                | Self::DirectoryNotWritable(_)
+        )
     }
 }
 
@@ -121,6 +149,9 @@ impl FileKeyStore {
         };
         let directory_uid = match std::fs::metadata(directory) {
             Ok(found) => {
+                if !found.is_dir() {
+                    return Err(KeyStoreError::NotADirectory(directory.to_path_buf()));
+                }
                 // Never change a directory this call did not create: it may be shared (`/tmp`, `/var/lib`).
                 if found.permissions().mode() & 0o077 != 0 {
                     return Err(KeyStoreError::DirectoryOpenToOthers(directory.to_path_buf()));
@@ -145,7 +176,22 @@ impl FileKeyStore {
         // replaced; and there is no moment at which a half-written key sits under the real name.
         let name = self.path.file_name().map(|n| n.to_string_lossy().into_owned());
         let prefix = format!(".{}.", name.unwrap_or_default());
-        let (mut file, temporary) = create_temporary(directory, &prefix).map_err(io_at(directory))?;
+        let (mut file, temporary) = match create_temporary(directory, &prefix) {
+            Ok(created) => created,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                // Whose directory it is decides what to say: another user's, or this user's without write access.
+                let me = match self.expected_owner {
+                    Some(uid) => Some(uid),
+                    None => crate::fsutil::current_uid().ok(),
+                };
+                return Err(if me.is_some_and(|me| me != directory_uid) {
+                    KeyStoreError::DirectoryOfAnotherUser(directory.to_path_buf())
+                } else {
+                    KeyStoreError::DirectoryNotWritable(directory.to_path_buf())
+                });
+            }
+            Err(error) => return Err(KeyStoreError::Io(directory.to_path_buf(), error)),
+        };
         let installed = (|| {
             file.write_all(pem.as_bytes()).map_err(io_at(&temporary))?;
             file.sync_all().map_err(io_at(&temporary))?;
@@ -200,6 +246,41 @@ impl FileKeyStore {
             .read_to_end(&mut text)
             .map_err(|error| KeyStoreError::Io(self.path.clone(), error))?;
         key_of_pem(&text).ok_or_else(|| KeyStoreError::NotAKey(self.path.clone()))
+    }
+
+    /// Where the key id is recorded: beside the key, its name followed by `KEY_ID_SUFFIX`.
+    pub fn key_id_path(&self) -> PathBuf {
+        let mut name = self.path.as_os_str().to_owned();
+        name.push(KEY_ID_SUFFIX);
+        PathBuf::from(name)
+    }
+
+    /// Record the id the key was generated under (`keygen`), privately and atomically.
+    pub fn write_key_id(&self, key_id: &str) -> Result<(), KeyStoreError> {
+        let path = self.key_id_path();
+        crate::fsutil::write_own_file(&path, format!("{key_id}\n").as_bytes())
+            .map_err(|error| KeyStoreError::Io(path, error))
+    }
+
+    /// The id the key was generated under; `None` when this state directory does not record one (it was made before
+    /// the file existed).
+    pub fn read_key_id(&self) -> Result<Option<String>, KeyStoreError> {
+        let path = self.key_id_path();
+        let file = match open_regular(&path, OpenOptions::new().read(true)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => return Err(KeyStoreError::NotAFile(path)),
+            Err(error) => return Err(KeyStoreError::Io(path, error)),
+        };
+        let mut text = Vec::new();
+        file.take(MAX_KEY_ID_FILE)
+            .read_to_end(&mut text)
+            .map_err(|error| KeyStoreError::Io(path.clone(), error))?;
+        let id = text.strip_suffix(b"\n").unwrap_or(&text);
+        match std::str::from_utf8(id) {
+            Ok(id) if crate::signing::is_key_id(id) => Ok(Some(id.to_owned())),
+            _ => Err(KeyStoreError::NotAKeyId(path)),
+        }
     }
 
     fn directory(&self) -> &Path {

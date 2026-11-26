@@ -14,11 +14,13 @@
 //!   The body is the outbox's stored event texts spliced into `{"events":[...],"schemaVersion":1}`, never the events
 //!   parsed and written again;
 //! - a refusal no retry can fix (rejected content, a conflicting replay, a service that lost what it had confirmed,
-//!   one event the service says is too large) HALTS the sender. A halted sender makes no request at all: knocking for
+//!   one event the service says is too large) to a request that carried events HALTS the sender (the same answer to
+//!   a heartbeat refused nothing, and backs off). A halted sender makes no request at all: knocking for
 //!   ever with the same refused batch only buries the fault. A person looks, the fault is fixed, the halt is cleared
 //!   (`spacegoat-hub resume`) and the agent continues from there. A `413` halts only when it is the service's own
 //!   answer (`{"error":"too_large"}`) to a request of exactly one event; to a larger batch it halves the batch, and
 //!   anything else (a `413` to a heartbeat, or one from something in between) backs off;
+//! - `429` waits what `Retry-After` says, at most `MAX_WAIT_SECONDS` (240), like every other wait;
 //! - `401` does not halt. The service gives the same answer for an unknown key and for a clock that is more than five
 //!   minutes off, and a clock corrects itself: the sender says so (`problem`) and tries again, slowly;
 //! - it talks to one origin only: a redirect is never followed (the signed headers and the events would go with it),
@@ -52,8 +54,9 @@ pub const HEARTBEAT_SECONDS: i64 = 240;
 pub const MAX_EVENTS: usize = 500;
 pub const MAX_COMPRESSED_BYTES: usize = 512 * 1024;
 pub const MAX_UNCOMPRESSED_BYTES: usize = 4 * 1024 * 1024;
-/// The longest `Retry-After` honoured: the hub owes a sign of life sooner than that.
-pub const MAX_WAIT_SECONDS: u64 = 3600;
+/// The longest `Retry-After` honoured: like every other wait, no longer than the liveness interval allows (a
+/// request at least every 300 seconds, protocol §11).
+pub const MAX_WAIT_SECONDS: u64 = BACKOFF_MAX_SECONDS;
 pub const BACKOFF_FIRST_SECONDS: u64 = 5;
 /// The protocol wants a request at least every 300 seconds; a wait of 240 leaves room for the run loop's tick.
 pub const BACKOFF_MAX_SECONDS: u64 = 240;
@@ -86,7 +89,7 @@ pub enum HaltReason {
 }
 
 impl HaltReason {
-    /// The words the Python agent recorded (and its status printed).
+    /// The word `halt.json` records and the status prints.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Schema => "schema",
@@ -137,6 +140,30 @@ impl Problem {
 impl fmt::Display for Problem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// Why the last request confirmed nothing (closed list; the status shows `as_text`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceTrouble {
+    /// No answer at all: nobody there, a connection refused or dropped, a timeout, a TLS failure.
+    NoConnection,
+    /// An answer with this HTTP status that confirmed nothing.
+    Http(u16),
+    /// An answer that could not be read in full, or was larger than the cap.
+    Unreadable,
+    /// A `200` that confirmed nothing (not the service's answer, or a batch the mark did not move for).
+    NotConfirming,
+}
+
+impl ServiceTrouble {
+    pub fn as_text(self) -> String {
+        match self {
+            Self::NoConnection => "no_connection".to_owned(),
+            Self::Http(status) => format!("http_{status}"),
+            Self::Unreadable => "unreadable".to_owned(),
+            Self::NotConfirming => "not_confirming".to_owned(),
+        }
     }
 }
 
@@ -229,6 +256,7 @@ pub struct Sender {
     /// When the service last confirmed a request (wall milliseconds, for display).
     last_success: Option<i64>,
     problem: Option<Problem>,
+    trouble: Option<ServiceTrouble>,
     reading: Option<ClockReading>,
     service_last_seq: Option<u64>,
 }
@@ -284,6 +312,7 @@ impl Sender {
             halted: None,
             last_success: None,
             problem: None,
+            trouble: None,
             reading: None,
             service_last_seq: None,
         })
@@ -324,6 +353,11 @@ impl Sender {
     /// Why delivery is not working although the sender keeps trying.
     pub fn problem(&self) -> Option<Problem> {
         self.problem
+    }
+
+    /// Why the last request got no confirming answer; `None` before any request and after a confirming one.
+    pub fn trouble(&self) -> Option<ServiceTrouble> {
+        self.trouble
     }
 
     /// When the service last confirmed a request (wall clock, Unix milliseconds).
@@ -374,6 +408,19 @@ impl Sender {
         self.exchange(&events)
     }
 
+    /// At most one request, and only one that carries events: never a heartbeat. For a hub that cannot say "alive,
+    /// nothing to report" truthfully (its capture is failing) but still delivers what it has signed.
+    pub fn step_events(&mut self) -> Result<SendOutcome, SenderError> {
+        if let Some(waiting) = self.gate() {
+            return Ok(waiting);
+        }
+        let events = self.outbox.pending(self.batch_limit, None)?;
+        if events.is_empty() {
+            return Ok(SendOutcome::Idle);
+        }
+        self.exchange(&events)
+    }
+
     /// An empty request now (a heartbeat), whatever waits in the outbox: the first request of a run, which asks the
     /// service where it stands before anything is sent (protocol §11). Still none while halted or waiting out a
     /// back-off.
@@ -410,16 +457,26 @@ impl Sender {
         let Some((body, count)) = self.fit(events)? else {
             return Ok(self.halt(HaltReason::TooLarge));
         };
-        let Some(answer) = self.post(&body) else {
-            return Ok(self.back_off());
+        let answer = match self.post(&body) {
+            Ok(answer) => answer,
+            Err(trouble) => {
+                self.trouble = Some(trouble);
+                return Ok(self.back_off());
+            }
         };
         self.last_contact = Some(self.clock.mono_millis());
+        if answer.status != 200 {
+            // Cleared again only by a confirming answer (`confirmed`).
+            self.trouble = Some(ServiceTrouble::Http(answer.status));
+        }
         let error = answer.object.get("error").and_then(Value::as_str);
+        let carried = count > 0;
         Ok(match (answer.status, error) {
             (200, _) => self.confirmed(&answer.object, count)?,
+            // The refusals below halt only a request that carried events: to a heartbeat, nothing was refused.
             // The service expects a number this hub has already been told was confirmed, and has forgotten: the
             // service lost events. A hub cannot send what it no longer has, and it does not invent a sequence.
-            (409, Some("seq_gap")) => self.halt(HaltReason::Gap),
+            (409, Some("seq_gap")) if carried => self.halt(HaltReason::Gap),
             (401, _) => {
                 self.problem = Some(Problem::Unauthorized);
                 self.wait(UNAUTHORIZED_RETRY_SECONDS)
@@ -431,10 +488,11 @@ impl Sender {
                 SendOutcome::RetryNow
             }
             (429, _) => self.wait(retry_after(answer.retry_after.as_deref(), self.clock.wall_millis())),
-            (400 | 409, Some("schema")) => self.halt(HaltReason::Schema),
-            (400 | 409, Some("replay_conflict")) => self.halt(HaltReason::ReplayConflict),
-            // 5xx, a redirect, a 413 to a heartbeat or one that is not the service's, and anything this version does
-            // not know: the service's trouble (or something in between), not a reason to stop.
+            (400 | 409, Some("schema")) if carried => self.halt(HaltReason::Schema),
+            (400 | 409, Some("replay_conflict")) if carried => self.halt(HaltReason::ReplayConflict),
+            // 5xx, a redirect, a 413 to a heartbeat or one that is not the service's, a refusal of a heartbeat, and
+            // anything this version does not know: the service's trouble (or something in between), not a reason
+            // to stop.
             _ => self.back_off(),
         })
     }
@@ -459,9 +517,9 @@ impl Sender {
         }
     }
 
-    /// One signed POST, timestamped by the wall clock. `None` when there is no complete answer: the request may or
-    /// may not have arrived, and sending the same bytes again is always safe.
-    fn post(&mut self, body: &[u8]) -> Option<Answer> {
+    /// One signed POST, timestamped by the wall clock. An `Err` when there is no complete answer (and what kind of
+    /// none): the request may or may not have arrived, and sending the same bytes again is always safe.
+    fn post(&mut self, body: &[u8]) -> Result<Answer, ServiceTrouble> {
         let (wall, mono) = (self.clock.wall_millis(), self.clock.mono_millis());
         let timestamp = wall.div_euclid(MS_PER_SECOND).to_string();
         let message = signing::request_signing_message(&self.principal, "POST", INGEST_PATH, &timestamp, body);
@@ -476,7 +534,7 @@ impl Sender {
             .header("X-VT-Timestamp", &timestamp)
             .header("X-VT-Signature", &signature)
             .send(body)
-            .ok()?;
+            .map_err(|_| ServiceTrouble::NoConnection)?;
         let status = response.status().as_u16();
         let single = |name: &str| {
             let mut values = response.headers().get_all(name).iter();
@@ -493,7 +551,7 @@ impl Sender {
             .with_config()
             .limit(MAX_ANSWER_BYTES)
             .read_to_vec()
-            .ok()?;
+            .map_err(|_| ServiceTrouble::Unreadable)?;
         let skew = date
             .as_deref()
             .and_then(clock::parse_http_date)
@@ -506,7 +564,7 @@ impl Sender {
                 mono_millis: mono,
             });
         }
-        Some(Answer {
+        Ok(Answer {
             status,
             object: json_object(&raw),
             retry_after,
@@ -523,10 +581,13 @@ impl Sender {
         };
         let (Some(_), Some(_), Some(last_seq)) = (field("accepted"), field("duplicates"), field("lastSeq")) else {
             // A 200 that is not the service's answer (a proxy, a portal page): nothing was confirmed.
+            self.trouble = Some(ServiceTrouble::NotConfirming);
             return Ok(self.back_off());
         };
         self.service_last_seq = Some(last_seq);
         self.problem = None;
+        // The service's own answer: it is there and speaking for itself, whatever it says next.
+        self.trouble = None;
         let last_assigned = self.outbox.last_assigned()?;
         if last_seq > last_assigned {
             if last_assigned == 0 {
@@ -547,6 +608,7 @@ impl Sender {
         if sent > 0 && self.outbox.last_acked()? <= before {
             // Events went and the service confirmed none of them: whatever it is, sending the same batch again at
             // once will not change it.
+            self.trouble = Some(ServiceTrouble::NotConfirming);
             return Ok(self.back_off());
         }
         self.failures = 0;
@@ -586,8 +648,7 @@ impl fmt::Debug for Sender {
 }
 
 /// `{"events":[...],"schemaVersion":1}` with the stored texts spliced in as they are. It is the canonical JSON of
-/// that object (keys sorted, no whitespace) because each stored text is canonical itself: the bytes the Python agent
-/// sent for the same events.
+/// that object (keys sorted, no whitespace) because each stored text is canonical itself.
 fn request_body(events: &[StoredEvent]) -> String {
     let length = events.iter().map(|event| event.json.len() + 1).sum::<usize>();
     let mut body = String::with_capacity(length + 32);
@@ -602,7 +663,7 @@ fn request_body(events: &[StoredEvent]) -> String {
     body
 }
 
-/// gzip at the strongest level (Python's `gzip.compress` default), with no time or name in the header.
+/// gzip at the strongest level, with no time or name in the header.
 fn gzip(plain: &[u8]) -> io::Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
     encoder.write_all(plain)?;
@@ -621,7 +682,7 @@ fn ceil_seconds(ms: i64) -> u64 {
     u64::try_from(ms.saturating_add(MS_PER_SECOND - 1) / MS_PER_SECOND).unwrap_or(0)
 }
 
-/// `Retry-After` as seconds or as an HTTP date, between 1 s and an hour; 5 s when it is neither.
+/// `Retry-After` as seconds or as an HTTP date, between 1 s and `MAX_WAIT_SECONDS`; 5 s when it is neither.
 fn retry_after(value: Option<&str>, now: i64) -> u64 {
     let value = value.unwrap_or("").trim();
     let seconds: i64 = if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {

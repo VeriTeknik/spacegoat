@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! A hub with its own freshly generated key, registered at a fake service, with its configuration file: the fixture
-//! the agent and command-line tests share (the Python tests' `hub` fixture).
+//! the agent and command-line tests share.
 
 use std::path::PathBuf;
 

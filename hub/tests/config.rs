@@ -67,7 +67,7 @@ fn test_config_refuses_what_it_cannot_run_with() {
         with("base_url", "http://hub.example"),
         with("base_url", "https://hub.example/api"),
         with("source_id", "nope"),
-        // The service assigns lowercase; the Python accepted nothing else either.
+        // The service assigns lowercase; nothing else is accepted.
         with("source_id", "01234567-89AB-4CDE-8FAB-0123456789AB"),
         with("key_id", "K"),
         with("state_dir", "relative"),

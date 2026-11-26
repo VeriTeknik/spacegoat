@@ -13,7 +13,7 @@ const DAY_MS: i64 = 86_400_000;
 const FIRST_MS: i64 = -62_167_219_200_000;
 const LAST_MS: i64 = 253_402_300_799_999;
 
-/// Known moments, computed independently (Python's `datetime`).
+/// Known moments, computed independently of this implementation.
 const KNOWN: [(i64, &str); 7] = [
     (0, "1970-01-01T00:00:00.000Z"),
     (-1, "1969-12-31T23:59:59.999Z"),
@@ -26,7 +26,7 @@ const KNOWN: [(i64, &str); 7] = [
 
 #[test]
 fn observed_at_is_utc_milliseconds_with_the_sub_millisecond_part_dropped() {
-    // Python's test gave the moment in Istanbul time; a `SystemTime` has no zone, it is UTC by definition.
+    // A `SystemTime` has no zone: it is UTC by definition.
     let moment = UNIX_EPOCH + Duration::new(1_795_514_400, 123_999_999);
     let millis = clock::unix_millis(moment).unwrap();
     assert_eq!(clock::observed_at_text(millis).unwrap(), "2026-11-24T10:00:00.123Z");

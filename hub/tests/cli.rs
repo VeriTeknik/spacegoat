@@ -6,6 +6,7 @@
 mod support;
 
 use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -33,6 +34,19 @@ struct Ran {
 fn cli(args: &[&str]) -> Ran {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = cli::run(args.iter().map(OsString::from), &mut out, &mut err);
+    Ran {
+        code,
+        out: String::from_utf8(out).unwrap(),
+        err: String::from_utf8(err).unwrap(),
+    }
+}
+
+/// `run --simulate` that must refuse to start: with the stop already set, an agent that did start returns at once
+/// (exit 0) instead of running until killed.
+fn run_refused(config: &Path) -> Ran {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let args = ["run", "--config", path(config), "--simulate"].map(OsString::from);
+    let code = cli::run_until(args, &mut out, &mut err, Arc::new(AtomicBool::new(true)));
     Ran {
         code,
         out: String::from_utf8(out).unwrap(),
@@ -108,6 +122,7 @@ fn test_status_prints_counts_and_no_device() {
         "halted",
         "haltedAt",
         "waitingFor",
+        "service",
         "problem",
         "resume",
     ];
@@ -125,7 +140,7 @@ fn test_status_prints_counts_and_no_device() {
     assert_no_personal_data(&ran.out, "status");
     assert!(
         ran.out.starts_with("{\n  \"sourceId\": "),
-        "the Python's indent=2 form: {}",
+        "two-space indented JSON: {}",
         ran.out
     );
 }
@@ -200,7 +215,7 @@ fn run_without_simulate_refuses_to_start() {
 fn run_on_a_directory_another_agent_holds_refuses_to_start() {
     let hub = Hub::new();
     let holding = hub.agent();
-    let ran = cli(&["run", "--config", path(&hub.config_path), "--simulate"]);
+    let ran = run_refused(&hub.config_path);
     assert_eq!(ran.code, 2);
     assert!(ran.err.contains("already running"), "{}", ran.err);
     holding.close().unwrap();
@@ -453,7 +468,7 @@ fn public_key_prints_the_existing_keys_public_half_and_nothing_else() {
     let made = cli(&["keygen", "--state-dir", path(&state), "--key-id", "hub-key-1"]);
     assert_eq!(made.code, 0);
     let key_file = std::fs::read(state.join("hub.key")).unwrap();
-    let again = cli(&["public-key", "--state-dir", path(&state), "--key-id", "hub-key-1"]);
+    let again = cli(&["public-key", "--state-dir", path(&state)]);
     assert_eq!(
         (again.code, again.out.as_str(), again.err.as_str()),
         (0, made.out.as_str(), "")
@@ -473,6 +488,7 @@ fn public_key_prints_the_existing_keys_public_half_and_nothing_else() {
         "{}",
         refused.err
     );
+    assert!(!refused.err.contains("--key-id"), "the id is on disk: {}", refused.err);
     // No key: a reason, exit 1; a malformed key id: usage, exit 2.
     let none = cli(&[
         "public-key",
@@ -481,7 +497,7 @@ fn public_key_prints_the_existing_keys_public_half_and_nothing_else() {
         "--key-id",
         "hub-key-1",
     ]);
-    assert_eq!(none.code, 1);
+    assert_eq!(none.code, 2, "could not start: no key");
     assert!(none.err.contains("no key"), "{}", none.err);
     assert_eq!(
         cli(&["public-key", "--state-dir", path(&state), "--key-id", "Bad Id"]).code,
@@ -499,7 +515,7 @@ fn status_shows_a_halt_with_its_time_and_names_resume_which_clears_it() {
     agent.tick().unwrap();
     // Refused while the agent holds the directory.
     let busy = cli(&["resume", "--config", path(&hub.config_path)]);
-    assert_eq!(busy.code, 1);
+    assert_eq!(busy.code, 2);
     assert!(busy.err.contains("already running"), "{}", busy.err);
     agent.close().unwrap();
     let status = status_of(&hub);
@@ -551,4 +567,349 @@ fn a_damaged_outbox_is_said_once_on_stderr_without_its_contents() {
     assert!(err.contains("outbox.sqlite.damaged"), "{err}");
     assert_no_personal_data(&err, "stderr");
     assert_eq!(status_of(&hub)["problem"], "outbox_replaced");
+}
+
+// ---- What `run` says on stderr ----
+
+#[test]
+fn run_says_once_on_stderr_that_it_halted_and_how_to_resume() {
+    let hub = Hub::new();
+    hub.service.push(Step::Pass);
+    hub.service
+        .push(Step::status(400, serde_json::json!({"error": "schema"})));
+    let mut child = spawn_run(&hub);
+    wait_until("the halt", || hub.state.join("halt.json").exists());
+    wait_until("agent.json to say so", || {
+        std::fs::read_to_string(hub.state.join("agent.json")).is_ok_and(|text| text.contains("\"halted\": \"schema\""))
+    });
+    signal(&child, "TERM");
+    assert_eq!(exit_of(&mut child).code(), Some(0));
+    let (out, err) = output_of(child);
+    assert_eq!(out, "");
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(err.contains("halted") && err.contains("schema"), "{err}");
+    assert!(err.contains("spacegoat-hub resume --config"), "{err}");
+    assert_no_personal_data(&err, "stderr");
+}
+
+// ---- Resume says what clearing means, per reason ----
+
+fn halted_with(hub: &Hub, reason: &str) {
+    std::fs::write(
+        hub.state.join("halt.json"),
+        format!("{{\"reason\": \"{reason}\", \"at\": null}}"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn resume_says_per_reason_what_clearing_it_means() {
+    for (reason, said) in [
+        ("schema", &["schema", "refused"][..]),
+        ("replay_conflict", &["replay_conflict", "another"][..]),
+        ("too_large", &["too_large", "larger"][..]),
+        ("ahead", &["ahead", "does not fix", "register it anew"][..]),
+        ("gap", &["gap", "halt again", "--from-service"][..]),
+        ("unknown", &["unknown"][..]),
+    ] {
+        let hub = Hub::new();
+        halted_with(&hub, if reason == "unknown" { "something new" } else { reason });
+        let ran = cli(&["resume", "--config", path(&hub.config_path)]);
+        assert_eq!(ran.code, 0, "{reason}: {}", ran.err);
+        for words in said {
+            assert!(ran.out.contains(words), "{reason}: {words:?} not in {}", ran.out);
+        }
+        assert!(!hub.state.join("halt.json").exists(), "{reason}");
+    }
+}
+
+#[test]
+fn resume_from_service_is_the_way_out_of_a_gap() {
+    let hub = Hub::new();
+    std::fs::write(hub.state.join("confirmed.json"), r#"{"lastAckedSeq": 10}"#).unwrap();
+    hub.service.set_last_seq(3);
+    hub.run(2).close().unwrap();
+    assert_eq!(status_of(&hub)["halted"], "gap");
+    // Plain resume clears it, and it comes back: the cause is still there.
+    let plain = cli(&["resume", "--config", path(&hub.config_path)]);
+    assert_eq!(plain.code, 0, "{}", plain.err);
+    hub.run(2).close().unwrap();
+    assert_eq!(status_of(&hub)["halted"], "gap");
+    let ran = cli(&["resume", "--config", path(&hub.config_path), "--from-service"]);
+    assert_eq!(ran.code, 0, "{}", ran.err);
+    assert!(ran.out.contains("service"), "{}", ran.out);
+    let mark: Value =
+        serde_json::from_str(&std::fs::read_to_string(hub.state.join("confirmed.json")).unwrap()).unwrap();
+    assert_eq!(mark["lastAckedSeq"], 0);
+    let agent = hub.run(3);
+    assert_eq!(agent.status().unwrap().halted, None);
+    let reset = hub
+        .service
+        .accepted()
+        .into_iter()
+        .find(|event| event["kind"] == "site_source.reset")
+        .unwrap();
+    assert_eq!(reset["sourceSeq"], 4);
+    assert_eq!(reset["attributes"]["lastAckedSeq"], 3);
+}
+
+#[test]
+fn resume_from_service_is_refused_for_any_other_halt_and_for_a_queue_that_holds_numbers() {
+    let hub = Hub::new();
+    halted_with(&hub, "schema");
+    let ran = cli(&["resume", "--config", path(&hub.config_path), "--from-service"]);
+    assert_eq!(ran.code, 1, "{}", ran.out);
+    assert!(ran.err.contains("gap"), "{}", ran.err);
+    assert!(hub.state.join("halt.json").exists(), "not cleared");
+    // A gap met while delivering: the queue still holds numbers the service does not have.
+    let hub = Hub::new();
+    hub.run(2).close().unwrap();
+    halted_with(&hub, "gap");
+    let ran = cli(&["resume", "--config", path(&hub.config_path), "--from-service"]);
+    assert_eq!(ran.code, 1, "{}", ran.out);
+    assert!(ran.err.contains("outbox.sqlite"), "{}", ran.err);
+    assert!(hub.state.join("halt.json").exists(), "not cleared");
+    // Nothing halted: nothing to resume.
+    let hub = Hub::new();
+    let ran = cli(&["resume", "--config", path(&hub.config_path), "--from-service"]);
+    assert_eq!(ran.code, 1);
+    assert!(ran.err.contains("not halted"), "{}", ran.err);
+}
+
+// ---- Files of the hub's own that are not files ----
+
+#[test]
+fn status_and_resume_refuse_a_status_halt_or_confirmed_file_that_is_not_a_file() {
+    for name in ["agent.json", "halt.json", "confirmed.json", "outbox.sqlite"] {
+        let hub = Hub::new();
+        std::fs::create_dir(hub.state.join(name)).unwrap();
+        for command in ["status", "resume"] {
+            let ran = cli(&[command, "--config", path(&hub.config_path)]);
+            assert_eq!(ran.code, 2, "{command} {name}: {}", ran.err);
+            assert!(
+                ran.err.contains(name) && ran.err.contains("directory"),
+                "{command}: {}",
+                ran.err
+            );
+            assert!(ran.err.contains("by hand"), "{command}: {}", ran.err);
+        }
+        let ran = run_refused(&hub.config_path);
+        assert_eq!(ran.code, 2, "run {name}: {}", ran.err);
+        assert!(
+            ran.err.contains(name) && ran.err.contains("directory"),
+            "run: {}",
+            ran.err
+        );
+    }
+}
+
+// ---- The key id on disk ----
+
+#[test]
+fn keygen_records_the_key_id_and_public_key_reads_it_back() {
+    let tmp = TempDir::new();
+    let state = tmp.join("state");
+    let made = cli(&["keygen", "--state-dir", path(&state), "--key-id", "hub-key-1"]);
+    assert_eq!(made.code, 0, "{}", made.err);
+    assert_eq!(support::mode(&state.join("hub.key.id")), 0o600);
+    let again = cli(&["public-key", "--state-dir", path(&state)]);
+    assert_eq!((again.code, again.out.as_str()), (0, made.out.as_str()));
+    let same = cli(&["public-key", "--state-dir", path(&state), "--key-id", "hub-key-1"]);
+    assert_eq!((same.code, same.out.as_str()), (0, made.out.as_str()));
+    let other = cli(&["public-key", "--state-dir", path(&state), "--key-id", "hub-key-2"]);
+    assert_eq!(other.code, 2);
+    assert!(
+        other.err.contains("hub-key-1") && other.err.contains("hub-key-2"),
+        "{}",
+        other.err
+    );
+    assert!(other.out.is_empty());
+}
+
+#[test]
+fn run_refuses_a_configuration_whose_key_id_is_not_the_one_the_key_was_made_with() {
+    let hub = Hub::new();
+    std::fs::write(hub.state.join("hub.key.id"), "hub-key-9\n").unwrap();
+    std::fs::set_permissions(hub.state.join("hub.key.id"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let ran = run_refused(&hub.config_path);
+    assert_eq!(ran.code, 2);
+    assert!(
+        ran.err.contains("hub-key-1") && ran.err.contains("hub-key-9"),
+        "{}",
+        ran.err
+    );
+    assert!(hub.service.requests().is_empty());
+}
+
+#[test]
+fn a_state_directory_from_an_earlier_build_without_the_key_id_works_as_before() {
+    // The fixture makes its key without the id file, as an earlier build did.
+    let hub = Hub::new();
+    assert!(!hub.state.join("hub.key.id").exists());
+    hub.run(1).close().unwrap();
+    let state = path(&hub.state);
+    let given = cli(&["public-key", "--state-dir", state, "--key-id", "hub-key-1"]);
+    assert_eq!(given.code, 0, "{}", given.err);
+    let asked = cli(&["public-key", "--state-dir", state]);
+    assert_eq!(asked.code, 2);
+    assert!(asked.err.contains("--key-id"), "{}", asked.err);
+}
+
+// ---- The state directory: what status refuses, and the messages ----
+
+#[test]
+fn status_refuses_what_run_refuses_about_the_state_directory() {
+    let hub = Hub::new();
+    std::fs::set_permissions(&hub.state, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let ran = cli(&["status", "--config", path(&hub.config_path)]);
+    assert_eq!(ran.code, 2, "{}", ran.out);
+    assert!(ran.err.contains("open to other users"), "{}", ran.err);
+    assert!(ran.out.is_empty());
+    std::fs::set_permissions(&hub.state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for broken in ["missing", "file"] {
+        let hub = Hub::new();
+        std::fs::remove_dir_all(&hub.state).unwrap();
+        if broken == "file" {
+            std::fs::write(&hub.state, "x").unwrap();
+        }
+        let ran = cli(&["status", "--config", path(&hub.config_path)]);
+        assert_eq!(ran.code, 2, "{broken}: {}", ran.out);
+        let said = if broken == "file" { "not a directory" } else { "missing" };
+        assert!(ran.err.contains(said), "{broken}: {}", ran.err);
+        assert!(ran.out.is_empty());
+    }
+}
+
+#[test]
+fn keygen_and_run_on_a_path_that_is_a_file_say_not_a_directory() {
+    let tmp = TempDir::new();
+    let file = tmp.join("state");
+    std::fs::write(&file, "x").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let made = cli(&["keygen", "--state-dir", path(&file), "--key-id", "hub-key-1"]);
+    assert_eq!(made.code, 2);
+    assert!(made.err.contains("not a directory"), "{}", made.err);
+    let hub = Hub::new();
+    std::fs::remove_dir_all(&hub.state).unwrap();
+    std::fs::write(&hub.state, "x").unwrap();
+    let ran = run_refused(&hub.config_path);
+    assert_eq!(ran.code, 2);
+    assert!(ran.err.contains("not a directory"), "{}", ran.err);
+}
+
+#[test]
+fn a_directory_the_user_owns_but_cannot_write_is_said_so() {
+    let tmp = TempDir::new();
+    let state = tmp.join("state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let made = cli(&["keygen", "--state-dir", path(&state), "--key-id", "hub-key-1"]);
+    assert_eq!(made.code, 2);
+    assert!(made.err.contains("cannot be written"), "{}", made.err);
+    assert!(!made.err.contains("another user"), "{}", made.err);
+    let hub = Hub::new();
+    std::fs::set_permissions(&hub.state, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let ran = run_refused(&hub.config_path);
+    std::fs::set_permissions(&hub.state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(ran.code, 2);
+    assert!(ran.err.contains("cannot be written"), "{}", ran.err);
+    assert!(!ran.err.contains("another user"), "{}", ran.err);
+}
+
+#[test]
+fn an_outbox_of_another_source_says_which_is_which_and_prints_neither() {
+    let hub = Hub::new();
+    hub.run(1).close().unwrap();
+    let other = "fedcba98-7654-4321-8fed-cba987654321";
+    let text = std::fs::read_to_string(&hub.config_path)
+        .unwrap()
+        .replace(support::hub::SOURCE, other);
+    std::fs::write(&hub.config_path, text).unwrap();
+    let ran = run_refused(&hub.config_path);
+    assert_eq!(ran.code, 2);
+    assert!(
+        ran.err.contains("configuration") && ran.err.contains("outbox.sqlite"),
+        "{}",
+        ran.err
+    );
+    assert!(
+        !ran.err.contains(other) && !ran.err.contains(support::hub::SOURCE),
+        "{}",
+        ran.err
+    );
+}
+
+#[test]
+fn the_resume_command_status_names_has_an_absolute_path() {
+    let hub = Hub::new();
+    halted_with(&hub, "schema");
+    let output = Command::new(BINARY)
+        .args(["status", "--config", "hub.toml"])
+        .current_dir(hub.tmp.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let absolute = std::fs::canonicalize(hub.tmp.path()).unwrap().join("hub.toml");
+    let named = status["resume"].as_str().unwrap();
+    let named_path = named.strip_prefix("spacegoat-hub resume --config ").unwrap();
+    assert!(Path::new(named_path).is_absolute(), "{named}");
+    assert_eq!(std::fs::canonicalize(named_path).unwrap(), absolute);
+}
+
+#[test]
+fn exit_codes_are_the_same_in_every_command() {
+    // 2: it could not start.
+    let hub = Hub::new();
+    let holding = hub.agent();
+    halted_with(&hub, "schema");
+    assert_eq!(cli(&["resume", "--config", path(&hub.config_path)]).code, 2, "the lock");
+    holding.close().unwrap();
+    let tmp = TempDir::new();
+    let open = tmp.join("open");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        cli(&["keygen", "--state-dir", path(&open), "--key-id", "hub-key-1"]).code,
+        2
+    );
+    // 1: it ran and failed.
+    let hub = Hub::new();
+    assert_eq!(
+        cli(&["resume", "--config", path(&hub.config_path)]).code,
+        1,
+        "nothing to resume"
+    );
+    // 0: success.
+    halted_with(&hub, "schema");
+    assert_eq!(cli(&["resume", "--config", path(&hub.config_path)]).code, 0);
+}
+
+// ---- A healthy queue is never set aside: a hot write-ahead log after a kill ----
+
+#[test]
+fn an_outbox_with_a_hot_write_ahead_log_after_a_kill_is_not_set_aside() {
+    let hub = Hub::new();
+    let mut child = spawn_run(&hub);
+    wait_until("the first batch", || hub.service.last_seq() >= 2);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let wal = hub.state.join("outbox.sqlite-wal");
+    assert!(
+        std::fs::metadata(&wal).unwrap().len() > 0,
+        "the log the kill left behind"
+    );
+    let before = status_of(&hub);
+    let agent = hub.agent();
+    assert!(agent.notices().is_empty(), "{:?}", agent.notices());
+    assert!(!hub.state.join("outbox.sqlite.damaged").exists());
+    assert_eq!(
+        agent.status().unwrap().last_assigned_seq,
+        before["lastAssignedSeq"].as_u64().unwrap()
+    );
 }

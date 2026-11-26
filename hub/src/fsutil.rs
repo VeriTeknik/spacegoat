@@ -61,6 +61,50 @@ pub fn write_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
     fsync_directory(directory)
 }
 
+/// `write_atomic` for a file of the hub's own: refused (`InvalidInput`) when its name holds anything but a regular file
+/// (a symbolic link, a directory), which a person must look at, rather than replaced by the write.
+pub fn write_own_file(path: &Path, content: &[u8]) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_file() => Err(not_a_regular_file(path)),
+        Ok(_) => write_atomic(path, content),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => write_atomic(path, content),
+        Err(error) => Err(error),
+    }
+}
+
+/// What a name in the state directory holds when it is not a regular file, in words: `None` for a regular file and
+/// for nothing at all.
+pub fn non_file_kind(path: &Path) -> io::Result<Option<&'static str>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let kind = meta.file_type();
+            Ok(if kind.is_file() {
+                None
+            } else if kind.is_symlink() {
+                Some("a symbolic link")
+            } else if kind.is_dir() {
+                Some("a directory")
+            } else {
+                Some("not a regular file")
+            })
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The user this process creates files as (std cannot ask for the effective uid): the owner of a temporary file made
+/// for a moment in the system's temporary directory, and removed again. Nothing in the state directory is touched.
+pub fn current_uid() -> io::Result<u32> {
+    let (file, path) = create_temporary(&std::env::temp_dir(), ".spacegoat-hub-uid.")?;
+    let uid = file.metadata().map(|meta| meta.uid());
+    drop(file);
+    let removed = std::fs::remove_file(&path);
+    let uid = uid?;
+    removed?;
+    Ok(uid)
+}
+
 /// Create `path` for its owner only, or, if it exists, make sure it still is: the hub's state files hold personal
 /// data (queued events, what was last seen of each device). A file of the hub's own that has become readable by
 /// others is closed again, not trusted as it is. A symbolic link or anything but a regular file is refused.

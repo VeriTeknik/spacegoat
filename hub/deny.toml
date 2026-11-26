@@ -25,6 +25,11 @@ allow = [
     "CDLA-Permissive-2.0",
 ]
 
+# The hub crate itself is AGPL-3.0-or-later and not published (`publish = false`): its own licence is not judged
+# against the list above, which is about what may be linked into it.
+[licenses.private]
+ignore = true
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"

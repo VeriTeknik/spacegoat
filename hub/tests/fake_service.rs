@@ -8,11 +8,15 @@
 
 mod support;
 
+use std::io::{Read, Write};
+
 use serde_json::{Map, Value, json};
+use spacegoat_hub::canonical::canonical_json;
 use spacegoat_hub::clock;
 use spacegoat_hub::outbox::Outbox;
 use spacegoat_hub::sender::{HaltReason, SendOutcome, Sender};
-use support::fake_service::{FakeService, TestClock};
+use spacegoat_hub::signing::{self, EventFields};
+use support::fake_service::{FakeService, PATH, TestClock};
 use support::{TempDir, vector_key};
 
 const SOURCE: &str = "01234567-89ab-4cde-8fab-0123456789ab";
@@ -375,4 +379,183 @@ fn a_gap_is_declared_from_the_next_number_and_carries_the_number_after_it() {
     );
     // Not from the next number: an ordinary gap in the sequence.
     assert_eq!(at_four(declared(2, 3)).0, SendOutcome::Halted(HaltReason::Gap));
+}
+
+// ---- A personal-data nonce is fresh for each event (protocol §6) ----
+
+/// Event `seq` signed again by the vector key with `nonce` as its personal-data nonce, written over the stored one.
+fn renonce(case: &Case, seq: u64, nonce: &str) {
+    let path = case.tmp.join("outbox.sqlite");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let body: String = db
+        .query_row("SELECT body FROM events WHERE seq = ?1", [seq as i64], |row| row.get(0))
+        .unwrap();
+    let mut event: Value = serde_json::from_str(&body).unwrap();
+    let commitment = signing::pii_commitment(nonce, &event["pii"]).unwrap();
+    let message = signing::event_signing_message(&EventFields {
+        source_id: SOURCE,
+        source_seq: seq,
+        kind: event["kind"].as_str().unwrap(),
+        observed_at: event["observedAt"].as_str().unwrap(),
+        attributes: &event["attributes"],
+        pii_commitment: Some(&commitment),
+    })
+    .unwrap();
+    let signature = signing::stored_signature(KEY_ID, &signing::sign(&vector_key(), &message)).unwrap();
+    event["piiNonce"] = json!(nonce);
+    event["piiCommitment"] = json!(commitment);
+    event["signature"] = json!(signature);
+    db.execute(
+        "UPDATE events SET body = ?1 WHERE seq = ?2",
+        rusqlite::params![canonical_json(&event).unwrap(), seq as i64],
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_personal_data_nonce_used_before_is_refused() {
+    let appeared = json!({"trustOrigin": "hub", "deviceRef": DEVICE, "segmentRef": SEGMENT, "deviceClass": "printer"});
+    let mut case = Case::new();
+    case.append(
+        "site.device_appeared",
+        appeared.clone(),
+        Some(json!({"ip": "192.0.2.1"})),
+    )
+    .append(
+        "site.device_appeared",
+        appeared.clone(),
+        Some(json!({"ip": "192.0.2.2"})),
+    );
+    let first: Value = serde_json::from_str(&case.outbox.pending(1, None).unwrap()[0].json).unwrap();
+    let nonce = first["piiNonce"].as_str().unwrap().to_owned();
+    renonce(&case, 2, &nonce);
+    // In the same batch.
+    let Case {
+        tmp,
+        clock,
+        service,
+        outbox,
+    } = case;
+    let mut sender = Sender::new(
+        &service.base_url,
+        SOURCE,
+        KEY_ID,
+        vector_key(),
+        outbox,
+        clock.as_clock(),
+    )
+    .unwrap();
+    assert_eq!(sender.step().unwrap(), SendOutcome::Halted(HaltReason::Schema));
+    drop((sender, tmp, service));
+    // And in a later request than the one that used it first.
+    let mut case = Case::new();
+    case.append(
+        "site.device_appeared",
+        appeared.clone(),
+        Some(json!({"ip": "192.0.2.1"})),
+    );
+    let first: Value = serde_json::from_str(&case.outbox.pending(1, None).unwrap()[0].json).unwrap();
+    let nonce = first["piiNonce"].as_str().unwrap().to_owned();
+    let Case {
+        tmp,
+        clock,
+        service,
+        mut outbox,
+    } = case;
+    outbox
+        .append(
+            "site.device_appeared",
+            &time(&clock, 0),
+            &object(appeared),
+            Some(&object(json!({"ip": "192.0.2.2"}))),
+        )
+        .unwrap();
+    let probe = Case {
+        tmp,
+        clock,
+        service,
+        outbox,
+    };
+    renonce(&probe, 2, &nonce);
+    let Case {
+        tmp,
+        clock,
+        service,
+        outbox,
+    } = probe;
+    let mut sender = Sender::new(
+        &service.base_url,
+        SOURCE,
+        KEY_ID,
+        vector_key(),
+        outbox,
+        clock.as_clock(),
+    )
+    .unwrap();
+    // One event per request (a `413` halves the batch): the first is accepted, the second reuses its nonce.
+    service.push(support::fake_service::Step::MaxEvents(1));
+    assert_eq!(sender.step().unwrap(), SendOutcome::RetryNow);
+    let first = sender.step().unwrap();
+    let second = sender.step().unwrap();
+    assert_eq!(
+        (first, second),
+        (SendOutcome::Sent(1), SendOutcome::Halted(HaltReason::Schema))
+    );
+    assert_eq!(service.accepted_seqs(), [1]);
+    drop(tmp);
+}
+
+#[test]
+fn a_replayed_event_keeps_its_nonce_and_is_a_duplicate_not_a_reuse() {
+    let mut case = Case::new();
+    case.append(
+        "site.device_appeared",
+        json!({"trustOrigin": "hub", "deviceRef": DEVICE, "segmentRef": SEGMENT, "deviceClass": "printer"}),
+        Some(json!({"ip": "192.0.2.1"})),
+    );
+    case.service.push(support::fake_service::Step::LoseAnswer);
+    let Case {
+        tmp,
+        clock,
+        service,
+        outbox,
+    } = case;
+    let mut sender = Sender::new(
+        &service.base_url,
+        SOURCE,
+        KEY_ID,
+        vector_key(),
+        outbox,
+        clock.as_clock(),
+    )
+    .unwrap();
+    assert!(matches!(sender.step().unwrap(), SendOutcome::RetryLater(_)));
+    clock.advance_seconds(5);
+    assert_eq!(sender.step().unwrap(), SendOutcome::Sent(1));
+    drop(tmp);
+}
+
+// ---- The service authenticates before it judges anything else ----
+
+#[test]
+fn an_unsigned_request_is_unauthorized_whatever_its_body_or_headers() {
+    let service = FakeService::new(SOURCE, KEY_ID, vector_key().verifying_key());
+    let address = service.base_url.strip_prefix("http://").unwrap();
+    for (content_type, body) in [
+        ("application/json", &b"not gzip at all"[..]),
+        ("text/plain", &b"{}"[..]),
+    ] {
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        let request = format!(
+            "POST {PATH} HTTP/1.1\r\nHost: {address}\r\nContent-Type: {content_type}\r\nContent-Encoding: gzip\r\n\
+             X-VT-Principal: source:{SOURCE}\r\nX-VT-Key-Id: {KEY_ID}\r\nX-VT-Timestamp: 1800000000\r\n\
+             X-VT-Signature: AAAA\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).unwrap();
+        assert!(answer.starts_with("HTTP/1.1 401 "), "{content_type}: {answer}");
+    }
 }

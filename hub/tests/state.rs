@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use serde_json::{Map, Value, json};
 use spacegoat_hub::fsutil::{create_temporary, fsync_directory, private_file, write_atomic};
-use spacegoat_hub::state::{Confirmed, Pseudonyms, uuid_v4};
+use spacegoat_hub::state::{Confirmed, Mark, Pseudonyms, uuid_v4};
 use support::{TempDir, mode};
 
 fn object(value: Value) -> Map<String, Value> {
@@ -171,60 +171,90 @@ fn a_directory_can_be_synced() {
 
 // ---- Confirmed ----
 
+const SOURCE: &str = "01234567-89ab-4cde-8fab-0123456789ab";
+const OTHER: &str = "fedcba98-7654-4321-8fed-cba987654321";
+
 #[test]
-fn confirmed_is_zero_until_something_is_confirmed() {
+fn confirmed_is_nothing_until_something_is_confirmed() {
     let tmp = TempDir::new();
-    let confirmed = Confirmed::new(tmp.join("confirmed.json"));
-    assert_eq!(confirmed.read().unwrap(), 0);
+    let confirmed = Confirmed::new(tmp.join("confirmed.json"), SOURCE);
+    assert_eq!(confirmed.read().unwrap(), Mark::Nothing);
     confirmed.write(41).unwrap();
-    assert_eq!(confirmed.read().unwrap(), 41);
-    assert_eq!(Confirmed::new(tmp.join("confirmed.json")).read().unwrap(), 41);
+    assert_eq!(confirmed.read().unwrap(), Mark::Confirmed(41));
+    assert_eq!(
+        Confirmed::new(tmp.join("confirmed.json"), SOURCE).read().unwrap(),
+        Mark::Confirmed(41)
+    );
 }
 
 #[test]
-fn confirmed_only_moves_forward() {
+fn confirmed_only_moves_forward_unless_it_is_replaced() {
     let tmp = TempDir::new();
-    let confirmed = Confirmed::new(tmp.join("confirmed.json"));
+    let confirmed = Confirmed::new(tmp.join("confirmed.json"), SOURCE);
     confirmed.write(41).unwrap();
     confirmed.write(7).unwrap();
-    assert_eq!(confirmed.read().unwrap(), 41);
-    confirmed.write(41).unwrap();
+    assert_eq!(confirmed.read().unwrap(), Mark::Confirmed(41));
     confirmed.write(42).unwrap();
-    assert_eq!(confirmed.read().unwrap(), 42);
+    assert_eq!(confirmed.read().unwrap(), Mark::Confirmed(42));
+    confirmed.replace(0).unwrap();
+    assert_eq!(confirmed.read().unwrap(), Mark::Confirmed(0));
 }
 
 #[test]
-fn confirmed_is_written_as_the_python_agent_wrote_it_and_privately() {
+fn confirmed_names_its_source_and_is_private() {
     let tmp = TempDir::new();
     let path = tmp.join("confirmed.json");
-    Confirmed::new(&path).write(41).unwrap();
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"lastAckedSeq": 41}"#);
+    Confirmed::new(&path, SOURCE).write(41).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{{\"lastAckedSeq\": 41, \"sourceId\": \"{SOURCE}\"}}")
+    );
     assert_eq!(mode(&path), 0o600);
 }
 
 #[test]
-fn a_damaged_confirmed_file_reads_as_nothing_confirmed() {
+fn a_mark_of_another_source_is_no_mark_and_the_earlier_form_is_this_sources() {
+    let tmp = TempDir::new();
+    let path = tmp.join("confirmed.json");
+    std::fs::write(&path, format!("{{\"lastAckedSeq\": 41, \"sourceId\": \"{OTHER}\"}}")).unwrap();
+    assert_eq!(Confirmed::new(&path, SOURCE).read().unwrap(), Mark::Nothing);
+    // And this source's first mark replaces it, however small.
+    Confirmed::new(&path, SOURCE).write(3).unwrap();
+    assert_eq!(Confirmed::new(&path, SOURCE).read().unwrap(), Mark::Confirmed(3));
+    std::fs::write(&path, r#"{"lastAckedSeq": 41}"#).unwrap();
+    assert_eq!(Confirmed::new(&path, SOURCE).read().unwrap(), Mark::Confirmed(41));
+}
+
+#[test]
+fn a_confirmed_file_that_cannot_be_understood_is_not_a_zero() {
     let tmp = TempDir::new();
     let path = tmp.join("confirmed.json");
     for damaged in [
-        "",
-        "not json",
-        "[]",
-        "{}",
-        r#"{"lastAckedSeq": -1}"#,
-        r#"{"lastAckedSeq": 1.5}"#,
-        r#"{"lastAckedSeq": 2.0}"#,
-        r#"{"lastAckedSeq": true}"#,
-        r#"{"lastAckedSeq": "41"}"#,
-        r#"{"lastAckedSeq": null}"#,
-        "\u{feff}{\"lastAckedSeq\": 41}",
+        "".to_owned(),
+        "not json".to_owned(),
+        "[]".to_owned(),
+        "{}".to_owned(),
+        r#"{"lastAckedSeq": -1}"#.to_owned(),
+        r#"{"lastAckedSeq": 1.5}"#.to_owned(),
+        r#"{"lastAckedSeq": 2.0}"#.to_owned(),
+        r#"{"lastAckedSeq": true}"#.to_owned(),
+        r#"{"lastAckedSeq": "41"}"#.to_owned(),
+        r#"{"lastAckedSeq": null}"#.to_owned(),
+        r#"{"lastAckedSeq": 41, "sourceId": 7}"#.to_owned(),
+        "\u{feff}{\"lastAckedSeq\": 41}".to_owned(),
+        format!("{{\"lastAckedSeq\": 41, \"pad\": \"{}\"}}", "x".repeat(70_000)),
     ] {
-        std::fs::write(&path, damaged).unwrap();
-        assert_eq!(Confirmed::new(&path).read().unwrap(), 0, "{damaged:?}");
+        std::fs::write(&path, &damaged).unwrap();
+        assert_eq!(
+            Confirmed::new(&path, SOURCE).read().unwrap(),
+            Mark::NotUnderstood,
+            "{}",
+            damaged.get(..40).unwrap_or(&damaged)
+        );
     }
-    // Then a write puts it right.
-    Confirmed::new(&path).write(3).unwrap();
-    assert_eq!(Confirmed::new(&path).read().unwrap(), 3);
+    // A forward write puts it right: a mark nobody can read holds nothing to move back from.
+    Confirmed::new(&path, SOURCE).write(3).unwrap();
+    assert_eq!(Confirmed::new(&path, SOURCE).read().unwrap(), Mark::Confirmed(3));
 }
 
 #[test]
@@ -233,7 +263,14 @@ fn a_confirmed_file_the_hub_cannot_read_is_an_error_not_a_zero() {
     let tmp = TempDir::new();
     let path = tmp.join("confirmed.json");
     std::fs::create_dir(&path).unwrap();
-    Confirmed::new(&path).read().unwrap_err();
+    Confirmed::new(&path, SOURCE).read().unwrap_err();
+    // Nor is one reached through a link read.
+    let tmp = TempDir::new();
+    let target = tmp.join("elsewhere.json");
+    std::fs::write(&target, r#"{"lastAckedSeq": 41}"#).unwrap();
+    let path = tmp.join("confirmed.json");
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    Confirmed::new(&path, SOURCE).read().unwrap_err();
 }
 
 // ---- Pseudonyms ----
@@ -315,7 +352,7 @@ fn facts_are_empty_before_the_first_report_and_remembered_after() {
 }
 
 #[test]
-fn facts_are_stored_with_sorted_keys_as_the_python_agent_stored_them() {
+fn facts_are_stored_as_json_with_sorted_keys() {
     let tmp = TempDir::new();
     let path = tmp.join("pseudonyms.sqlite");
     let mut pseudonyms = Pseudonyms::open(&path).unwrap();

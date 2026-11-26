@@ -2,8 +2,10 @@
 //! A hub service for tests: it checks what the real one checks (spec/protocol.md) and nothing is mocked in between.
 //!
 //! A real HTTP/1.1 server on a loopback socket, with its request parsing written out here (no server crate), so the
-//! sender is tested against bytes on a wire. It verifies the request signature against the registered public key,
-//! the timestamp window, the gzip body and its limits, every event signature, the personal-data commitment, the age
+//! sender is tested against bytes on a wire. It verifies the request signature against the registered public key
+//! before it looks at anything else,
+//! the timestamp window, the gzip body and its limits, every event signature, the personal-data commitment and that its
+//! nonce was never used by another event, the age
 //! of each observation, the sequence, the reset rule and the gap rule wherever the event sits in the batch, and on a
 //! replay the whole event against the one on record. Every fresh event must also have the form protocol §6 to §9
 //! give its kind (`has_the_protocols_shape`): exactly its attributes and no other, each of its type and format,
@@ -15,7 +17,7 @@
 //! back, or that sends no `Date`. It records every request and every event it accepted, so a test asserts on what
 //! actually arrived.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -162,7 +164,7 @@ pub enum Step {
     /// The same for a 503.
     TruncateError,
     /// These bytes are the whole answer, then the connection closes. For answers no well-behaved server writes
-    /// (the Python tests made those with a stub opener instead of a socket).
+    /// (not HTTP at all, a body that cannot be decoded, a page from something in between).
     Raw(Vec<u8>),
 }
 
@@ -222,6 +224,8 @@ struct State {
     /// What is on record, by sequence number: the canonical text of the event. A replay is compared with it, never
     /// taken on trust.
     stored: HashMap<u64, String>,
+    /// Every personal-data nonce of an accepted event: a nonce is fresh for each event (protocol §6).
+    nonces: HashSet<String>,
     requests: Vec<Record>,
     script: VecDeque<Step>,
     max_events: usize,
@@ -247,6 +251,7 @@ impl FakeService {
             last_seq: 0,
             accepted: Vec::new(),
             stored: HashMap::new(),
+            nonces: HashSet::new(),
             requests: Vec::new(),
             script: VecDeque::new(),
             max_events: 500,
@@ -286,6 +291,11 @@ impl FakeService {
 
     pub fn push(&self, step: Step) {
         self.state().script.push_back(step);
+    }
+
+    /// Forget the answers scripted and not used yet: the service is simply itself again.
+    pub fn clear_script(&self) {
+        self.state().script.clear();
     }
 
     pub fn last_seq(&self) -> u64 {
@@ -524,6 +534,11 @@ fn handle(state: &mut State, request: &Request, now: i64) -> Outcome {
         Some(Step::StatusWithoutDate { code, body }) => return Outcome::AnswerWithoutDate(*code, body.clone()),
         _ => {}
     }
+    // Whoever is not a registered hub learns nothing about what else is wrong with the request (protocol §1: the
+    // service refuses every request that is not signed by a key it has on record).
+    if !authentic(state, request, now) {
+        return error(401, json!({"error": "unauthorized"}));
+    }
     let headers = &request.headers;
     let well_formed = request.method == "POST"
         && request.path == PATH
@@ -532,9 +547,6 @@ fn handle(state: &mut State, request: &Request, now: i64) -> Outcome {
         && header(headers, "Content-Type") == Some("application/json");
     if !well_formed {
         return schema();
-    }
-    if !authentic(state, request, now) {
-        return error(401, json!({"error": "unauthorized"}));
     }
     if request.body.len() > MAX_COMPRESSED {
         return error(413, json!({"error": "too_large"}));
@@ -590,6 +602,7 @@ fn handle(state: &mut State, request: &Request, now: i64) -> Outcome {
     // `held` is what the service holds when it reaches each fresh event: the reset rule and the sequence are judged
     // against it, wherever in the batch the event sits.
     let mut held = last_seq;
+    let mut nonces = HashSet::new();
     for (index, (event, seq)) in fresh.iter().enumerate() {
         let kind = event.get("kind").and_then(Value::as_str);
         let attributes = event.get("attributes");
@@ -614,8 +627,14 @@ fn handle(state: &mut State, request: &Request, now: i64) -> Outcome {
         if !has_the_protocols_shape(event) || !event_is_valid(state, event, *seq, now) {
             return schema();
         }
+        if let Some(nonce) = event.get("piiNonce").and_then(Value::as_str)
+            && (state.nonces.contains(nonce) || !nonces.insert(nonce.to_owned()))
+        {
+            return schema();
+        }
         held = *seq;
     }
+    state.nonces.extend(nonces);
     for (event, seq) in &fresh {
         state.accepted.push((*event).clone());
         state.stored.insert(*seq, canonical_json(event).unwrap());

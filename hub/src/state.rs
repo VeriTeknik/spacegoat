@@ -3,20 +3,21 @@
 //!
 //! Two things, kept apart from the outbox on purpose, so that losing the queue does not lose them:
 //!
-//! - `Confirmed`: the last sequence number the service confirmed. With it, a hub whose outbox is gone can still say
+//! - `Confirmed`: the last sequence number the service confirmed, and to which source. With it, a hub whose outbox is gone can still say
 //!   truthfully where it stood (`site_source.reset`), instead of guessing or starting over.
 //! - `Pseudonyms`: which random `deviceRef` stands for which device, and what was last reported about it. They are
 //!   what lets the service see "the same device" tomorrow. They are random (UUID v4), never derived from the device,
 //!   and they stay on the hub.
 
 use std::fmt;
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value};
 
-use crate::fsutil::{private_file, write_atomic};
+use crate::fsutil::{open_regular, private_file, write_own_file};
 use crate::outbox::open_durable;
 
 #[derive(Debug)]
@@ -81,39 +82,86 @@ pub fn uuid_v4() -> io::Result<String> {
     ))
 }
 
-/// The last sequence number the service confirmed, in a small JSON file of its own.
+/// `confirmed.json` holds a few short fields; anything larger is not one, and is not read whole.
+const MAX_CONFIRMED_FILE: u64 = 64 * 1024;
+
+/// What `confirmed.json` says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    /// There is no mark, or it was written for another source: nothing was confirmed to this one.
+    Nothing,
+    /// The service confirmed everything up to this number. A mark without a source id (the earlier form) is this
+    /// source's.
+    Confirmed(u64),
+    /// The file is there but does not say anything this code writes. It is not 0: it says that something was
+    /// confirmed once, and not how much.
+    NotUnderstood,
+}
+
+/// The last sequence number the service confirmed to one source, in a small JSON file of its own:
+/// `{"lastAckedSeq": 41, "sourceId": "<uuid>"}`.
 #[derive(Debug)]
 pub struct Confirmed {
     path: PathBuf,
+    source_id: String,
 }
 
 impl Confirmed {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+    pub fn new(path: impl Into<PathBuf>, source_id: &str) -> Self {
+        Self {
+            path: path.into(),
+            source_id: source_id.to_owned(),
+        }
     }
 
-    /// 0 when nothing was ever confirmed, or when the file does not hold a non-negative integer. A file that exists
-    /// but cannot be read is an error: reading 0 then would make the hub forget where it stood.
-    pub fn read(&self) -> io::Result<u64> {
-        let text = match std::fs::read(&self.path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+    /// The mark. A file that exists but cannot be read (permissions, a directory or a symbolic link at its name) is
+    /// an error: reading "nothing" then would make the hub forget where it stood.
+    pub fn read(&self) -> io::Result<Mark> {
+        let file = match open_regular(&self.path, OpenOptions::new().read(true)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Mark::Nothing),
             Err(error) => return Err(error),
         };
-        let value: Value = match serde_json::from_slice(&text) {
-            Ok(value) => value,
-            Err(_) => return Ok(0),
+        let mut text = Vec::new();
+        file.take(MAX_CONFIRMED_FILE + 1).read_to_end(&mut text)?;
+        if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_CONFIRMED_FILE {
+            return Ok(Mark::NotUnderstood);
+        }
+        let Ok(Value::Object(mark)) = serde_json::from_slice::<Value>(&text) else {
+            return Ok(Mark::NotUnderstood);
         };
-        Ok(value.get("lastAckedSeq").and_then(Value::as_u64).unwrap_or(0))
+        let Some(number) = mark.get("lastAckedSeq").and_then(Value::as_u64) else {
+            return Ok(Mark::NotUnderstood);
+        };
+        Ok(match mark.get("sourceId") {
+            None => Mark::Confirmed(number),
+            Some(Value::String(source)) if *source == self.source_id => Mark::Confirmed(number),
+            Some(Value::String(_)) => Mark::Nothing,
+            Some(_) => Mark::NotUnderstood,
+        })
     }
 
-    /// Record `last_acked_seq` if it is ahead of what is recorded; never moves back.
+    /// Record `last_acked_seq` if it is ahead of what is recorded; never moves back. Over a mark that is another
+    /// source's or cannot be understood it is written whatever its value (except 0, which says nothing).
     pub fn write(&self, last_acked_seq: u64) -> io::Result<()> {
-        if last_acked_seq > self.read()? {
-            // The Python agent's `json.dumps` form, space included.
-            write_atomic(&self.path, format!("{{\"lastAckedSeq\": {last_acked_seq}}}").as_bytes())?;
+        let ahead = match self.read()? {
+            Mark::Confirmed(recorded) => last_acked_seq > recorded,
+            Mark::Nothing | Mark::NotUnderstood => last_acked_seq > 0,
+        };
+        if ahead {
+            self.replace(last_acked_seq)?;
         }
         Ok(())
+    }
+
+    /// Record `last_acked_seq` whatever is recorded (a person's decision, or the queue's own count).
+    pub fn replace(&self, last_acked_seq: u64) -> io::Result<()> {
+        // `json.dumps` form, a space after each separator.
+        let text = format!(
+            "{{\"lastAckedSeq\": {last_acked_seq}, \"sourceId\": {}}}",
+            Value::from(self.source_id.as_str())
+        );
+        write_own_file(&self.path, text.as_bytes())
     }
 }
 
@@ -182,6 +230,14 @@ impl Pseudonyms {
         Ok(found)
     }
 
+    /// Whether the store holds no reference at all (new, or emptied).
+    pub fn is_empty(&self) -> Result<bool, StateError> {
+        let any: bool = self
+            .db
+            .query_row("SELECT EXISTS (SELECT 1 FROM refs)", [], |row| row.get(0))?;
+        Ok(!any)
+    }
+
     /// What the hub last reported about `identity` (empty before its first report).
     pub fn facts(&self, scope: &str, identity: &str) -> Result<Map<String, Value>, StateError> {
         let text: Option<String> = self
@@ -211,7 +267,7 @@ impl Pseudonyms {
 
     pub fn remember(&mut self, scope: &str, identity: &str, facts: &Map<String, Value>) -> Result<(), StateError> {
         self.reference(scope, identity)?;
-        // serde_json's map is ordered by key: the same text Python's `json.dumps(sort_keys=True)` sorted to.
+        // serde_json's map is ordered by key: the stored facts are a JSON object with its keys sorted.
         let text = serde_json::to_string(facts).map_err(io::Error::other)?;
         self.db.execute(
             "UPDATE refs SET facts = ?1 WHERE scope = ?2 AND identity = ?3",

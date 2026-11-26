@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The whole agent with simulated observations, against a service that checks signatures and sequence for real
 //! (`support/fake_service.rs`) over real sockets: an interruption, a lost answer, a lost outbox, a reinstall, the clock
-//! gate, a halt, a second agent. Every test of the Python `test_agent_simulated.py` that concerns the agent is here
-//! under its name; the command-line ones are in `tests/cli.rs`, the configuration one in `tests/config.rs`.
+//! gate, a halt, a second agent. The command-line cases are in `tests/cli.rs`, the configuration one in
+//! `tests/config.rs`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 mod support;
@@ -253,7 +253,10 @@ fn test_nothing_is_produced_while_the_clock_is_not_set() {
     );
     assert_eq!(status.waiting_for.as_deref(), Some("clock"));
     let saved = std::fs::read_to_string(hub.state.join("agent.json")).unwrap();
-    assert_eq!(saved, r#"{"halted": null, "waitingFor": "clock", "problem": null}"#);
+    assert_eq!(
+        saved,
+        r#"{"halted": null, "waitingFor": "clock", "service": null, "problem": null}"#
+    );
 }
 
 #[test]
@@ -288,7 +291,10 @@ fn test_a_halted_agent_says_why_makes_no_request_and_produces_nothing_more() {
     assert_eq!(hub.service.requests().len(), requests);
     assert_eq!(agent.status().unwrap().last_assigned_seq, assigned);
     let saved = std::fs::read_to_string(hub.state.join("agent.json")).unwrap();
-    assert_eq!(saved, r#"{"halted": "schema", "waitingFor": null, "problem": null}"#);
+    assert_eq!(
+        saved,
+        r#"{"halted": "schema", "waitingFor": null, "service": "http_400", "problem": null}"#
+    );
 }
 
 #[test]
@@ -334,7 +340,7 @@ fn a_clock_off_by(offset: i64) {
         "one greeting, then the wait after the 401"
     );
     // The clock is set right; the wait after the `401` is counted on the monotonic clock, so it is the same 240 s
-    // whichever way the wall clock was off (the Python counted it on the wall clock).
+    // whichever way the wall clock was off.
     hub_clock.set_offset_seconds(0);
     for clock in [&hub_clock, &hub.clock] {
         clock.advance_seconds(sender::UNAUTHORIZED_RETRY_SECONDS as i64);
@@ -485,7 +491,7 @@ fn test_what_an_observer_hands_over_is_checked_before_it_is_signed() {
             Some(&long_name),
             Some("2001:DB8::1"),
         ),
-        // The Python case was a lone surrogate, which a Rust string cannot hold; this is the non-ASCII half of it.
+        // A name that is not plain ASCII (a lone surrogate, the other case, cannot be held by a Rust string).
         sighting("odd:3", "iot", None, Some("café"), None),
     ]);
     let mut agent = Agent::open(&hub.config, Box::new(observer), hub.clock.as_clock()).unwrap();
@@ -710,16 +716,20 @@ fn a_wall_clock_stepped_back_keeps_heartbeats_on_time_and_the_agent_recovers_by_
     hub_clock.step_wall_seconds(-3 * 3600);
     agent.tick().unwrap();
     assert_eq!(agent.status().unwrap().waiting_for.as_deref(), Some("clock"));
-    assert_eq!(hub.service.requests().len(), before, "no heartbeat due yet");
-    // 240 s of real time: the heartbeat is due on the monotonic clock, whatever the wall clock says.
-    pass(&[&hub_clock, &hub.clock], sender::HEARTBEAT_SECONDS);
-    agent.tick().unwrap();
-    assert_eq!(hub.service.requests().len(), before + 1, "the heartbeat went out");
+    // A clock that was trusted and is not any more takes a new reading at once.
+    assert_eq!(hub.service.requests().len(), before + 1, "a new reading at once");
     assert_eq!(
         hub.service.requests().last().unwrap().events,
         None,
         "refused: three hours off"
     );
+    // The wait after that `401` is 240 s of real time on the monotonic clock, whatever the wall clock says.
+    pass(&[&hub_clock, &hub.clock], sender::UNAUTHORIZED_RETRY_SECONDS as i64 - 1);
+    agent.tick().unwrap();
+    assert_eq!(hub.service.requests().len(), before + 1, "still waiting out the 401");
+    pass(&[&hub_clock, &hub.clock], 1);
+    agent.tick().unwrap();
+    assert_eq!(hub.service.requests().len(), before + 2, "the heartbeat went out");
     assert_eq!(agent.status().unwrap().last_assigned_seq, produced);
     // NTP puts the wall clock right. Nobody touches the hub.
     hub_clock.step_wall_seconds(3 * 3600);
@@ -881,8 +891,12 @@ fn a_crash_after_the_reset_was_declared_delivers_that_reset_and_declares_no_seco
     assert_gapless(&hub);
     let status = agent.status().unwrap();
     assert_eq!(status.last_acked_seq, status.last_assigned_seq);
-    let written = std::fs::read_to_string(hub.state.join("confirmed.json")).unwrap();
-    assert_eq!(written, format!("{{\"lastAckedSeq\": {}}}", status.last_acked_seq));
+    let written: Value =
+        serde_json::from_str(&std::fs::read_to_string(hub.state.join("confirmed.json")).unwrap()).unwrap();
+    assert_eq!(
+        written,
+        json!({"lastAckedSeq": status.last_acked_seq, "sourceId": hub.config.source_id})
+    );
 }
 
 #[test]
@@ -1059,8 +1073,17 @@ fn break_new_references(hub: &Hub, broken: bool) {
     }
 }
 
+/// The `X-VT-Timestamp` of every request, in seconds.
+fn request_times(hub: &Hub) -> Vec<i64> {
+    hub.service
+        .requests()
+        .iter()
+        .map(|record| record.header("X-VT-Timestamp").unwrap().parse().unwrap())
+        .collect()
+}
+
 #[test]
-fn run_records_a_storage_error_backs_off_keeps_heartbeating_and_recovers() {
+fn run_records_a_storage_error_sends_no_heartbeat_while_it_lasts_and_recovers() {
     let hub = Hub::new();
     let agent = hub.agent();
     break_new_references(&hub, true);
@@ -1068,6 +1091,7 @@ fn run_records_a_storage_error_backs_off_keeps_heartbeating_and_recovers() {
     let mut elapsed = 0i64;
     let mut problems = Vec::new();
     let state = hub.state.clone();
+    let started = hub.clock.now() / 1000;
     agent::run(agent, Arc::clone(&stop), |pause| {
         elapsed += pause.as_millis() as i64;
         hub.clock.advance_millis(pause.as_millis() as i64);
@@ -1084,15 +1108,22 @@ fn run_records_a_storage_error_backs_off_keeps_heartbeating_and_recovers() {
     .unwrap();
     assert!(problems.contains(&Some("pseudonyms_failed".to_owned())), "{problems:?}");
     assert_eq!(problems.last().unwrap(), &None, "recovered");
-    // Twenty broken minutes: the service heard from the hub at least every 300 s throughout.
-    let heartbeats = hub
-        .service
-        .requests()
-        .iter()
-        .filter(|r| r.events == Some(vec![]))
-        .count();
-    assert!(heartbeats >= 20 * 60 / 300, "{heartbeats} heartbeats in twenty minutes");
+    // A heartbeat says "alive, nothing to report", which a hub that cannot capture cannot say: after the greeting
+    // the service heard nothing until the store was repaired (its silence alert is the signal), then everything.
+    let times = request_times(&hub);
+    assert_eq!(hub.service.requests()[0].events, Some(vec![]), "the greeting");
+    assert!(times[0] - started < 5, "{times:?}");
+    assert!(
+        times[1] - started >= 20 * 60,
+        "a request while capture was failing: {times:?}"
+    );
     assert_eq!(of_kind(&hub.service.accepted(), "site.device_appeared").len(), 4);
+    // Twenty minutes without capture are said once capture resumed.
+    let lost = of_kind(&hub.service.accepted(), "site_source.input_lost");
+    assert_eq!(lost.len(), 1, "{lost:?}");
+    assert_eq!(lost[0]["attributes"]["reason"], "capture_stopped");
+    let from = clock::observed_at_millis(lost[0]["attributes"]["fromTime"].as_str().unwrap()).unwrap();
+    assert!((from / 1000 - started).abs() < 5, "from when capture first failed");
     assert_gapless(&hub);
 }
 
@@ -1100,13 +1131,14 @@ fn run_records_a_storage_error_backs_off_keeps_heartbeating_and_recovers() {
 fn a_confirmed_mark_or_status_file_that_cannot_be_written_does_not_stop_delivery() {
     let hub = Hub::new();
     hub.run(1).close().unwrap();
+    let mut agent = hub.agent();
+    // While it runs (at its start they are refused by name).
     for name in ["confirmed.json", "agent.json"] {
         let path = hub.state.join(name);
         let _ = std::fs::remove_file(&path);
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("in-the-way"), "x").unwrap();
     }
-    let mut agent = hub.agent();
     for _ in 0..4 {
         agent.tick().unwrap();
         hub.clock.advance_seconds(1);
@@ -1236,8 +1268,12 @@ fn a_full_backlog_stops_production_and_says_what_was_not_captured_once_it_drains
     }
     let status = agent.status().unwrap();
     assert_eq!(status.pending, 4, "stopped at the cap");
-    assert_eq!(status.waiting_for.as_deref(), Some("backlog"));
-    assert!(waited.iter().filter(|w| w.as_deref() == Some("backlog")).count() >= 3);
+    // What it waits for is the service that confirms nothing; the backlog is why it produces nothing meanwhile.
+    assert_eq!(
+        (status.waiting_for.as_deref(), status.service.as_deref()),
+        (Some("service"), Some("http_503"))
+    );
+    assert!(waited.iter().filter(|w| w.as_deref() == Some("service")).count() >= 3);
     // A restart while it is full keeps it stopped: the mark lives in the outbox.
     agent.close().unwrap();
     let mut agent = Agent::open_with(
@@ -1321,4 +1357,494 @@ fn a_segment_that_emptied_still_gets_its_snapshot_when_due() {
         json!({"ot": 0, "printer": 0, "user_device": 0, "server": 0, "network": 0, "iot": 0, "unknown": 0})
     );
     assert_eq!(snapshots[1]["attributes"]["ephemeral"], 0);
+}
+
+// ---- What the status says about the service after the greeting ----
+
+#[test]
+fn after_the_greeting_the_status_says_when_the_service_confirms_nothing_and_which_kind() {
+    let hub = Hub::new();
+    let mut agent = hub.run(1);
+    let status = agent.status().unwrap();
+    assert_eq!((status.waiting_for, status.service), (None, None));
+    hub.service.push(Step::status(503, json!({"error": "unavailable"})));
+    hub.clock.advance_seconds(3600); // a snapshot is due: a batch goes
+    agent.tick().unwrap();
+    let status = agent.status().unwrap();
+    assert_eq!(
+        (status.waiting_for.as_deref(), status.service.as_deref()),
+        (Some("service"), Some("http_503"))
+    );
+    let saved = std::fs::read_to_string(hub.state.join("agent.json")).unwrap();
+    assert!(
+        saved.contains(r#""waitingFor": "service", "service": "http_503""#),
+        "{saved}"
+    );
+    hub.service.push(Step::status(200, json!({"hello": "a portal"})));
+    hub.clock.advance_seconds(5);
+    agent.tick().unwrap();
+    let status = agent.status().unwrap();
+    assert_eq!(
+        (status.waiting_for.as_deref(), status.service.as_deref()),
+        (Some("service"), Some("not_confirming"))
+    );
+    hub.clock.advance_seconds(10);
+    agent.tick().unwrap();
+    let status = agent.status().unwrap();
+    assert_eq!(
+        (status.waiting_for, status.service),
+        (None, None),
+        "cleared by a confirming answer"
+    );
+    assert_eq!(status.pending, 0);
+}
+
+// ---- One line per change, never per tick ----
+
+#[test]
+fn run_reports_one_line_per_change_and_none_per_tick() {
+    let hub = Hub::new();
+    hub.service.push(Step::Pass);
+    for _ in 0..3 {
+        hub.service.push(Step::status(503, json!({"error": "unavailable"})));
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut lines = Vec::new();
+    let mut elapsed = 0u128;
+    agent::run_reporting(
+        hub.agent(),
+        Arc::clone(&stop),
+        |pause| {
+            elapsed += pause.as_millis();
+            hub.clock.advance_millis(pause.as_millis() as i64);
+            if elapsed >= 10 * 60_000 {
+                stop.store(true, Ordering::SeqCst);
+            }
+        },
+        |line| lines.push(line.to_owned()),
+    )
+    .unwrap();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[0].contains("waiting for the service") && lines[0].contains("http_503"),
+        "{lines:?}"
+    );
+    assert!(lines[1].contains("running normally"), "{lines:?}");
+    for line in &lines {
+        assert_no_personal_data(line, "a reported line");
+        assert_eq!(line.lines().count(), 1);
+    }
+}
+
+// ---- What was reported is remembered for the run ----
+
+/// A trigger, from another connection, that makes every update of the pseudonym store fail: what was reported cannot
+/// be recorded, while new references can still be made.
+fn break_updates(hub: &Hub, broken: bool) {
+    let db = rusqlite::Connection::open(hub.state.join("pseudonyms.sqlite")).unwrap();
+    if broken {
+        db.execute_batch("CREATE TRIGGER broken BEFORE UPDATE ON refs BEGIN SELECT RAISE(ABORT, 'disk on fire'); END")
+            .unwrap();
+    } else {
+        db.execute_batch("DROP TRIGGER broken").unwrap();
+    }
+}
+
+#[test]
+fn a_store_that_cannot_record_what_was_reported_reports_each_device_once_and_delivers_meanwhile() {
+    let hub = Hub::new();
+    let mut agent = hub.agent();
+    agent.tick().unwrap();
+    break_updates(&hub, true);
+    for _ in 0..12 {
+        hub.clock.advance_seconds(600);
+        assert!(agent.tick().is_err(), "the store write fails");
+        assert_eq!(agent.status().unwrap().problem.as_deref(), Some("pseudonyms_failed"));
+        assert_eq!(agent.status().unwrap().pending, 0, "delivered meanwhile");
+    }
+    let accepted = hub.service.accepted();
+    let appeared = of_kind(&accepted, "site.device_appeared");
+    let refs: HashSet<&Value> = appeared.iter().map(|event| &event["attributes"]["deviceRef"]).collect();
+    assert_eq!((appeared.len(), refs.len()), (4, 4), "one device_appeared per device");
+    // A snapshot an hour, not one a tick.
+    assert!(of_kind(&accepted, "site.inventory_snapshot").len() <= 3);
+    assert!(
+        of_kind(&accepted, "site_source.input_lost").is_empty(),
+        "capture never stopped"
+    );
+    // Repaired: the store write is retried and succeeds; nothing is reported again.
+    break_updates(&hub, false);
+    let before = hub.service.accepted().len();
+    hub.clock.advance_seconds(60);
+    agent.tick().unwrap();
+    assert_eq!(agent.status().unwrap().problem, None);
+    assert_eq!(hub.service.accepted().len(), before);
+    agent.close().unwrap();
+    let pseudonyms = spacegoat_hub::state::Pseudonyms::open(&hub.state.join("pseudonyms.sqlite")).unwrap();
+    for identity in ["sim:printer", "sim:laptop", "sim:plc", "sim:switch"] {
+        assert!(!pseudonyms.facts("device", identity).unwrap().is_empty(), "{identity}");
+    }
+}
+
+// ---- An untrusted clock stops production only ----
+
+#[test]
+fn a_clock_that_is_not_trusted_stops_production_but_a_full_backlog_still_drains() {
+    let hub = Hub::new();
+    let settings = agent::AgentSettings {
+        backlog_cap: 4,
+        ..agent::AgentSettings::default()
+    };
+    let mut agent = Agent::open_with(
+        &hub.config,
+        Box::new(SimulatedObserver::new()),
+        hub.clock.as_clock(),
+        settings,
+    )
+    .unwrap();
+    hub.service.push(Step::Pass);
+    for _ in 0..40 {
+        hub.service.push(Step::status(503, json!({"error": "unavailable"})));
+    }
+    for _ in 0..6 {
+        agent.tick().unwrap();
+        hub.clock.advance_seconds(3600);
+    }
+    let full = agent.status().unwrap();
+    assert_eq!((full.pending, full.waiting_for.as_deref()), (4, Some("service")));
+    agent.close().unwrap();
+    // The service is back; this hub's wall clock is now 270 s ahead of it: inside the service's five minutes, beyond
+    // the hub's own four.
+    hub.service.clear_script();
+    let ahead = TestClock::at_wall(hub.clock.now() + 270_000);
+    let mut agent = Agent::open_with(
+        &hub.config,
+        Box::new(SimulatedObserver::new()),
+        ahead.as_clock(),
+        settings,
+    )
+    .unwrap();
+    for _ in 0..3 {
+        agent.tick().unwrap();
+        pass(&[&ahead, &hub.clock], 10);
+    }
+    let status = agent.status().unwrap();
+    assert_eq!(status.waiting_for.as_deref(), Some("clock"));
+    assert_eq!(status.last_assigned_seq, full.last_assigned_seq, "nothing new signed");
+    assert_eq!(status.pending, 0, "what was signed is delivered");
+    assert_eq!(hub.service.last_seq(), full.last_assigned_seq);
+}
+
+// ---- A clock that jumps ----
+
+#[test]
+fn a_wall_clock_that_jumps_takes_a_new_reading_at_once() {
+    let hub = Hub::new();
+    let hub_clock = TestClock::new();
+    let mut agent = agent_on(&hub, &hub_clock);
+    agent.tick().unwrap();
+    assert_eq!(agent.status().unwrap().pending, 0);
+    let before = hub.service.requests().len();
+    hub_clock.step_wall_seconds(3600);
+    agent.tick().unwrap();
+    assert_eq!(
+        hub.service.requests().len(),
+        before + 1,
+        "a new reading at once, not at the next heartbeat"
+    );
+    assert_eq!(agent.status().unwrap().waiting_for.as_deref(), Some("clock"));
+}
+
+#[test]
+fn a_tick_reads_the_clocks_after_the_greeting() {
+    let hub = Hub::new();
+    // Every answer takes ten seconds of the hub's time: the service moves the shared clock as it answers.
+    let shared = hub.clock.clone();
+    hub.service.set_now(Arc::new(move || {
+        shared.advance_seconds(10);
+        shared.now()
+    }));
+    let before = hub.clock.now();
+    hub.run(1).close().unwrap();
+    let first = &hub.service.accepted()[0];
+    let observed = clock::observed_at_millis(first["observedAt"].as_str().unwrap()).unwrap();
+    assert!(
+        observed >= before + 10_000,
+        "observed before the greeting was answered: {first}"
+    );
+}
+
+// ---- A stop in capture longer than five minutes is declared ----
+
+#[test]
+fn a_halt_is_declared_as_lost_input_once_capture_resumes() {
+    let hub = Hub::new();
+    let mut agent = hub.run(2);
+    hub.service.push(Step::status(400, json!({"error": "schema"})));
+    hub.clock.advance_seconds(3600);
+    let halted_at = hub.clock.now();
+    agent.tick().unwrap();
+    assert_eq!(agent.status().unwrap().halted.as_deref(), Some("schema"));
+    for _ in 0..3 {
+        hub.clock.advance_seconds(3600);
+        agent.tick().unwrap();
+    }
+    agent.close().unwrap();
+    agent::resume(&hub.config, None).unwrap().unwrap();
+    hub.clock.advance_seconds(60);
+    let resumed_at = hub.clock.now();
+    hub.run(2).close().unwrap();
+    let lost = of_kind(&hub.service.accepted(), "site_source.input_lost");
+    assert_eq!(lost.len(), 1, "{lost:?}");
+    let attributes = &lost[0]["attributes"];
+    assert_eq!(attributes["reason"], "capture_stopped");
+    let from = clock::observed_at_millis(attributes["fromTime"].as_str().unwrap()).unwrap();
+    let to = clock::observed_at_millis(attributes["toTime"].as_str().unwrap()).unwrap();
+    assert!(from >= halted_at && from - halted_at < 5_000, "from the halt");
+    assert!(to >= resumed_at, "to when capture resumed");
+    assert_gapless(&hub);
+}
+
+#[test]
+fn a_clock_distrust_shorter_than_five_minutes_is_not_declared_and_a_longer_one_is() {
+    for (seconds, declared) in [(241, false), (360, true)] {
+        let hub = Hub::new();
+        let hub_clock = TestClock::new();
+        let mut agent = agent_on(&hub, &hub_clock);
+        agent.tick().unwrap();
+        hub_clock.step_wall_seconds(3600);
+        agent.tick().unwrap();
+        assert_eq!(agent.status().unwrap().waiting_for.as_deref(), Some("clock"));
+        hub_clock.step_wall_seconds(-3600);
+        pass(&[&hub_clock, &hub.clock], seconds);
+        agent.tick().unwrap();
+        agent.tick().unwrap();
+        assert_eq!(agent.status().unwrap().waiting_for, None, "{seconds}");
+        let lost = of_kind(&hub.service.accepted(), "site_source.input_lost");
+        assert_eq!(lost.len(), usize::from(declared), "{seconds}: {lost:?}");
+        if declared {
+            // The stop began while the clock was not trusted: no `fromTime`.
+            assert!(lost[0]["attributes"].get("fromTime").is_none(), "{}", lost[0]);
+        }
+        assert_gapless(&hub);
+    }
+}
+
+// ---- A new pseudonym store beside a queue that assigned numbers ----
+
+#[test]
+fn a_new_or_empty_pseudonym_store_beside_a_queue_that_assigned_numbers_is_said() {
+    for empty in [false, true] {
+        let hub = Hub::new();
+        hub.run(2).close().unwrap();
+        if empty {
+            let db = rusqlite::Connection::open(hub.state.join("pseudonyms.sqlite")).unwrap();
+            db.execute("DELETE FROM refs", []).unwrap();
+        } else {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(hub.state.join(format!("pseudonyms.sqlite{suffix}")));
+            }
+        }
+        let mut agent = hub.agent();
+        assert_eq!(agent.notices().len(), 1, "{empty}: {:?}", agent.notices());
+        assert!(agent.notices()[0].contains("new references"), "{:?}", agent.notices());
+        agent.tick().unwrap();
+        assert_eq!(
+            agent.status().unwrap().problem.as_deref(),
+            Some("pseudonyms_new"),
+            "{empty}"
+        );
+    }
+    // A hub that has never assigned a number has nothing to say about it.
+    let hub = Hub::new();
+    let agent = hub.agent();
+    assert!(agent.notices().is_empty());
+}
+
+// ---- What was confirmed ----
+
+#[test]
+fn an_unreadable_confirmed_mark_beside_a_queue_that_assigned_numbers_is_rewritten_from_the_queue() {
+    let hub = Hub::new();
+    let first = hub.run(3);
+    let acked = first.status().unwrap().last_acked_seq;
+    first.close().unwrap();
+    std::fs::write(hub.state.join("confirmed.json"), "a page of something else").unwrap();
+    let agent = hub.agent();
+    assert!(
+        agent.notices().iter().any(|notice| notice.contains("confirmed.json")),
+        "{:?}",
+        agent.notices()
+    );
+    assert!(agent.notices().iter().all(|notice| !notice.contains("something else")));
+    let written: Value =
+        serde_json::from_str(&std::fs::read_to_string(hub.state.join("confirmed.json")).unwrap()).unwrap();
+    assert_eq!(
+        written,
+        json!({"lastAckedSeq": acked, "sourceId": hub.config.source_id})
+    );
+}
+
+#[test]
+fn an_unreadable_confirmed_mark_beside_a_queue_that_never_assigned_a_number_is_a_lost_queue_not_a_gap() {
+    for held in [0u64, 5] {
+        let hub = Hub::new();
+        std::fs::write(hub.state.join("confirmed.json"), r#"{"lastAckedSeq": "many"}"#).unwrap();
+        hub.service.set_last_seq(held);
+        let agent = hub.agent();
+        assert!(
+            agent.notices().iter().any(|notice| notice.contains("confirmed.json")),
+            "{held}: {:?}",
+            agent.notices()
+        );
+        let mut agent = agent;
+        for _ in 0..3 {
+            agent.tick().unwrap();
+        }
+        assert_eq!(agent.status().unwrap().halted, None, "{held}");
+        let resets = of_kind(&hub.service.accepted(), "site_source.reset");
+        let seqs = hub.service.accepted_seqs();
+        assert_eq!(
+            seqs,
+            (held + 1..=held + seqs.len() as u64).collect::<Vec<_>>(),
+            "{held}"
+        );
+        if held == 0 {
+            assert!(resets.is_empty());
+        } else {
+            assert_eq!(resets.len(), 1);
+            assert_eq!(
+                resets[0]["attributes"],
+                json!({"trustOrigin": "hub", "lastAckedSeq": held, "reason": "queue_lost"})
+            );
+        }
+    }
+}
+
+#[test]
+fn a_confirmed_mark_of_another_source_counts_as_none() {
+    let hub = Hub::new();
+    std::fs::write(
+        hub.state.join("confirmed.json"),
+        r#"{"lastAckedSeq": 10, "sourceId": "fedcba98-7654-4321-8fed-cba987654321"}"#,
+    )
+    .unwrap();
+    hub.service.set_last_seq(3);
+    let agent = hub.run(3);
+    assert_eq!(
+        agent.status().unwrap().halted,
+        None,
+        "not a gap: that mark is another source's"
+    );
+    assert_eq!(
+        reset_of(&hub)["attributes"],
+        json!({"trustOrigin": "hub", "lastAckedSeq": 3, "reason": "reinstall"})
+    );
+}
+
+#[test]
+fn a_confirmed_mark_in_the_earlier_form_is_this_sources() {
+    let hub = Hub::new();
+    std::fs::write(hub.state.join("confirmed.json"), r#"{"lastAckedSeq": 10}"#).unwrap();
+    hub.service.set_last_seq(3);
+    let agent = hub.run(2);
+    assert_eq!(agent.status().unwrap().halted.as_deref(), Some("gap"));
+}
+
+// ---- Files of the hub's own that are not files ----
+
+#[test]
+fn a_status_halt_or_confirmed_file_that_is_a_link_or_a_directory_is_refused_by_name() {
+    for name in ["agent.json", "halt.json", "confirmed.json"] {
+        for kind in ["symbolic link", "directory"] {
+            let hub = Hub::new();
+            let victim = hub.tmp.join("victim");
+            std::fs::write(&victim, "untouched").unwrap();
+            let path = hub.state.join(name);
+            if kind == "directory" {
+                std::fs::create_dir(&path).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&victim, &path).unwrap();
+            }
+            let refused = Agent::open(&hub.config, Box::new(SimulatedObserver::new()), hub.clock.as_clock())
+                .map(|_| ())
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains(name), "{name} {kind}: {refused}");
+            assert!(refused.contains(kind), "{name} {kind}: {refused}");
+            assert!(refused.contains("by hand"), "{name} {kind}: {refused}");
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+            assert!(std::fs::symlink_metadata(&path).is_ok(), "left where it is");
+            assert!(hub.service.requests().is_empty());
+        }
+    }
+}
+
+// ---- Resume ----
+
+#[test]
+fn resume_rewrites_the_status_file_before_it_removes_the_halt_and_says_when_removing_fails() {
+    let hub = Hub::new();
+    let mut agent = hub.run(2);
+    hub.service.push(Step::status(400, json!({"error": "schema"})));
+    hub.clock.advance_seconds(3600);
+    agent.tick().unwrap();
+    agent.close().unwrap();
+    let failed = agent::resume_with(&hub.config, agent::ResumeOptions::default(), &|_: &std::path::Path| {
+        Err(std::io::Error::other("the disk said no"))
+    })
+    .unwrap_err();
+    assert!(failed.to_string().contains("halt.json"), "{failed}");
+    let saved = std::fs::read_to_string(hub.state.join("agent.json")).unwrap();
+    assert!(saved.contains("\"halted\": null"), "{saved}");
+    assert!(hub.state.join("halt.json").exists(), "still halted");
+    assert_eq!(
+        agent::read_halt(&hub.state).unwrap().unwrap().reason,
+        "schema",
+        "and the status still says so"
+    );
+}
+
+// ---- A healthy queue is never set aside ----
+
+#[test]
+fn an_outbox_locked_by_another_connection_is_not_set_aside() {
+    let hub = Hub::new();
+    hub.run(2).close().unwrap();
+    let holder = rusqlite::Connection::open(hub.state.join("outbox.sqlite")).unwrap();
+    holder
+        .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; SELECT count(*) FROM events;")
+        .unwrap();
+    let refused = Agent::open(&hub.config, Box::new(SimulatedObserver::new()), hub.clock.as_clock());
+    assert!(
+        refused.is_err(),
+        "busy is not damage, and not a queue to start anew either"
+    );
+    drop(holder);
+    assert!(!hub.state.join("outbox.sqlite.damaged").exists());
+    let agent = hub.agent();
+    assert!(agent.status().unwrap().last_assigned_seq > 0);
+    assert!(agent.notices().is_empty());
+}
+
+#[test]
+fn a_read_only_outbox_is_an_error_and_is_not_set_aside() {
+    let hub = Hub::new();
+    hub.run(2).close().unwrap();
+    let path = hub.state.join("outbox.sqlite");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let refused = Agent::open(&hub.config, Box::new(SimulatedObserver::new()), hub.clock.as_clock());
+    assert!(
+        refused.is_err(),
+        "a queue that cannot be written is refused at the start"
+    );
+    assert!(!hub.state.join("outbox.sqlite.damaged").exists());
+    // A person puts the permissions right (SQLite made its side files with the database's own mode).
+    for suffix in ["", "-wal", "-shm"] {
+        let side = hub.state.join(format!("outbox.sqlite{suffix}"));
+        if side.exists() {
+            std::fs::set_permissions(&side, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    assert!(hub.agent().status().unwrap().last_assigned_seq > 0);
 }
