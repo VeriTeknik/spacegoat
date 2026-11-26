@@ -58,7 +58,7 @@ impl Hub {
 
     /// The agent on the simulated network, on the shared clock.
     pub fn agent(&self) -> Agent {
-        Agent::open(&self.config, Box::new(SimulatedObserver::new()), self.clock.as_fn()).unwrap()
+        Agent::open(&self.config, Box::new(SimulatedObserver::new()), self.clock.as_clock()).unwrap()
     }
 
     /// An agent that has ticked `steps` times.

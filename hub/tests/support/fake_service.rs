@@ -4,11 +4,16 @@
 //! A real HTTP/1.1 server on a loopback socket, with its request parsing written out here (no server crate), so the
 //! sender is tested against bytes on a wire. It verifies the request signature against the registered public key,
 //! the timestamp window, the gzip body and its limits, every event signature, the personal-data commitment, the age
-//! of each observation, the sequence, the reset rule, and on a replay the whole event against the one on record. It
-//! answers with the protocol's bodies.
+//! of each observation, the sequence, the reset rule and the gap rule wherever the event sits in the batch, and on a
+//! replay the whole event against the one on record. Every fresh event must also have the form protocol §6 to §9
+//! give its kind (`has_the_protocols_shape`): exactly its attributes and no other, each of its type and format,
+//! references that are UUID version 4, enums from their lists, and personal data only in the kinds that may carry
+//! it. Anything else is answered `400 {"error":"schema"}`, so a wrong field in the agent fails a test. It answers
+//! with the protocol's bodies.
 //!
-//! A test can script the next answers to stand for a service that is down, busy, or whose answer was lost on the
-//! way back. It records every request and every event it accepted, so a test asserts on what actually arrived.
+//! A test can script the next answers to stand for a service that is down, busy, whose answer was lost on the way
+//! back, or that sends no `Date`. It records every request and every event it accepted, so a test asserts on what
+//! actually arrived.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -23,7 +28,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde_json::{Value, json};
 use spacegoat_hub::canonical::canonical_json;
-use spacegoat_hub::clock;
+use spacegoat_hub::clock::{self, Clock};
 use spacegoat_hub::signing::{self, EventFields};
 
 pub const PATH: &str = "/api/ops/evidence/ingest";
@@ -39,10 +44,25 @@ const MAX_READ_BODY: usize = 2 * MAX_COMPRESSED;
 /// A clock in Unix milliseconds that both sides of a test can share.
 pub type ServiceClock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
-/// The system clock plus an offset a test moves, shared by every clone.
-#[derive(Clone, Default)]
+/// A wall clock (the system clock plus an offset a test moves) and a monotonic clock that moves ONLY when a test
+/// moves it, shared by every clone. `advance_seconds` is time passing (both move); `step_wall_seconds` and
+/// `set_offset_seconds` are the wall clock being set (only it moves); `advance_mono_seconds` is time passing for the
+/// hub alone. Because the monotonic clock does not follow real time, an interval in a test is exactly what the test
+/// says it is.
+#[derive(Clone)]
 pub struct TestClock {
     offset_ms: Arc<AtomicI64>,
+    mono_ms: Arc<AtomicI64>,
+}
+
+impl Default for TestClock {
+    fn default() -> Self {
+        Self {
+            offset_ms: Arc::new(AtomicI64::new(0)),
+            // An arbitrary start: only differences mean anything.
+            mono_ms: Arc::new(AtomicI64::new(1_000_000)),
+        }
+    }
 }
 
 impl TestClock {
@@ -50,21 +70,69 @@ impl TestClock {
         Self::default()
     }
 
+    /// A clock whose wall reads `unix_millis` now (and moves on from there with real time).
+    pub fn at_wall(unix_millis: i64) -> Self {
+        let clock = Self::new();
+        clock
+            .offset_ms
+            .store(unix_millis - clock::now().unwrap(), Ordering::SeqCst);
+        clock
+    }
+
+    /// The wall clock.
     pub fn now(&self) -> i64 {
         clock::now().unwrap() + self.offset_ms.load(Ordering::SeqCst)
     }
 
+    pub fn mono(&self) -> i64 {
+        self.mono_ms.load(Ordering::SeqCst)
+    }
+
+    /// Time passes: both clocks move.
     pub fn advance_seconds(&self, seconds: i64) {
+        self.offset_ms.fetch_add(seconds * 1000, Ordering::SeqCst);
+        self.mono_ms.fetch_add(seconds * 1000, Ordering::SeqCst);
+    }
+
+    pub fn advance_millis(&self, millis: i64) {
+        self.offset_ms.fetch_add(millis, Ordering::SeqCst);
+        self.mono_ms.fetch_add(millis, Ordering::SeqCst);
+    }
+
+    /// The wall clock is stepped (set by a person, NTP, an RTC); the monotonic clock does not notice.
+    pub fn step_wall_seconds(&self, seconds: i64) {
         self.offset_ms.fetch_add(seconds * 1000, Ordering::SeqCst);
     }
 
+    /// The wall clock is set to the system clock plus `seconds`; the monotonic clock does not notice.
     pub fn set_offset_seconds(&self, seconds: i64) {
         self.offset_ms.store(seconds * 1000, Ordering::SeqCst);
     }
 
+    /// Only the monotonic clock moves (for a clock that only some side reads monotonically).
+    pub fn advance_mono_seconds(&self, seconds: i64) {
+        self.mono_ms.fetch_add(seconds * 1000, Ordering::SeqCst);
+    }
+
+    /// The wall clock, for the service.
     pub fn as_fn(&self) -> ServiceClock {
         let clock = self.clone();
         Arc::new(move || clock.now())
+    }
+
+    /// Both clocks, for the hub.
+    pub fn as_clock(&self) -> Arc<dyn Clock> {
+        Arc::new(self.clone())
+    }
+}
+
+impl Clock for TestClock {
+    fn wall_millis(&self) -> i64 {
+        self.now()
+    }
+
+    fn mono_millis(&self) -> i64 {
+        self.mono()
     }
 }
 
@@ -78,6 +146,8 @@ pub enum Step {
         body: Value,
         headers: Vec<(String, String)>,
     },
+    /// Like `Status`, but the answer carries no `Date` header at all.
+    StatusWithoutDate { code: u16, body: Value },
     /// Process the request as the service would (a placeholder that lets a later step reach a later request).
     Pass,
     /// Process the batch for real, then drop the connection before answering.
@@ -103,6 +173,11 @@ impl Step {
             body,
             headers: Vec::new(),
         }
+    }
+
+    /// An answer with no `Date` header (a proxy, or a service that forgot it).
+    pub fn without_date(code: u16, body: Value) -> Self {
+        Self::StatusWithoutDate { code, body }
     }
 
     pub fn status_with(code: u16, body: Value, headers: &[(&str, &str)]) -> Self {
@@ -361,10 +436,10 @@ pub fn http_date(unix_millis: i64) -> String {
     )
 }
 
-fn write_answer(stream: &mut TcpStream, now: i64, code: u16, body: &Value, headers: &[(String, String)]) {
+fn write_answer(stream: &mut TcpStream, now: i64, code: u16, body: &Value, headers: &[(String, String)], date: bool) {
     let payload = serde_json::to_vec(body).unwrap();
     let mut head = format!("HTTP/1.1 {code} {}\r\n", reason(code));
-    if header(headers, "Date").is_none() {
+    if date && header(headers, "Date").is_none() {
         head.push_str(&format!("Date: {}\r\n", http_date(now)));
     }
     head.push_str(&format!(
@@ -384,6 +459,7 @@ fn write_answer(stream: &mut TcpStream, now: i64, code: u16, body: &Value, heade
 /// What the service does with one request: an answer, or a connection dropped without one.
 enum Outcome {
     Answer(u16, Value, Vec<(String, String)>),
+    AnswerWithoutDate(u16, Value),
     Drop,
     Raw(Vec<u8>),
     Late(Duration, Value),
@@ -402,13 +478,14 @@ fn serve(state: &Arc<Mutex<State>>, mut stream: TcpStream) {
         (handle(&mut state, &request, now), now)
     };
     match outcome {
-        Outcome::Answer(code, body, headers) => write_answer(&mut stream, now, code, &body, &headers),
+        Outcome::Answer(code, body, headers) => write_answer(&mut stream, now, code, &body, &headers, true),
+        Outcome::AnswerWithoutDate(code, body) => write_answer(&mut stream, now, code, &body, &[], false),
         Outcome::Raw(bytes) => {
             let _ = stream.write_all(&bytes);
         }
         Outcome::Late(pause, body) => {
             std::thread::sleep(pause);
-            write_answer(&mut stream, now, 200, &body, &[]);
+            write_answer(&mut stream, now, 200, &body, &[], true);
         }
         Outcome::Drop => {}
     }
@@ -444,6 +521,7 @@ fn handle(state: &mut State, request: &Request, now: i64) -> Outcome {
         }
         Some(Step::Raw(bytes)) => return Outcome::Raw(bytes.clone()),
         Some(Step::Status { code, body, headers }) => return Outcome::Answer(*code, body.clone(), headers.clone()),
+        Some(Step::StatusWithoutDate { code, body }) => return Outcome::AnswerWithoutDate(*code, body.clone()),
         _ => {}
     }
     let headers = &request.headers;
@@ -509,28 +587,34 @@ fn handle(state: &mut State, request: &Request, now: i64) -> Outcome {
         .filter(|(_, seq)| *seq > last_seq)
         .collect();
     let duplicates = events.len() - fresh.len();
-    if let Some((first, first_seq)) = fresh.first() {
-        let kind = first.get("kind").and_then(Value::as_str);
-        let attributes = first.get("attributes");
-        let from_seq = attributes.and_then(|a| a.get("fromSeq")).and_then(Value::as_u64);
-        let declared = kind == Some("site_source.gap_declared") && from_seq == Some(last_seq + 1);
-        let last_acked = attributes.and_then(|a| a.get("lastAckedSeq")).and_then(Value::as_u64);
-        if kind == Some("site_source.reset") && last_acked != Some(last_seq) {
+    // `held` is what the service holds when it reaches each fresh event: the reset rule and the sequence are judged
+    // against it, wherever in the batch the event sits.
+    let mut held = last_seq;
+    for (index, (event, seq)) in fresh.iter().enumerate() {
+        let kind = event.get("kind").and_then(Value::as_str);
+        let attributes = event.get("attributes");
+        let number = |name: &str| attributes.and_then(|a| a.get(name)).and_then(Value::as_u64);
+        if kind == Some("site_source.reset") && number("lastAckedSeq") != Some(held) {
             return schema();
         }
-        if !declared && *first_seq != last_seq + 1 {
-            return error(409, json!({"error": "seq_gap", "expectedSeq": last_seq + 1}));
+        // A gap declared from the next number on carries the number just after the gap (protocol §8).
+        let declares_gap = kind == Some("site_source.gap_declared") && number("fromSeq") == Some(held + 1);
+        if declares_gap {
+            let to = number("toSeq");
+            if to.is_none_or(|to| to < held + 1 || to.checked_add(1) != Some(*seq)) {
+                return schema();
+            }
+        } else if *seq != held + 1 {
+            return if index == 0 {
+                error(409, json!({"error": "seq_gap", "expectedSeq": held + 1}))
+            } else {
+                schema()
+            };
         }
-    }
-    let mut expected = fresh.first().map(|(_, seq)| *seq);
-    for (event, seq) in &fresh {
-        if Some(*seq) != expected {
+        if !has_the_protocols_shape(event) || !event_is_valid(state, event, *seq, now) {
             return schema();
         }
-        expected = Some(seq + 1);
-        if !event_is_valid(state, event, *seq, now) {
-            return schema();
-        }
+        held = *seq;
     }
     for (event, seq) in &fresh {
         state.accepted.push((*event).clone());
@@ -649,4 +733,191 @@ fn event_is_valid(state: &State, event: &Value, seq: u64, now: i64) -> bool {
         return false;
     };
     verify(&state.public_key, signature, &message)
+}
+
+/// The kinds of protocol §8 and §9 and the attributes each carries, exactly (`fromTime` of `input_lost` is optional
+/// and listed apart).
+const KINDS: [(&str, &[&str]); 9] = [
+    (
+        "site.device_appeared",
+        &["trustOrigin", "deviceRef", "segmentRef", "deviceClass"],
+    ),
+    (
+        "site.device_changed",
+        &["trustOrigin", "deviceRef", "segmentRef", "deviceClass", "changed"],
+    ),
+    ("site.device_seen", &["trustOrigin", "deviceRef", "segmentRef"]),
+    (
+        "site.device_gone",
+        &["trustOrigin", "deviceRef", "segmentRef", "lastSeenAt"],
+    ),
+    (
+        "site.inventory_snapshot",
+        &["trustOrigin", "segmentRef", "counts", "ephemeral"],
+    ),
+    (
+        "site_source.gap_declared",
+        &["trustOrigin", "fromSeq", "toSeq", "reason"],
+    ),
+    ("site_source.reset", &["trustOrigin", "lastAckedSeq", "reason"]),
+    ("site_source.input_lost", &["trustOrigin", "reason", "toTime"]),
+    ("site_source.event_dropped", &["trustOrigin", "reason", "originalKind"]),
+];
+/// The only kinds that may carry personal data, and the fields it may have (protocol §6, §9).
+const PII_KINDS: [&str; 2] = ["site.device_appeared", "site.device_changed"];
+const PII_FIELDS: [&str; 3] = ["mac", "hostname", "ip"];
+const CLASSES: [&str; 7] = ["ot", "printer", "user_device", "server", "network", "iot", "unknown"];
+const EVENT_FIELDS: [&str; 8] = [
+    "sourceSeq",
+    "kind",
+    "observedAt",
+    "attributes",
+    "signature",
+    "pii",
+    "piiNonce",
+    "piiCommitment",
+];
+const MAX_SAFE: u64 = (1 << 53) - 1;
+const NINETY_DAYS_MS: i64 = 90 * 86_400_000;
+
+/// A random (version 4) UUID, lowercase, with the RFC 9562 variant: the only references the service takes.
+pub fn is_uuid_v4(value: &Value) -> bool {
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    let bytes = text.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            14 => *b == b'4',
+            19 => matches!(b, b'8' | b'9' | b'a' | b'b'),
+            _ => b.is_ascii_digit() || (b'a'..=b'f').contains(b),
+        })
+}
+
+fn is_lower_hex(value: Option<&Value>, length: usize) -> bool {
+    value.and_then(Value::as_str).is_some_and(|text| {
+        text.len() == length && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+fn safe_integer(value: Option<&Value>) -> Option<u64> {
+    value.and_then(Value::as_u64).filter(|n| *n <= MAX_SAFE)
+}
+
+fn time_of(value: Option<&Value>) -> Option<i64> {
+    value.and_then(Value::as_str).and_then(clock::observed_at_millis)
+}
+
+/// Everything protocol §6 to §9 says about an event's form, apart from its signature and its place in the sequence:
+/// no unknown field at the top or in the attributes, every attribute of its kind present with its type and format,
+/// enums from their lists, and personal data only where the kind allows it, in the allowed fields and forms.
+pub fn has_the_protocols_shape(event: &Value) -> bool {
+    let Some(fields) = event.as_object() else {
+        return false;
+    };
+    if fields.keys().any(|key| !EVENT_FIELDS.contains(&key.as_str())) {
+        return false;
+    }
+    if safe_integer(fields.get("sourceSeq")).is_none_or(|seq| seq == 0) {
+        return false;
+    }
+    let (Some(kind), Some(observed_at), Some(Value::Object(attributes)), Some(Value::String(_))) = (
+        fields.get("kind").and_then(Value::as_str),
+        time_of(fields.get("observedAt")),
+        fields.get("attributes"),
+        fields.get("signature"),
+    ) else {
+        return false;
+    };
+    let Some((_, required)) = KINDS.iter().find(|(name, _)| *name == kind) else {
+        return false;
+    };
+    let optional: &[&str] = if kind == "site_source.input_lost" {
+        &["fromTime"]
+    } else {
+        &[]
+    };
+    let keys_fit = required.iter().all(|key| attributes.contains_key(*key))
+        && attributes
+            .keys()
+            .all(|key| required.contains(&key.as_str()) || optional.contains(&key.as_str()));
+    if !keys_fit || attributes.get("trustOrigin") != Some(&json!("hub")) {
+        return false;
+    }
+    let get = |name: &str| attributes.get(name);
+    let text = |name: &str| get(name).and_then(Value::as_str);
+    let refs_ok = ["deviceRef", "segmentRef"]
+        .iter()
+        .filter(|name| required.contains(name))
+        .all(|name| get(name).is_some_and(is_uuid_v4));
+    let class_ok = !required.contains(&"deviceClass") || text("deviceClass").is_some_and(|c| CLASSES.contains(&c));
+    let kind_ok = match kind {
+        "site.device_changed" => match get("changed").and_then(Value::as_array) {
+            Some(changed) if !changed.is_empty() => {
+                let names: Vec<Option<&str>> = changed.iter().map(Value::as_str).collect();
+                let distinct: std::collections::HashSet<&Option<&str>> = names.iter().collect();
+                distinct.len() == names.len()
+                    && names
+                        .iter()
+                        .all(|name| name.is_some_and(|name| ["class", "name", "address"].contains(&name)))
+            }
+            _ => false,
+        },
+        "site.device_gone" => {
+            time_of(get("lastSeenAt")).is_some_and(|last| last <= observed_at && observed_at - last <= NINETY_DAYS_MS)
+        }
+        "site.inventory_snapshot" => {
+            let counts_ok = match get("counts") {
+                Some(Value::Object(counts)) => {
+                    counts.len() == CLASSES.len()
+                        && CLASSES.iter().all(|class| safe_integer(counts.get(*class)).is_some())
+                }
+                _ => false,
+            };
+            counts_ok && safe_integer(get("ephemeral")).is_some()
+        }
+        "site_source.gap_declared" => {
+            let (from, to) = (safe_integer(get("fromSeq")), safe_integer(get("toSeq")));
+            text("reason") == Some("operator") && from.is_some_and(|from| from >= 1 && to.is_some_and(|to| from <= to))
+        }
+        "site_source.reset" => {
+            safe_integer(get("lastAckedSeq")).is_some()
+                && text("reason").is_some_and(|reason| ["queue_lost", "reinstall"].contains(&reason))
+        }
+        "site_source.input_lost" => {
+            let to = time_of(get("toTime"));
+            let from_ok = match get("fromTime") {
+                None => true,
+                Some(from) => time_of(Some(from)).is_some_and(|from| to.is_some_and(|to| from <= to)),
+            };
+            to.is_some()
+                && from_ok
+                && text("reason").is_some_and(|reason| ["capture_stopped", "capture_unreadable"].contains(&reason))
+        }
+        "site_source.event_dropped" => {
+            text("reason") == Some("operator") && text("originalKind").is_some_and(|original| !original.is_empty())
+        }
+        _ => true,
+    };
+    if !(refs_ok && class_ok && kind_ok) {
+        return false;
+    }
+    match (fields.get("pii"), fields.get("piiNonce"), fields.get("piiCommitment")) {
+        (None, None, None) => true,
+        (Some(Value::Object(pii)), nonce, commitment) => {
+            PII_KINDS.contains(&kind)
+                && !pii.is_empty()
+                && is_lower_hex(nonce, 64)
+                && is_lower_hex(commitment, 64)
+                && pii.iter().all(|(name, value)| match (name.as_str(), value.as_str()) {
+                    ("mac", Some(mac)) => is_lower_hex(Some(value), 12) && mac.len() == 12,
+                    ("hostname", Some(hostname)) => (1..=253).contains(&hostname.chars().count()),
+                    ("ip", Some(ip)) => ip.parse::<std::net::IpAddr>().is_ok(),
+                    _ => false,
+                })
+                && pii.keys().all(|name| PII_FIELDS.contains(&name.as_str()))
+        }
+        _ => false,
+    }
 }

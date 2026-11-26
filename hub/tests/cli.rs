@@ -106,9 +106,12 @@ fn test_status_prints_counts_and_no_device() {
         "lastAckedSeq",
         "pending",
         "halted",
+        "haltedAt",
         "waitingFor",
+        "problem",
+        "resume",
     ];
-    // The Python's key order, as printed (serde_json's map sorts, so check the text).
+    // The order, as printed (serde_json's map sorts, so check the text).
     let positions: Vec<usize> = expected
         .iter()
         .map(|key| ran.out.find(&format!("\"{key}\"")).unwrap())
@@ -408,7 +411,7 @@ fn a_hub_killed_mid_run_starts_again_and_the_service_takes_each_number_once() {
     );
     assert_eq!(killed["lastAckedSeq"], 0, "the hub never heard the answer");
 
-    // Started again: the same events go again, with the same signatures, and are counted as duplicates.
+    // Started again: the first request is a heartbeat, and its answer confirms what the service already took.
     let mut second = spawn_run(&hub);
     wait_until("the replay to be confirmed", || status_of(&hub)["lastAckedSeq"] == held);
     second.kill().unwrap();
@@ -433,8 +436,119 @@ fn a_hub_killed_mid_run_starts_again_and_the_service_takes_each_number_once() {
         .iter()
         .filter(|record| record.events.as_ref().is_some_and(|events| events.contains(&1)))
         .count();
-    assert_eq!(sent_first, 2, "sent twice, accepted once");
+    // Sent once: the second run opened with a heartbeat, whose `lastSeq` confirmed the batch the first run never
+    // heard back about. Nothing is sent again that the service already says it holds.
+    assert_eq!(sent_first, 1, "sent once, confirmed by the next run's heartbeat");
     let status = status_of(&hub);
     assert_eq!(status["lastAckedSeq"], status["lastAssignedSeq"]);
     assert_eq!(status["lastAckedSeq"], hub.service.last_seq());
+}
+
+// ---- public-key, resume, and what status says about a halt ----
+
+#[test]
+fn public_key_prints_the_existing_keys_public_half_and_nothing_else() {
+    let tmp = TempDir::new();
+    let state = tmp.join("state");
+    let made = cli(&["keygen", "--state-dir", path(&state), "--key-id", "hub-key-1"]);
+    assert_eq!(made.code, 0);
+    let key_file = std::fs::read(state.join("hub.key")).unwrap();
+    let again = cli(&["public-key", "--state-dir", path(&state), "--key-id", "hub-key-1"]);
+    assert_eq!(
+        (again.code, again.out.as_str(), again.err.as_str()),
+        (0, made.out.as_str(), "")
+    );
+    assert_eq!(
+        std::fs::read(state.join("hub.key")).unwrap(),
+        key_file,
+        "nothing changed"
+    );
+    let body = String::from_utf8(key_file).unwrap().lines().nth(1).unwrap().to_owned();
+    assert!(!again.out.contains(&body) && !again.out.contains("PRIVATE"));
+    // A second keygen refuses, and says how to get the public key back.
+    let refused = cli(&["keygen", "--state-dir", path(&state), "--key-id", "hub-key-1"]);
+    assert_eq!(refused.code, 1);
+    assert!(
+        refused.err.contains("spacegoat-hub public-key --state-dir"),
+        "{}",
+        refused.err
+    );
+    // No key: a reason, exit 1; a malformed key id: usage, exit 2.
+    let none = cli(&[
+        "public-key",
+        "--state-dir",
+        path(&tmp.join("empty")),
+        "--key-id",
+        "hub-key-1",
+    ]);
+    assert_eq!(none.code, 1);
+    assert!(none.err.contains("no key"), "{}", none.err);
+    assert_eq!(
+        cli(&["public-key", "--state-dir", path(&state), "--key-id", "Bad Id"]).code,
+        2
+    );
+}
+
+#[test]
+fn status_shows_a_halt_with_its_time_and_names_resume_which_clears_it() {
+    let hub = Hub::new();
+    let mut agent = hub.run(2);
+    hub.service
+        .push(Step::status(400, serde_json::json!({"error": "schema"})));
+    hub.clock.advance_seconds(2 * 3600);
+    agent.tick().unwrap();
+    // Refused while the agent holds the directory.
+    let busy = cli(&["resume", "--config", path(&hub.config_path)]);
+    assert_eq!(busy.code, 1);
+    assert!(busy.err.contains("already running"), "{}", busy.err);
+    agent.close().unwrap();
+    let status = status_of(&hub);
+    assert_eq!(status["halted"], "schema");
+    assert!(status["haltedAt"].as_str().unwrap().ends_with('Z'));
+    let resume = status["resume"].as_str().unwrap();
+    assert_eq!(
+        resume,
+        format!("spacegoat-hub resume --config {}", path(&hub.config_path))
+    );
+    let cleared = cli(&["resume", "--config", path(&hub.config_path)]);
+    assert_eq!(cleared.code, 0, "{}", cleared.err);
+    assert!(cleared.out.contains("cleared the halt: schema"), "{}", cleared.out);
+    let after = status_of(&hub);
+    assert_eq!(
+        (after["halted"].clone(), after["resume"].clone()),
+        (Value::Null, Value::Null)
+    );
+    let saved = std::fs::read_to_string(hub.state.join("agent.json")).unwrap();
+    assert!(saved.contains("\"halted\": null"), "{saved}");
+    // Nothing left to clear.
+    let nothing = cli(&["resume", "--config", path(&hub.config_path)]);
+    assert_eq!(nothing.code, 1);
+    assert!(nothing.err.contains("not halted"), "{}", nothing.err);
+}
+
+#[test]
+fn a_damaged_outbox_is_said_once_on_stderr_without_its_contents() {
+    let hub = Hub::new();
+    hub.run(2).close().unwrap();
+    hub.lose_outbox();
+    std::fs::write(
+        hub.state.join("outbox.sqlite"),
+        "printer.example 00005e005301 192.0.2.10",
+    )
+    .unwrap();
+    let mut child = spawn_run(&hub);
+    wait_until("the reset", || {
+        hub.service
+            .accepted()
+            .iter()
+            .any(|event| event["kind"] == "site_source.reset")
+    });
+    signal(&child, "TERM");
+    assert_eq!(exit_of(&mut child).code(), Some(0));
+    let (out, err) = output_of(child);
+    assert_eq!(out, "");
+    assert_eq!(err.lines().count(), 1, "{err}");
+    assert!(err.contains("outbox.sqlite.damaged"), "{err}");
+    assert_no_personal_data(&err, "stderr");
+    assert_eq!(status_of(&hub)["problem"], "outbox_replaced");
 }

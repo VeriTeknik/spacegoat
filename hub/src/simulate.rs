@@ -4,6 +4,9 @@
 //! Guarantee: nothing here touches a network interface, and everything it reports is reserved for documentation:
 //! IPv4 192.0.2.0/24 (RFC 5737), the hardware addresses 00-00-5E-00-53-xx (RFC 7042) and names under `.example`
 //! (RFC 2606). It has the shape a real observer has: each poll returns what is on the network right now.
+//!
+//! Besides four devices with lasting addresses there is one whose address changes at every poll (a phone with a
+//! randomised hardware address): the observer hands it over as ephemeral, so it is only ever counted.
 
 use crate::agent::{Observer, Sighting};
 
@@ -62,11 +65,28 @@ pub fn devices() -> Vec<Sighting> {
             mac: Some(device.mac.to_owned()),
             hostname: device.name.map(str::to_owned),
             ip: Some(device.ip.to_owned()),
+            ephemeral: false,
         })
         .collect()
 }
 
-/// Devices join one per poll until all four are present; from then on they are simply still there.
+/// The device whose identity keeps changing, as it is seen at poll `poll`: a new hardware address (and so a new
+/// identity) each time, still within the documentation range.
+pub fn ephemeral_device(poll: usize) -> Sighting {
+    let last = 0x80 + poll % 0x80;
+    Sighting {
+        identity: format!("sim:phone:{last:02x}"),
+        segment: SEGMENT.to_owned(),
+        device_class: "user_device".to_owned(),
+        mac: Some(format!("00005e0053{last:02x}")),
+        hostname: None,
+        ip: Some(format!("192.0.2.{}", 100 + poll % 100)),
+        ephemeral: true,
+    }
+}
+
+/// Devices join one per poll until all four are present; from then on they are simply still there. The ephemeral
+/// one is there from the first poll, under a new address each time.
 #[derive(Debug, Default)]
 pub struct SimulatedObserver {
     polls: usize,
@@ -81,6 +101,8 @@ impl SimulatedObserver {
 impl Observer for SimulatedObserver {
     fn poll(&mut self) -> Vec<Sighting> {
         self.polls = self.polls.saturating_add(1);
-        devices().into_iter().take(self.polls).collect()
+        let mut seen: Vec<Sighting> = devices().into_iter().take(self.polls).collect();
+        seen.push(ephemeral_device(self.polls));
+        seen
     }
 }

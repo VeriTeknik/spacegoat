@@ -1,13 +1,80 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Time as the protocol writes it, the one check a hub makes before it trusts its own clock, and the reading of the
-//! service's `Date` header.
+//! The hub's two clocks (wall and monotonic, `Clock`), time as the protocol writes it, the one check a hub makes
+//! before it trusts its own clock, and the reading of the service's `Date` header.
 //!
 //! A moment is a count of milliseconds since 1970-01-01T00:00:00Z (Unix time, no leap seconds), so it has no zone to
 //! get wrong. The calendar arithmetic is done here by hand (proleptic Gregorian, days counted from 1970-03-01 in
 //! 400-year eras) rather than taken from a date library: it is small, and every text it produces is one that
 //! `signing::is_observed_at` accepts and that reads back to the same moment.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// The two clocks a hub reads, and what each is for.
+///
+/// - The WALL clock (Unix milliseconds) says what time it is. It can be set, stepped back, or jump forward at any
+///   moment (an NTP step, an RTC read at boot, a person). It is used only for what must name a time: an event's
+///   `observedAt`, the request timestamp, and moments kept across a restart.
+/// - The MONOTONIC clock (milliseconds from an arbitrary start) only moves forward, at the rate time passes. It
+///   measures every interval within one run: back-off, the wait after a `401`, when a heartbeat is due, how long the
+///   run loop sleeps. A step of the wall clock does not move it, so no interval is stretched or cut short by one.
+///
+/// Both are injected, so a test can step one without the other.
+pub trait Clock: Send + Sync {
+    /// The wall clock, in Unix milliseconds.
+    fn wall_millis(&self) -> i64;
+    /// The monotonic clock, in milliseconds; only the difference between two readings means anything.
+    fn mono_millis(&self) -> i64;
+}
+
+/// The system's clocks: `SystemTime` for the wall, `Instant` for the monotonic one.
+#[derive(Debug)]
+pub struct SystemClock {
+    origin: Instant,
+}
+
+impl SystemClock {
+    pub fn new() -> Self {
+        Self { origin: Instant::now() }
+    }
+}
+
+impl Default for SystemClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for SystemClock {
+    /// 0 (a clock that is not set) for a system time outside what an `i64` of milliseconds holds.
+    fn wall_millis(&self) -> i64 {
+        now().unwrap_or(0)
+    }
+
+    fn mono_millis(&self) -> i64 {
+        i64::try_from(self.origin.elapsed().as_millis()).unwrap_or(i64::MAX)
+    }
+}
+
+/// One reading of the service's clock: how far the hub's wall clock was from it (hub minus service, from a `Date`
+/// header), and the hub's wall and monotonic clocks at that moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockReading {
+    pub skew_millis: i64,
+    pub wall_millis: i64,
+    pub mono_millis: i64,
+}
+
+impl ClockReading {
+    /// The skew now, without asking the service again: the skew at the reading plus how far the wall clock has
+    /// jumped since (wall time elapsed minus real time elapsed). A wall clock stepped by an hour after the reading
+    /// is an hour off now; one that was off at the reading and has since been corrected is right again.
+    pub fn skew_now(&self, wall_millis: i64, mono_millis: i64) -> i64 {
+        let wall_elapsed = wall_millis.saturating_sub(self.wall_millis);
+        let real_elapsed = mono_millis.saturating_sub(self.mono_millis);
+        self.skew_millis
+            .saturating_add(wall_elapsed.saturating_sub(real_elapsed))
+    }
+}
 
 /// A hub that boots without a battery-backed clock starts in the past. An event signed with that time cannot be taken
 /// back, so nothing is produced until the clock has been set (spec/protocol.md was published in this year).

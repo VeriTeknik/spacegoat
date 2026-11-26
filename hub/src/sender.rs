@@ -1,31 +1,38 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The sender: delivers what the outbox holds, in order, and says honestly what happened (spec/protocol.md §10).
 //!
-//! One call to `step()` makes at most one request. It never sleeps and never loops: the agent's loop decides when to
-//! call it again, from the outcome it returns. The clock is injected, so every decision here is testable against a
-//! real service.
+//! One call to `step()` or `heartbeat()` makes at most one request. It never sleeps and never loops: the agent's loop
+//! decides when to call it again, from the outcome it returns. The clocks are injected (`clock::Clock`), so every
+//! decision here is testable against a real service. Every interval (back-off, the wait after a `401`, when a
+//! heartbeat is due) is measured on the monotonic clock; the wall clock only gives the request its timestamp.
 //!
 //! What it guarantees:
 //! - an event is forgotten only after the service confirmed it (`200` with `accepted`, `duplicates` and `lastSeq`,
-//!   all non-negative integers); any other `200` (a proxy page, a captive portal) confirms nothing;
+//!   all integers from 0 to 2^53 - 1); any other `200` (a proxy page, a captive portal) confirms nothing. A `200` to
+//!   a batch that moves the confirmed mark nowhere is a failure: it backs off rather than send the batch again at once;
 //! - a failed or unanswered request is sent again with the same bytes, so the service counts duplicates, never gaps.
 //!   The body is the outbox's stored event texts spliced into `{"events":[...],"schemaVersion":1}`, never the events
 //!   parsed and written again;
-//! - a refusal no retry can fix (rejected content, a conflicting replay, a service that lost what it had confirmed)
-//!   HALTS the sender. A halted sender makes no request at all: knocking for ever with the same refused batch only
-//!   buries the fault. A person looks, the fault is fixed, the agent is started again and continues from there;
+//! - a refusal no retry can fix (rejected content, a conflicting replay, a service that lost what it had confirmed,
+//!   one event the service says is too large) HALTS the sender. A halted sender makes no request at all: knocking for
+//!   ever with the same refused batch only buries the fault. A person looks, the fault is fixed, the halt is cleared
+//!   (`spacegoat-hub resume`) and the agent continues from there. A `413` halts only when it is the service's own
+//!   answer (`{"error":"too_large"}`) to a request of exactly one event; to a larger batch it halves the batch, and
+//!   anything else (a `413` to a heartbeat, or one from something in between) backs off;
 //! - `401` does not halt. The service gives the same answer for an unknown key and for a clock that is more than five
 //!   minutes off, and a clock corrects itself: the sender says so (`problem`) and tries again, slowly;
 //! - it talks to one origin only: a redirect is never followed (the signed headers and the events would go with it),
 //!   no proxy is taken from the environment, and it is `https` unless the service is on this very machine;
 //! - an answer that cannot be read in full, or is larger than 64 KiB, is no answer: the events are sent again.
 //!
-//! It also reads two things off every answer for the agent: how far the hub's clock is from the service's (`Date`),
-//! and the last sequence number the service holds (`lastSeq`).
+//! It also reads two things off every answer for the agent: how far the hub's clock is from the service's (`Date`,
+//! kept as a `ClockReading` with the hub's two clocks at that moment; an answer without a readable `Date` leaves the
+//! last reading as it is), and the last sequence number the service holds (`lastSeq`).
 
 use std::fmt;
 use std::io::{self, Write};
 use std::net::Ipv6Addr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -34,7 +41,8 @@ use flate2::write::GzEncoder;
 use serde_json::{Map, Value};
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 
-use crate::clock;
+use crate::canonical::MAX_SAFE_INTEGER;
+use crate::clock::{self, Clock, ClockReading};
 use crate::outbox::{Outbox, OutboxError, StoredEvent};
 use crate::signing;
 
@@ -47,11 +55,13 @@ pub const MAX_UNCOMPRESSED_BYTES: usize = 4 * 1024 * 1024;
 /// The longest `Retry-After` honoured: the hub owes a sign of life sooner than that.
 pub const MAX_WAIT_SECONDS: u64 = 3600;
 pub const BACKOFF_FIRST_SECONDS: u64 = 5;
-pub const BACKOFF_MAX_SECONDS: u64 = 300;
+/// The protocol wants a request at least every 300 seconds; a wait of 240 leaves room for the run loop's tick.
+pub const BACKOFF_MAX_SECONDS: u64 = 240;
 /// The whole request, from resolving the name to the last byte of the answer.
 pub const REQUEST_TIMEOUT_SECONDS: u64 = 30;
 pub const CONNECT_TIMEOUT_SECONDS: u64 = 10;
-pub const UNAUTHORIZED_RETRY_SECONDS: u64 = 300;
+/// "Tries again slowly" (protocol §10), within the 300 seconds of §11.
+pub const UNAUTHORIZED_RETRY_SECONDS: u64 = 240;
 pub const MAX_ANSWER_BYTES: u64 = 64 * 1024;
 
 /// The hosts plain `http` is allowed for: this very machine.
@@ -71,6 +81,8 @@ pub enum HaltReason {
     TooLarge,
     /// The service confirmed a number this hub never assigned: two hubs share one identity.
     Ahead,
+    /// A halt recorded on disk whose reason this version cannot read.
+    Unknown,
 }
 
 impl HaltReason {
@@ -82,7 +94,22 @@ impl HaltReason {
             Self::Gap => "gap",
             Self::TooLarge => "too_large",
             Self::Ahead => "ahead",
+            Self::Unknown => "unknown",
         }
+    }
+
+    /// The reason `as_str` wrote; `Unknown` for any other text.
+    pub fn from_text(text: &str) -> Self {
+        [
+            Self::Schema,
+            Self::ReplayConflict,
+            Self::Gap,
+            Self::TooLarge,
+            Self::Ahead,
+        ]
+        .into_iter()
+        .find(|reason| reason.as_str() == text)
+        .unwrap_or(Self::Unknown)
     }
 }
 
@@ -189,31 +216,33 @@ pub struct Sender {
     key_id: String,
     key: SigningKey,
     outbox: Outbox,
-    now: Box<dyn Fn() -> i64 + Send>,
+    clock: Arc<dyn Clock>,
     max_compressed: usize,
     max_uncompressed: usize,
     batch_limit: usize,
     failures: u32,
-    /// No request before this moment (Unix milliseconds).
+    /// No request before this moment (monotonic milliseconds).
     not_before: i64,
+    /// When the service last answered at all (monotonic milliseconds).
     last_contact: Option<i64>,
     halted: Option<HaltReason>,
+    /// When the service last confirmed a request (wall milliseconds, for display).
     last_success: Option<i64>,
     problem: Option<Problem>,
-    clock_skew_ms: Option<i64>,
+    reading: Option<ClockReading>,
     service_last_seq: Option<u64>,
 }
 
 impl Sender {
     /// A sender for the service at `base_url` (an origin, see `service_origin`), delivering `outbox` as `source_id`
-    /// with `key`. `now` is the clock, in Unix milliseconds.
+    /// with `key`, on `clock`.
     pub fn new(
         base_url: &str,
         source_id: &str,
         key_id: &str,
         key: SigningKey,
         outbox: Outbox,
-        now: impl Fn() -> i64 + Send + 'static,
+        clock: Arc<dyn Clock>,
     ) -> Result<Self, OriginError> {
         let url = format!("{}{INGEST_PATH}", service_origin(base_url)?);
         let config = ureq::Agent::config_builder()
@@ -245,7 +274,7 @@ impl Sender {
             key_id: key_id.to_owned(),
             key,
             outbox,
-            now: Box::new(now),
+            clock,
             max_compressed: MAX_COMPRESSED_BYTES,
             max_uncompressed: MAX_UNCOMPRESSED_BYTES,
             batch_limit: MAX_EVENTS,
@@ -255,7 +284,7 @@ impl Sender {
             halted: None,
             last_success: None,
             problem: None,
-            clock_skew_ms: None,
+            reading: None,
             service_last_seq: None,
         })
     }
@@ -285,25 +314,39 @@ impl Sender {
         self.halted
     }
 
+    /// Stop for good (until a person clears it): a halt the agent decided, or one recorded before a restart. From
+    /// here on no request is made.
+    pub fn halt(&mut self, reason: HaltReason) -> SendOutcome {
+        self.halted = Some(reason);
+        SendOutcome::Halted(reason)
+    }
+
     /// Why delivery is not working although the sender keeps trying.
     pub fn problem(&self) -> Option<Problem> {
         self.problem
     }
 
-    /// When the service last confirmed a request (Unix milliseconds).
+    /// When the service last confirmed a request (wall clock, Unix milliseconds).
     pub fn last_success(&self) -> Option<i64> {
         self.last_success
     }
 
-    /// Hub clock minus service clock, from the last answer that carried a readable `Date`; `None` before any, and
-    /// after an answer whose `Date` was missing or not an IMF-fixdate.
+    /// The last reading of the service's clock: from the last answer that carried a readable `Date`. An answer
+    /// without one (or with a `Date` that is not an IMF-fixdate) neither changes nor clears it.
+    pub fn clock_reading(&self) -> Option<ClockReading> {
+        self.reading
+    }
+
+    /// Hub clock minus service clock now: the last reading, corrected for any jump of the wall clock since then
+    /// (`ClockReading::skew_now`). `None` before any reading.
     pub fn clock_skew_millis(&self) -> Option<i64> {
-        self.clock_skew_ms
+        let reading = self.reading?;
+        Some(reading.skew_now(self.clock.wall_millis(), self.clock.mono_millis()))
     }
 
     /// The same in seconds.
     pub fn clock_skew_seconds(&self) -> Option<f64> {
-        self.clock_skew_ms.map(|ms| ms as f64 / 1000.0)
+        self.clock_skew_millis().map(|ms| ms as f64 / 1000.0)
     }
 
     /// The last sequence number the service said it holds; `None` before any confirmed answer.
@@ -311,34 +354,69 @@ impl Sender {
         self.service_last_seq
     }
 
-    /// At most one request; never sleeps, never loops. An `Err` is the hub's own storage failing, never the service.
+    /// Whether a heartbeat is due: no answer yet in this run, or none for `HEARTBEAT_SECONDS` of monotonic time.
+    pub fn heartbeat_due(&self) -> bool {
+        let now = self.clock.mono_millis();
+        self.last_contact
+            .is_none_or(|at| now.saturating_sub(at) >= HEARTBEAT_SECONDS * MS_PER_SECOND)
+    }
+
+    /// At most one request: the events that wait, or a heartbeat when one is due. Never sleeps, never loops. An `Err`
+    /// is the hub's own storage failing, never the service.
     pub fn step(&mut self) -> Result<SendOutcome, SenderError> {
-        if let Some(reason) = self.halted {
-            return Ok(SendOutcome::Halted(reason));
-        }
-        let now = (self.now)();
-        if now < self.not_before {
-            return Ok(SendOutcome::RetryLater(ceil_seconds(
-                self.not_before.saturating_sub(now),
-            )));
+        if let Some(waiting) = self.gate() {
+            return Ok(waiting);
         }
         let events = self.outbox.pending(self.batch_limit, None)?;
-        let heartbeat_due = self
-            .last_contact
-            .is_none_or(|at| now.saturating_sub(at) >= HEARTBEAT_SECONDS * MS_PER_SECOND);
-        if events.is_empty() && !heartbeat_due {
+        if events.is_empty() && !self.heartbeat_due() {
             return Ok(SendOutcome::Idle);
         }
-        let Some((body, count)) = self.fit(&events)? else {
+        self.exchange(&events)
+    }
+
+    /// An empty request now (a heartbeat), whatever waits in the outbox: the first request of a run, which asks the
+    /// service where it stands before anything is sent (protocol §11). Still none while halted or waiting out a
+    /// back-off.
+    pub fn heartbeat(&mut self) -> Result<SendOutcome, SenderError> {
+        if let Some(waiting) = self.gate() {
+            return Ok(waiting);
+        }
+        self.exchange(&[])
+    }
+
+    /// A heartbeat only if one is due, and no events: while the agent cannot trust its clock it keeps the service
+    /// informed (and takes a new reading) without delivering.
+    pub fn heartbeat_if_due(&mut self) -> Result<SendOutcome, SenderError> {
+        if let Some(waiting) = self.gate() {
+            return Ok(waiting);
+        }
+        if !self.heartbeat_due() {
+            return Ok(SendOutcome::Idle);
+        }
+        self.exchange(&[])
+    }
+
+    /// The outcome without a request: halted, or waiting until the monotonic `not_before`.
+    fn gate(&self) -> Option<SendOutcome> {
+        if let Some(reason) = self.halted {
+            return Some(SendOutcome::Halted(reason));
+        }
+        let now = self.clock.mono_millis();
+        (now < self.not_before).then(|| SendOutcome::RetryLater(ceil_seconds(self.not_before.saturating_sub(now))))
+    }
+
+    /// One request carrying `events` (none: a heartbeat), and what its answer means.
+    fn exchange(&mut self, events: &[StoredEvent]) -> Result<SendOutcome, SenderError> {
+        let Some((body, count)) = self.fit(events)? else {
             return Ok(self.halt(HaltReason::TooLarge));
         };
-        let Some(answer) = self.post(&body, now) else {
+        let Some(answer) = self.post(&body) else {
             return Ok(self.back_off());
         };
-        self.last_contact = Some(now);
+        self.last_contact = Some(self.clock.mono_millis());
         let error = answer.object.get("error").and_then(Value::as_str);
         Ok(match (answer.status, error) {
-            (200, _) => self.confirmed(&answer.object, count, now)?,
+            (200, _) => self.confirmed(&answer.object, count)?,
             // The service expects a number this hub has already been told was confirmed, and has forgotten: the
             // service lost events. A hub cannot send what it no longer has, and it does not invent a sequence.
             (409, Some("seq_gap")) => self.halt(HaltReason::Gap),
@@ -346,15 +424,17 @@ impl Sender {
                 self.problem = Some(Problem::Unauthorized);
                 self.wait(UNAUTHORIZED_RETRY_SECONDS)
             }
-            (413, _) if count <= 1 => self.halt(HaltReason::TooLarge),
-            (413, _) => {
+            // One event alone, refused by the service itself for its size: no split can help.
+            (413, Some("too_large")) if count == 1 => self.halt(HaltReason::TooLarge),
+            (413, _) if count > 1 => {
                 self.batch_limit = (count / 2).max(1);
                 SendOutcome::RetryNow
             }
-            (429, _) => self.wait(retry_after(answer.retry_after.as_deref(), now)),
+            (429, _) => self.wait(retry_after(answer.retry_after.as_deref(), self.clock.wall_millis())),
             (400 | 409, Some("schema")) => self.halt(HaltReason::Schema),
             (400 | 409, Some("replay_conflict")) => self.halt(HaltReason::ReplayConflict),
-            // 5xx, a redirect, and anything this version does not know: the service's trouble, not a reason to stop.
+            // 5xx, a redirect, a 413 to a heartbeat or one that is not the service's, and anything this version does
+            // not know: the service's trouble (or something in between), not a reason to stop.
             _ => self.back_off(),
         })
     }
@@ -379,10 +459,11 @@ impl Sender {
         }
     }
 
-    /// One signed POST. `None` when there is no complete answer: the request may or may not have arrived, and
-    /// sending the same bytes again is always safe.
-    fn post(&mut self, body: &[u8], now: i64) -> Option<Answer> {
-        let timestamp = now.div_euclid(MS_PER_SECOND).to_string();
+    /// One signed POST, timestamped by the wall clock. `None` when there is no complete answer: the request may or
+    /// may not have arrived, and sending the same bytes again is always safe.
+    fn post(&mut self, body: &[u8]) -> Option<Answer> {
+        let (wall, mono) = (self.clock.wall_millis(), self.clock.mono_millis());
+        let timestamp = wall.div_euclid(MS_PER_SECOND).to_string();
         let message = signing::request_signing_message(&self.principal, "POST", INGEST_PATH, &timestamp, body);
         let signature = signing::sign(&self.key, &message);
         let mut response = self
@@ -413,10 +494,18 @@ impl Sender {
             .limit(MAX_ANSWER_BYTES)
             .read_to_vec()
             .ok()?;
-        self.clock_skew_ms = date
+        let skew = date
             .as_deref()
             .and_then(clock::parse_http_date)
-            .and_then(|seconds| now.checked_sub(seconds.checked_mul(MS_PER_SECOND)?));
+            .and_then(|seconds| wall.checked_sub(seconds.checked_mul(MS_PER_SECOND)?));
+        if let Some(skew_millis) = skew {
+            // Only a readable `Date` is a reading; an answer without one keeps the last.
+            self.reading = Some(ClockReading {
+                skew_millis,
+                wall_millis: wall,
+                mono_millis: mono,
+            });
+        }
         Some(Answer {
             status,
             object: json_object(&raw),
@@ -424,8 +513,14 @@ impl Sender {
         })
     }
 
-    fn confirmed(&mut self, answer: &Map<String, Value>, sent: usize, now: i64) -> Result<SendOutcome, SenderError> {
-        let field = |name: &str| answer.get(name).and_then(Value::as_u64);
+    fn confirmed(&mut self, answer: &Map<String, Value>, sent: usize) -> Result<SendOutcome, SenderError> {
+        // A count the protocol's JSON cannot carry exactly (above 2^53 - 1) is no count: the answer is malformed.
+        let field = |name: &str| {
+            answer
+                .get(name)
+                .and_then(Value::as_u64)
+                .filter(|n| i64::try_from(*n).is_ok_and(|n| n <= MAX_SAFE_INTEGER))
+        };
         let (Some(_), Some(_), Some(last_seq)) = (field("accepted"), field("duplicates"), field("lastSeq")) else {
             // A 200 that is not the service's answer (a proxy, a portal page): nothing was confirmed.
             return Ok(self.back_off());
@@ -443,30 +538,31 @@ impl Sender {
             // writing into that sequence.
             return Ok(self.halt(HaltReason::Ahead));
         }
+        let before = self.outbox.last_acked()?;
         match self.outbox.ack(last_seq) {
             Ok(()) => {}
             Err(OutboxError::AckAhead) => return Ok(self.halt(HaltReason::Ahead)),
             Err(error) => return Err(error.into()),
         }
+        if sent > 0 && self.outbox.last_acked()? <= before {
+            // Events went and the service confirmed none of them: whatever it is, sending the same batch again at
+            // once will not change it.
+            return Ok(self.back_off());
+        }
         self.failures = 0;
         self.batch_limit = self.batch_limit.saturating_mul(2).min(MAX_EVENTS);
-        self.last_success = Some(now);
+        self.last_success = Some(self.clock.wall_millis());
         Ok(SendOutcome::Sent(sent))
     }
 
-    fn halt(&mut self, reason: HaltReason) -> SendOutcome {
-        self.halted = Some(reason);
-        SendOutcome::Halted(reason)
-    }
-
-    /// No request for `seconds`, counted from now (after the answer, not from when the request left).
+    /// No request for `seconds` of monotonic time, counted from now (after the answer, not from when it left).
     fn wait(&mut self, seconds: u64) -> SendOutcome {
         let ms = i64::try_from(seconds).unwrap_or(i64::MAX).saturating_mul(MS_PER_SECOND);
-        self.not_before = (self.now)().saturating_add(ms);
+        self.not_before = self.clock.mono_millis().saturating_add(ms);
         SendOutcome::RetryLater(seconds)
     }
 
-    /// 5 s, doubling with each failure in a row, at most 300 s.
+    /// 5 s, doubling with each failure in a row, at most `BACKOFF_MAX_SECONDS`.
     fn back_off(&mut self) -> SendOutcome {
         let seconds = BACKOFF_FIRST_SECONDS
             .saturating_mul(1u64 << self.failures.min(16))

@@ -2,7 +2,7 @@
 name = "spacegoat-hub"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.99"
 license = "AGPL-3.0-or-later"
 description = "SpaceGoat hub agent: observes the local network and sends signed, ordered evidence to a hub service"
 repository = "https://github.com/VeriTeknik/spacegoat"
@@ -51,3 +51,6 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+# An arithmetic overflow in a release build stops the process (panic = "abort") instead of wrapping silently into a
+# wrong sequence number or time.
+overflow-checks = true

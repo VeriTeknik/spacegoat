@@ -11,7 +11,11 @@
 //! event is on disk and will be sent. There is no state in between.
 //!
 //! The file belongs to one source. It also remembers what the service last confirmed, so a hub that lost everything
-//! else can still say truthfully where it stood (`declare_reset`).
+//! else can still say truthfully where it stood (`declare_reset`), and since when the hub has stopped capturing
+//! because too much waits (`stop_capture`, `resume_capture`): that mark lives and dies with the queue it is about.
+//!
+//! A file that is not a database, or fails SQLite's own `quick_check`, is recognised as such (`database_is_damaged`)
+//! so the agent can set it aside and treat the queue as lost, rather than not start at all.
 
 use std::fmt;
 use std::io;
@@ -20,7 +24,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Map, Value};
 
 use crate::canonical::canonical_json;
@@ -262,6 +266,51 @@ impl Outbox {
         Ok(seq)
     }
 
+    /// Since when (wall clock, Unix milliseconds) the hub has stopped capturing because its backlog is full; `None`
+    /// while it captures.
+    pub fn capture_stopped_at(&self) -> Result<Option<i64>, OutboxError> {
+        match meta(&self.db, "capture_stopped_at")? {
+            None => Ok(None),
+            Some(text) => text
+                .parse()
+                .map(Some)
+                .map_err(|_| OutboxError::Damaged("the capture mark is not a number")),
+        }
+    }
+
+    /// Record that the hub stopped capturing at `at` (wall clock, Unix milliseconds). An earlier mark is kept: the
+    /// loss began then.
+    pub fn stop_capture(&mut self, at: i64) -> Result<(), OutboxError> {
+        self.db.execute(
+            "INSERT INTO meta (key, value) VALUES ('capture_stopped_at', ?1) ON CONFLICT (key) DO NOTHING",
+            params![at.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Append the event that says what was not captured, and clear the mark, in one transaction: a crash leaves
+    /// either both or neither. Returns the event's sequence number.
+    pub fn resume_capture(
+        &mut self,
+        kind: &str,
+        observed_at: &str,
+        attributes: &Map<String, Value>,
+    ) -> Result<u64, OutboxError> {
+        let signer = Signer {
+            source_id: &self.source_id,
+            key_id: &self.key_id,
+            key: &self.key,
+        };
+        let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let seq = counter(&tx, "last_assigned")?
+            .checked_add(1)
+            .ok_or(OutboxError::Damaged("the sequence is exhausted"))?;
+        signer.store(&tx, seq, kind, observed_at, attributes, None)?;
+        tx.execute("DELETE FROM meta WHERE key = 'capture_stopped_at'", [])?;
+        tx.commit()?;
+        Ok(seq)
+    }
+
     /// Undelivered events in order, exactly as they were stored: from `from_seq`, or from the first not confirmed.
     pub fn pending(&self, limit: usize, from_seq: Option<u64>) -> Result<Vec<StoredEvent>, OutboxError> {
         let start = match from_seq {
@@ -378,6 +427,31 @@ pub(crate) fn open_durable(path: &Path) -> Result<Connection, rusqlite::Error> {
     }
     db.execute_batch("PRAGMA synchronous=FULL")?;
     Ok(db)
+}
+
+/// Whether the SQLite file at `path` is damaged: not a database at all, or one that fails `PRAGMA quick_check`.
+/// `Ok(false)` for a sound file and for a regular file of length 0 (a database that never got its first page);
+/// an `Err` for anything else that keeps it from being opened (permissions, I/O): that is not damage, and the file
+/// must not be set aside for it. Shared with the pseudonym store.
+pub fn database_is_damaged(path: &Path) -> Result<bool, rusqlite::Error> {
+    let db = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    db.busy_timeout(BUSY_TIMEOUT)?;
+    let checked = db.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0));
+    let damaged = match checked {
+        Ok(verdict) => verdict != "ok",
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if matches!(error.code, ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt) =>
+        {
+            true
+        }
+        Err(error) => return Err(error),
+    };
+    // A damaged file may not close cleanly; what matters is that this connection is gone before the file is moved.
+    let _ = db.close();
+    Ok(damaged)
 }
 
 fn random_nonce() -> Result<String, OutboxError> {

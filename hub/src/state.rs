@@ -168,6 +168,20 @@ impl Pseudonyms {
             .optional()?)
     }
 
+    /// Every identity in `scope` that has a reference, in a stable order (the segments a snapshot is due for,
+    /// whether or not anything is on them now).
+    pub fn identities(&self, scope: &str) -> Result<Vec<String>, StateError> {
+        let mut statement = self
+            .db
+            .prepare("SELECT identity FROM refs WHERE scope = ?1 ORDER BY identity")?;
+        let rows = statement.query_map(params![scope], |row| row.get::<_, String>(0))?;
+        let mut found = Vec::new();
+        for row in rows {
+            found.push(row?);
+        }
+        Ok(found)
+    }
+
     /// What the hub last reported about `identity` (empty before its first report).
     pub fn facts(&self, scope: &str, identity: &str) -> Result<Map<String, Value>, StateError> {
         let text: Option<String> = self

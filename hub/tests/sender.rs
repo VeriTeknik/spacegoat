@@ -62,8 +62,7 @@ fn make_sender(service: &FakeService, outbox: Outbox, clock: &TestClock) -> Send
 }
 
 fn sender_with_key(base_url: &str, outbox: Outbox, clock: &TestClock, key: SigningKey) -> Sender {
-    let clock = clock.clone();
-    Sender::new(base_url, SOURCE, KEY_ID, key, outbox, move || clock.now()).unwrap()
+    Sender::new(base_url, SOURCE, KEY_ID, key, outbox, clock.as_clock()).unwrap()
 }
 
 fn fill(outbox: &mut Outbox, clock: &TestClock, count: usize) {
@@ -365,7 +364,7 @@ fn a_batch_stays_under_the_uncompressed_limit_too() {
 }
 
 #[test]
-fn unavailable_backs_off_longer_each_time_up_to_five_minutes() {
+fn unavailable_backs_off_longer_each_time_up_to_four_minutes() {
     let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
     let mut outbox = open_outbox(&tmp, "outbox.sqlite");
     fill(&mut outbox, &clock, 1);
@@ -377,7 +376,7 @@ fn unavailable_backs_off_longer_each_time_up_to_five_minutes() {
         waits.push(wait);
         clock.advance_seconds(wait as i64 + 1);
     }
-    assert_eq!(waits, [5, 10, 20, 40, 80, 160, 300, 300, 300, 300, 300, 300]);
+    assert_eq!(waits, [5, 10, 20, 40, 80, 160, 240, 240, 240, 240, 240, 240]);
     assert_eq!(step(&mut sender), SendOutcome::Sent(1));
     service.push(Step::status(503, json!({"error": "unavailable"})));
     fill(sender.outbox_mut(), &clock, 1);
@@ -431,11 +430,14 @@ fn unauthorized_is_not_final_the_sender_says_so_and_tries_again_slowly() {
     let mut outbox = open_outbox(&tmp, "outbox.sqlite");
     fill(&mut outbox, &clock, 1);
     let mut sender = sender_with_key(&service.base_url, outbox, &clock, random_key());
-    assert_eq!(step(&mut sender), SendOutcome::RetryLater(300));
+    assert_eq!(step(&mut sender), SendOutcome::RetryLater(240));
     assert_eq!((sender.halted(), sender.problem()), (None, Some(Problem::Unauthorized)));
     assert!(matches!(step(&mut sender), SendOutcome::RetryLater(_)));
     assert_eq!(service.requests().len(), 1);
-    clock.advance_seconds(301);
+    clock.advance_seconds(239);
+    assert_eq!(step(&mut sender), SendOutcome::RetryLater(1));
+    assert_eq!(service.requests().len(), 1);
+    clock.advance_seconds(1);
     assert!(matches!(step(&mut sender), SendOutcome::RetryLater(_)));
     assert_eq!(service.requests().len(), 2);
 }
@@ -456,8 +458,9 @@ fn a_clock_that_is_off_is_measured_from_the_answer_and_recovers() {
     assert_eq!(sender.problem(), Some(Problem::Unauthorized));
     let skew = sender.clock_skew_seconds().unwrap();
     assert!((-602.0..=-598.0).contains(&skew), "{skew}");
-    hub_clock.set_offset_seconds(301); // the clock was set; the wait is over
-    service_clock.set_offset_seconds(301);
+    hub_clock.set_offset_seconds(0); // the clock was set
+    hub_clock.advance_seconds(240); // and the wait after the 401 is over
+    service_clock.advance_seconds(240);
     assert_eq!(step(&mut sender), SendOutcome::Sent(0));
     assert_eq!(sender.problem(), None);
     assert!(sender.clock_skew_seconds().unwrap().abs() <= 2.0);
@@ -593,9 +596,8 @@ fn the_service_address_is_an_https_origin_and_nothing_else() {
     ] {
         assert!(service_origin(base_url).is_err(), "{base_url}");
         let outbox = open_outbox(&tmp, "outbox.sqlite");
-        let clock = clock.clone();
         assert!(
-            Sender::new(base_url, SOURCE, KEY_ID, vector_key(), outbox, move || clock.now()).is_err(),
+            Sender::new(base_url, SOURCE, KEY_ID, vector_key(), outbox, clock.as_clock()).is_err(),
             "{base_url}"
         );
     }
@@ -615,8 +617,7 @@ fn accepted_service_addresses() {
     ] {
         assert_eq!(service_origin(base_url).unwrap(), origin);
         let outbox = open_outbox(&tmp, "outbox.sqlite");
-        let clock = clock.clone();
-        Sender::new(base_url, SOURCE, KEY_ID, vector_key(), outbox, move || clock.now()).unwrap();
+        Sender::new(base_url, SOURCE, KEY_ID, vector_key(), outbox, clock.as_clock()).unwrap();
     }
 }
 
@@ -834,7 +835,9 @@ fn an_event_whose_signature_does_not_cover_it_is_refused_by_the_service() {
     let mut outbox = open_outbox(&tmp, "outbox.sqlite");
     fill(&mut outbox, &clock, 1);
     outbox.close().unwrap();
-    tamper(&tmp, "outbox.sqlite", |event| event["kind"] = json!("site.device_gone"));
+    // Another moment, still of the right form: only the signature can tell.
+    let other = at(&clock, 1);
+    tamper(&tmp, "outbox.sqlite", |event| event["observedAt"] = json!(other));
     let mut sender = make_sender(&service, open_outbox(&tmp, "outbox.sqlite"), &clock);
     assert_eq!(step(&mut sender), SendOutcome::Halted(HaltReason::Schema));
     assert!(service.accepted().is_empty());
@@ -895,4 +898,209 @@ fn an_https_origin_speaks_tls_and_a_peer_that_does_not_is_a_retry() {
     let first = peer.join().unwrap();
     assert_eq!(first[..2], [22, 3]);
     assert_eq!(sender.outbox().last_acked().unwrap(), 0);
+}
+
+// ---- Two clocks ----
+
+#[test]
+fn intervals_are_measured_on_the_monotonic_clock_not_the_wall() {
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 1);
+    let hub_clock = TestClock::new();
+    service.set_now(clock.as_fn());
+    let mut sender = sender_with_key(&service.base_url, outbox, &hub_clock, vector_key());
+    service.push(Step::status(503, json!({"error": "unavailable"})));
+    assert_eq!(step(&mut sender), SendOutcome::RetryLater(5));
+    // A wall clock set a day ahead does not end the back-off; one set back an hour does not lengthen it.
+    hub_clock.step_wall_seconds(86_400);
+    assert_eq!(step(&mut sender), SendOutcome::RetryLater(5));
+    hub_clock.step_wall_seconds(-86_400 - 3600);
+    hub_clock.advance_mono_seconds(5);
+    assert!(
+        matches!(step(&mut sender), SendOutcome::RetryLater(_)),
+        "sent (refused: an hour off)"
+    );
+    assert_eq!(service.requests().len(), 2);
+    // Heartbeats too: due after 240 s of monotonic time, whatever the wall clock did.
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), self::service());
+    let mut sender = make_sender(&service, open_outbox(&tmp, "outbox.sqlite"), &clock);
+    assert_eq!(step(&mut sender), SendOutcome::Sent(0));
+    clock.step_wall_seconds(-3 * 3600);
+    clock.advance_mono_seconds(HEARTBEAT_SECONDS - 1);
+    assert_eq!(step(&mut sender), SendOutcome::Idle);
+    clock.advance_mono_seconds(1);
+    assert!(sender.heartbeat_due());
+}
+
+#[test]
+fn an_answer_without_a_date_keeps_the_last_reading() {
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut sender = make_sender(&service, open_outbox(&tmp, "outbox.sqlite"), &clock);
+    service.push(Step::status_with(
+        200,
+        json!({"accepted": 0, "duplicates": 0, "lastSeq": 0}),
+        &[("Date", &http_date(clock.now() - 600_000))],
+    ));
+    assert_eq!(sender.heartbeat().unwrap(), SendOutcome::Sent(0));
+    let reading = sender.clock_reading().unwrap();
+    service.push(Step::without_date(
+        200,
+        json!({"accepted": 0, "duplicates": 0, "lastSeq": 0}),
+    ));
+    assert_eq!(sender.heartbeat().unwrap(), SendOutcome::Sent(0));
+    assert_eq!(sender.clock_reading(), Some(reading));
+    // And with no reading at all, there is none.
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), self::service());
+    let mut sender = make_sender(&service, open_outbox(&tmp, "outbox.sqlite"), &clock);
+    service.push(Step::without_date(
+        200,
+        json!({"accepted": 0, "duplicates": 0, "lastSeq": 0}),
+    ));
+    assert_eq!(sender.heartbeat().unwrap(), SendOutcome::Sent(0));
+    assert_eq!(sender.clock_reading(), None);
+    assert_eq!(sender.clock_skew_millis(), None);
+}
+
+#[test]
+fn the_skew_now_follows_a_jump_of_the_wall_clock_after_the_reading() {
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let hub_clock = TestClock::new();
+    service.set_now(clock.as_fn());
+    let mut sender = sender_with_key(
+        &service.base_url,
+        open_outbox(&tmp, "outbox.sqlite"),
+        &hub_clock,
+        vector_key(),
+    );
+    assert_eq!(sender.heartbeat().unwrap(), SendOutcome::Sent(0));
+    assert!(sender.clock_skew_millis().unwrap().abs() <= 1_000);
+    hub_clock.step_wall_seconds(3600);
+    let skew = sender.clock_skew_millis().unwrap();
+    assert!((3_599_000..=3_601_000).contains(&skew), "{skew}");
+    // Time passing on both clocks is no jump.
+    hub_clock.advance_seconds(600);
+    assert!((3_599_000..=3_601_000).contains(&sender.clock_skew_millis().unwrap()));
+}
+
+#[test]
+fn heartbeat_sends_an_empty_request_even_when_events_wait() {
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 3);
+    let mut sender = make_sender(&service, outbox, &clock);
+    assert_eq!(sender.heartbeat().unwrap(), SendOutcome::Sent(0));
+    assert_eq!(events_per_request(&service), [Some(vec![])]);
+    assert_eq!(sender.service_last_seq(), Some(0));
+    assert_eq!(step(&mut sender), SendOutcome::Sent(3));
+    // `heartbeat_if_due` sends nothing before it is due, and never events.
+    assert_eq!(sender.heartbeat_if_due().unwrap(), SendOutcome::Idle);
+    fill(sender.outbox_mut(), &clock, 1);
+    clock.advance_seconds(HEARTBEAT_SECONDS);
+    assert_eq!(sender.heartbeat_if_due().unwrap(), SendOutcome::Sent(0));
+    assert_eq!(service.requests().last().unwrap().events, Some(vec![]));
+}
+
+// ---- 413 ----
+
+#[test]
+fn a_413_to_a_heartbeat_backs_off() {
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut sender = make_sender(&service, open_outbox(&tmp, "outbox.sqlite"), &clock);
+    service.push(Step::status(413, json!({"error": "too_large"})));
+    assert_eq!(sender.heartbeat().unwrap(), SendOutcome::RetryLater(5));
+    assert_eq!(sender.halted(), None);
+}
+
+#[test]
+fn a_413_to_one_event_that_is_not_the_services_answer_backs_off() {
+    for body in [
+        json!({}),
+        json!({"error": "request_entity_too_large"}),
+        json!("too_large"),
+    ] {
+        let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+        let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+        fill(&mut outbox, &clock, 1);
+        let mut sender = make_sender(&service, outbox, &clock);
+        service.push(Step::status(413, body.clone()));
+        assert_eq!(step(&mut sender), SendOutcome::RetryLater(5), "{body}");
+        assert_eq!(sender.halted(), None, "{body}");
+    }
+    // Nor a proxy's page that is not JSON at all.
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 1);
+    let mut sender = make_sender(&service, outbox, &clock);
+    service.push(Step::Raw(
+        b"HTTP/1.1 413 Payload Too Large\r\nContent-Type: text/html\r\nContent-Length: 13\r\n\r\n<html></html>"
+            .to_vec(),
+    ));
+    assert_eq!(step(&mut sender), SendOutcome::RetryLater(5));
+    assert_eq!(sender.halted(), None);
+}
+
+#[test]
+fn a_413_to_several_events_halves_the_batch_whatever_its_body() {
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 4);
+    let mut sender = make_sender(&service, outbox, &clock);
+    service.push(Step::Raw(
+        b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 5\r\n\r\nnope!".to_vec(),
+    ));
+    assert_eq!(step(&mut sender), SendOutcome::RetryNow);
+    assert_eq!(step(&mut sender), SendOutcome::Sent(2));
+}
+
+// ---- A 200 that confirms nothing, and numbers no JSON can carry ----
+
+#[test]
+fn a_200_that_does_not_move_the_confirmed_mark_for_a_batch_is_a_failure() {
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 2);
+    let mut sender = make_sender(&service, outbox, &clock);
+    service.push(Step::status(200, json!({"accepted": 0, "duplicates": 0, "lastSeq": 0})));
+    assert_eq!(step(&mut sender), SendOutcome::RetryLater(5));
+    assert_eq!(step(&mut sender), SendOutcome::RetryLater(5), "not again at once");
+    assert_eq!(service.requests().len(), 1);
+    // A second one in a row backs off longer: it is a failure like any other.
+    clock.advance_seconds(5);
+    service.push(Step::status(200, json!({"accepted": 0, "duplicates": 0, "lastSeq": 0})));
+    assert_eq!(step(&mut sender), SendOutcome::RetryLater(10));
+    clock.advance_seconds(10);
+    assert_eq!(step(&mut sender), SendOutcome::Sent(2));
+}
+
+#[test]
+fn counts_beyond_what_json_carries_exactly_are_no_answer() {
+    let too_big = 1u64 << 53;
+    for (name, body) in [
+        ("lastSeq", json!({"accepted": 0, "duplicates": 0, "lastSeq": too_big})),
+        ("accepted", json!({"accepted": too_big, "duplicates": 0, "lastSeq": 0})),
+        (
+            "duplicates",
+            json!({"accepted": 0, "duplicates": too_big, "lastSeq": 0}),
+        ),
+        (
+            "lastSeq u64",
+            json!({"accepted": 0, "duplicates": 0, "lastSeq": u64::MAX}),
+        ),
+    ] {
+        let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+        let mut sender = make_sender(&service, open_outbox(&tmp, "outbox.sqlite"), &clock);
+        service.push(Step::status(200, body));
+        assert_eq!(step(&mut sender), SendOutcome::RetryLater(5), "{name}");
+        assert_eq!(sender.service_last_seq(), None, "{name}");
+        assert_eq!(sender.halted(), None, "{name}");
+    }
+    // The largest number that is exact is an answer.
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut sender = make_sender(&service, open_outbox(&tmp, "outbox.sqlite"), &clock);
+    service.push(Step::status(
+        200,
+        json!({"accepted": 0, "duplicates": 0, "lastSeq": too_big - 1}),
+    ));
+    assert_eq!(step(&mut sender), SendOutcome::ServiceAhead(too_big - 1));
 }
