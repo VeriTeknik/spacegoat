@@ -7,7 +7,7 @@ The principle is simple: you cannot fix what you cannot see.
 
 > **Status: early development.**
 > Nothing here is ready for production use.
-> This repository currently holds the project layout; code arrives slice by slice.
+> This repository currently holds the protocol and its test vectors; device code arrives slice by slice.
 
 ## Why open source
 
@@ -26,7 +26,7 @@ The device software is published so that anyone can read what it collects, what 
 
 | Path | What it is | Licence |
 |---|---|---|
-| `hub/` | The Linux hub agent: listens on the local network, classifies devices, queues signed observations, drives a small display | AGPL-3.0 |
+| `hub/` | The Linux hub agent, in Rust (not in the repository yet): listens on the local network, classifies devices, queues signed observations, drives a small display | AGPL-3.0 |
 | `hub/profiles/` | One profile per supported hardware: which interface, display, key store and radios it has | AGPL-3.0 |
 | `core/` | Portable C core for microcontroller devices (signing, encoding). Not started | AGPL-3.0 |
 | `boards/` | Thin per-board layers for microcontroller devices (display, input, sound). Not started | AGPL-3.0 |

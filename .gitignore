@@ -1,9 +1,4 @@
-__pycache__/
-*.pyc
-.venv/
-.pytest_cache/
+target/
 *.key
 *.pem
-build/
-dist/
 .DS_Store
