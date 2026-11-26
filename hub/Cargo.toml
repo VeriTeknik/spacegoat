@@ -19,10 +19,16 @@ path = "src/main.rs"
 [dependencies]
 base64 = "0.22"
 ed25519-dalek = "3"
+# gzip of the request body only; the pure-Rust backend (miniz_oxide), no C zlib.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 getrandom = { version = "0.4", default-features = false }
 rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
 serde_json = "1"
 sha2 = "0.11"
+# Blocking HTTP/1.1 client. `rustls` = rustls with the ring provider (not aws-lc) and the compiled-in Mozilla roots
+# (webpki-roots), so a device image without a CA bundle still verifies the service. No gzip, cookies, json or proxy
+# features; redirects, environment proxies and HTTP-status-as-error are switched off in `sender.rs`.
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [lints.rust]

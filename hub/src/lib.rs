@@ -8,5 +8,6 @@ pub mod clock;
 pub mod fsutil;
 pub mod keystore;
 pub mod outbox;
+pub mod sender;
 pub mod signing;
 pub mod state;

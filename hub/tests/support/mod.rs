@@ -8,6 +8,8 @@
     clippy::indexing_slicing
 )]
 
+pub mod fake_service;
+
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
