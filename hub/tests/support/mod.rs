@@ -9,6 +9,7 @@
 )]
 
 pub mod fake_service;
+pub mod hub;
 
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};

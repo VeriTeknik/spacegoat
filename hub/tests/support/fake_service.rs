@@ -78,8 +78,13 @@ pub enum Step {
         body: Value,
         headers: Vec<(String, String)>,
     },
+    /// Process the request as the service would (a placeholder that lets a later step reach a later request).
+    Pass,
     /// Process the batch for real, then drop the connection before answering.
     LoseAnswer,
+    /// Process the batch for real, then wait this long before answering (a request still in flight, e.g. while the
+    /// hub is killed). The service answers nothing else meanwhile.
+    Delay(Duration),
     /// Answer 413 above this many events (for this one request).
     MaxEvents(usize),
     /// A 200 whose body stops half way (`Content-Length` promises more), then the connection closes.
@@ -381,6 +386,7 @@ enum Outcome {
     Answer(u16, Value, Vec<(String, String)>),
     Drop,
     Raw(Vec<u8>),
+    Late(Duration, Value),
 }
 
 fn serve(state: &Arc<Mutex<State>>, mut stream: TcpStream) {
@@ -399,6 +405,10 @@ fn serve(state: &Arc<Mutex<State>>, mut stream: TcpStream) {
         Outcome::Answer(code, body, headers) => write_answer(&mut stream, now, code, &body, &headers),
         Outcome::Raw(bytes) => {
             let _ = stream.write_all(&bytes);
+        }
+        Outcome::Late(pause, body) => {
+            std::thread::sleep(pause);
+            write_answer(&mut stream, now, 200, &body, &[]);
         }
         Outcome::Drop => {}
     }
@@ -529,13 +539,12 @@ fn handle(state: &mut State, request: &Request, now: i64) -> Outcome {
     if let Some((_, seq)) = fresh.last() {
         state.last_seq = *seq;
     }
-    if matches!(step, Some(Step::LoseAnswer)) {
-        return Outcome::Drop;
+    let answer = json!({"accepted": fresh.len(), "duplicates": duplicates, "lastSeq": state.last_seq});
+    match step {
+        Some(Step::LoseAnswer) => Outcome::Drop,
+        Some(Step::Delay(pause)) => Outcome::Late(pause, answer),
+        _ => error(200, answer),
     }
-    error(
-        200,
-        json!({"accepted": fresh.len(), "duplicates": duplicates, "lastSeq": state.last_seq}),
-    )
 }
 
 /// The request signature, made with the registered key, over this principal, endpoint, moment and exact body.
