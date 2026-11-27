@@ -1,0 +1,234 @@
+{
+  "_comment": "Test vectors for spec/protocol.md. They are made with a PUBLISHED TEST KEY whose 32 private bytes are 0, 1, 2, ... 31 (see spec/README.md); never register it anywhere real. The first four events are also pinned in the hub service's own test suite with the same signatures.",
+  "publicKey": "ed25519:A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+  "keyId": "vector-key-1",
+  "canonical": [
+    {
+      "name": "keys are sorted, no whitespace",
+      "value": {
+        "b": 1,
+        "a": [
+          true,
+          null,
+          "x"
+        ]
+      },
+      "text": "{\"a\":[true,null,\"x\"],\"b\":1}"
+    },
+    {
+      "name": "text stays UTF-8, never escaped",
+      "value": {
+        "label": "İstanbul, çağrı ve ölçüm"
+      },
+      "text": "{\"label\":\"İstanbul, çağrı ve ölçüm\"}"
+    },
+    {
+      "name": "nested objects sort at every level",
+      "value": {
+        "z": {
+          "b": 2,
+          "a": "ş"
+        },
+        "a": false
+      },
+      "text": "{\"a\":false,\"z\":{\"a\":\"ş\",\"b\":2}}"
+    },
+    {
+      "name": "empty object and array",
+      "value": {
+        "o": {},
+        "l": []
+      },
+      "text": "{\"l\":[],\"o\":{}}"
+    },
+    {
+      "name": "quote and backslash are escaped, slash is not",
+      "value": {
+        "t": "a\"b\\c/d"
+      },
+      "text": "{\"t\":\"a\\\"b\\\\c/d\"}"
+    },
+    {
+      "name": "control characters are escaped the short way where there is one",
+      "value": {
+        "t": "a\tb\nc\u0001d"
+      },
+      "text": "{\"t\":\"a\\tb\\nc\\u0001d\"}"
+    },
+    {
+      "name": "line separators U+2028 and U+2029 stay as they are",
+      "value": {
+        "t": "a b c"
+      },
+      "text": "{\"t\":\"a b c\"}"
+    },
+    {
+      "name": "text outside the basic plane stays as it is",
+      "value": {
+        "t": "🐐 goat"
+      },
+      "text": "{\"t\":\"🐐 goat\"}"
+    },
+    {
+      "name": "DEL stays as it is",
+      "value": {
+        "t": "ab"
+      },
+      "text": "{\"t\":\"ab\"}"
+    }
+  ],
+  "events": [
+    {
+      "name": "non-ASCII text values",
+      "input": {
+        "sourceId": "01234567-89ab-4cde-8fab-0123456789ab",
+        "sourceSeq": 42,
+        "kind": "signing.test",
+        "observedAt": "2026-10-23T10:00:00.123Z",
+        "attributes": {
+          "trustOrigin": "adapter",
+          "label": "İstanbul, çağrı ve ölçüm"
+        },
+        "piiCommitment": "c0d79f91d17576cb5daede53a0c36f9757a436ca1c08e65666c9a052c2aefbe5"
+      },
+      "messageHex": "76742d65766964656e63652d6576656e742f76310a7b2261747472696275746573223a7b226c6162656c223a22c4b07374616e62756c2c20c3a761c49f72c4b120766520c3b66cc3a7c3bc6d222c2274727573744f726967696e223a2261646170746572227d2c226b696e64223a227369676e696e672e74657374222c226f627365727665644174223a22323032362d31302d32335431303a30303a30302e3132335a222c22706969436f6d6d69746d656e74223a2263306437396639316431373537366362356461656465353361306333366639373537613433366361316330386536353636366339613035326332616566626535222c22736f757263654964223a2230313233343536372d383961622d346364652d386661622d303132333435363738396162222c22736f75726365536571223a34327d",
+      "signature": "JZeVmIlBo14VNfZP9kmf7mbsq49V3D8A_gfVHOeCz0saXMqLvbTzxLosQI2x10zco2i91IbvQ1FydRDKIUf2BA"
+    },
+    {
+      "name": "nested objects and arrays",
+      "input": {
+        "sourceId": "01234567-89ab-4cde-8fab-0123456789ab",
+        "sourceSeq": 43,
+        "kind": "signing.test",
+        "observedAt": "2026-10-23T10:00:00.123Z",
+        "attributes": {
+          "trustOrigin": "adapter",
+          "nested": {
+            "z": [
+              true,
+              null,
+              {
+                "b": 2,
+                "a": "ş"
+              }
+            ],
+            "a": false
+          }
+        },
+        "piiCommitment": null
+      },
+      "messageHex": "76742d65766964656e63652d6576656e742f76310a7b2261747472696275746573223a7b226e6573746564223a7b2261223a66616c73652c227a223a5b747275652c6e756c6c2c7b2261223a22c59f222c2262223a327d5d7d2c2274727573744f726967696e223a2261646170746572227d2c226b696e64223a227369676e696e672e74657374222c226f627365727665644174223a22323032362d31302d32335431303a30303a30302e3132335a222c22706969436f6d6d69746d656e74223a6e756c6c2c22736f757263654964223a2230313233343536372d383961622d346364652d386661622d303132333435363738396162222c22736f75726365536571223a34337d",
+      "signature": "GMSURc7ipD79VScRhxbqSYY6xQe9RWls_fXFMNXmUhJVm_e3J1tTjsjWuyvvRVoH7e04ICoP8jpP008s5hfUAg"
+    },
+    {
+      "name": "empty attributes and null commitment",
+      "input": {
+        "sourceId": "01234567-89ab-4cde-8fab-0123456789ab",
+        "sourceSeq": 44,
+        "kind": "signing.test",
+        "observedAt": "2026-10-23T10:00:00.123Z",
+        "attributes": {},
+        "piiCommitment": null
+      },
+      "messageHex": "76742d65766964656e63652d6576656e742f76310a7b2261747472696275746573223a7b7d2c226b696e64223a227369676e696e672e74657374222c226f627365727665644174223a22323032362d31302d32335431303a30303a30302e3132335a222c22706969436f6d6d69746d656e74223a6e756c6c2c22736f757263654964223a2230313233343536372d383961622d346364652d386661622d303132333435363738396162222c22736f75726365536571223a34347d",
+      "signature": "SiZl8sOpCI-blmazv7Gz551JpF22LFVIeWD43dz0erq2770wCgV0tmHTqRiz71h77GOQL3lsSBM4OgRg8YgPDg"
+    },
+    {
+      "name": "site device appeared, no personal data",
+      "input": {
+        "sourceId": "01234567-89ab-4cde-8fab-0123456789ab",
+        "sourceSeq": 7,
+        "kind": "site.device_appeared",
+        "observedAt": "2026-11-24T10:00:00.123Z",
+        "attributes": {
+          "trustOrigin": "hub",
+          "deviceRef": "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b",
+          "segmentRef": "0c0c0c0c-0c0c-4c0c-8c0c-0c0c0c0c0c0c",
+          "deviceClass": "printer"
+        },
+        "piiCommitment": null
+      },
+      "messageHex": "76742d65766964656e63652d6576656e742f76310a7b2261747472696275746573223a7b22646576696365436c617373223a227072696e746572222c22646576696365526566223a2230623062306230622d306230622d346230622d386230622d306230623062306230623062222c227365676d656e74526566223a2230633063306330632d306330632d346330632d386330632d306330633063306330633063222c2274727573744f726967696e223a22687562227d2c226b696e64223a22736974652e6465766963655f6170706561726564222c226f627365727665644174223a22323032362d31312d32345431303a30303a30302e3132335a222c22706969436f6d6d69746d656e74223a6e756c6c2c22736f757263654964223a2230313233343536372d383961622d346364652d386661622d303132333435363738396162222c22736f75726365536571223a377d",
+      "signature": "bC32GUnwU2Vx_xVZBEUiyg4y_zC20MXNV8277jBO_ZoLQxnw7Es1oqqqXgcC3wGr_492pACF9Zwu4wf1c-TJDw"
+    },
+    {
+      "name": "site device appeared with personal data",
+      "input": {
+        "sourceId": "01234567-89ab-4cde-8fab-0123456789ab",
+        "sourceSeq": 8,
+        "kind": "site.device_appeared",
+        "observedAt": "2026-11-24T10:00:01.000Z",
+        "attributes": {
+          "trustOrigin": "hub",
+          "deviceRef": "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b",
+          "segmentRef": "0c0c0c0c-0c0c-4c0c-8c0c-0c0c0c0c0c0c",
+          "deviceClass": "printer"
+        },
+        "piiCommitment": "758605d8c5f7430fa2897d168e354d0bd602dc49b46962a5dc5b4b96e8c8f0b4"
+      },
+      "messageHex": "76742d65766964656e63652d6576656e742f76310a7b2261747472696275746573223a7b22646576696365436c617373223a227072696e746572222c22646576696365526566223a2230623062306230622d306230622d346230622d386230622d306230623062306230623062222c227365676d656e74526566223a2230633063306330632d306330632d346330632d386330632d306330633063306330633063222c2274727573744f726967696e223a22687562227d2c226b696e64223a22736974652e6465766963655f6170706561726564222c226f627365727665644174223a22323032362d31312d32345431303a30303a30312e3030305a222c22706969436f6d6d69746d656e74223a2237353836303564386335663734333066613238393764313638653335346430626436303264633439623436393632613564633562346239366538633866306234222c22736f757263654964223a2230313233343536372d383961622d346364652d386661622d303132333435363738396162222c22736f75726365536571223a387d",
+      "signature": "VLv-W99PWGje9wphRazZrBwG_T72KwDnoKjRsGBfJ8yTw6Bah6XfMVMt6Z36RZtisZT3kF6ObvgSs0ZpEsMLBA"
+    },
+    {
+      "name": "site device seen",
+      "input": {
+        "sourceId": "01234567-89ab-4cde-8fab-0123456789ab",
+        "sourceSeq": 9,
+        "kind": "site.device_seen",
+        "observedAt": "2026-11-25T10:00:01.000Z",
+        "attributes": {
+          "trustOrigin": "hub",
+          "deviceRef": "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b",
+          "segmentRef": "0c0c0c0c-0c0c-4c0c-8c0c-0c0c0c0c0c0c"
+        },
+        "piiCommitment": null
+      },
+      "messageHex": "76742d65766964656e63652d6576656e742f76310a7b2261747472696275746573223a7b22646576696365526566223a2230623062306230622d306230622d346230622d386230622d306230623062306230623062222c227365676d656e74526566223a2230633063306330632d306330632d346330632d386330632d306330633063306330633063222c2274727573744f726967696e223a22687562227d2c226b696e64223a22736974652e6465766963655f7365656e222c226f627365727665644174223a22323032362d31312d32355431303a30303a30312e3030305a222c22706969436f6d6d69746d656e74223a6e756c6c2c22736f757263654964223a2230313233343536372d383961622d346364652d386661622d303132333435363738396162222c22736f75726365536571223a397d",
+      "signature": "zZOORe-xjg9iAfy8FzYd0zS1-wb3DZPcPedEa26Sh16uw8388E2lCWPsZnfKUw2CgWFizyUXP-0xsgzD8LzBDQ"
+    },
+    {
+      "name": "site inventory snapshot",
+      "input": {
+        "sourceId": "01234567-89ab-4cde-8fab-0123456789ab",
+        "sourceSeq": 10,
+        "kind": "site.inventory_snapshot",
+        "observedAt": "2026-11-25T11:00:00.000Z",
+        "attributes": {
+          "trustOrigin": "hub",
+          "segmentRef": "0c0c0c0c-0c0c-4c0c-8c0c-0c0c0c0c0c0c",
+          "counts": {
+            "ot": 1,
+            "printer": 2,
+            "user_device": 9,
+            "server": 1,
+            "network": 3,
+            "iot": 0,
+            "unknown": 4
+          },
+          "ephemeral": 5
+        },
+        "piiCommitment": null
+      },
+      "messageHex": "76742d65766964656e63652d6576656e742f76310a7b2261747472696275746573223a7b22636f756e7473223a7b22696f74223a302c226e6574776f726b223a332c226f74223a312c227072696e746572223a322c22736572766572223a312c22756e6b6e6f776e223a342c22757365725f646576696365223a397d2c22657068656d6572616c223a352c227365676d656e74526566223a2230633063306330632d306330632d346330632d386330632d306330633063306330633063222c2274727573744f726967696e223a22687562227d2c226b696e64223a22736974652e696e76656e746f72795f736e617073686f74222c226f627365727665644174223a22323032362d31312d32355431313a30303a30302e3030305a222c22706969436f6d6d69746d656e74223a6e756c6c2c22736f757263654964223a2230313233343536372d383961622d346364652d386661622d303132333435363738396162222c22736f75726365536571223a31307d",
+      "signature": "HywYZR4gHkUrcppxgJ1rcdGj_Awz2hglHIvPup88dfCdTHKgTs6CKaJKicralIRDwXaA3Wcb_6ou06VIir8JCw"
+    }
+  ],
+  "request": {
+    "principal": "source:01234567-89ab-4cde-8fab-0123456789ab",
+    "method": "POST",
+    "path": "/api/ops/evidence/ingest",
+    "timestamp": "1795600000",
+    "bodyHex": "7b226576656e7473223a5b5d2c22736368656d6156657273696f6e223a317d",
+    "messageHex": "76742d6d616368696e652f76310a736f757263653a30313233343536372d383961622d346364652d386661622d3031323334353637383961620a504f5354202f6170692f6f70732f65766964656e63652f696e676573740a313739353630303030300a65653462663864363266313763366434373130373130633166653164353665303265626135363231613734656334383364346133353731396565353734323135",
+    "signature": "8qKGl0d2riz6a2v-xt39BqDKW5A0f7EdmF_KaTHY_F6J-QyK9KhGNQJjd0VC7oUeg73L_Fo0g0h4CANWygzkBg"
+  },
+  "pii": {
+    "nonceHex": "abababababababababababababababababababababababababababababababab",
+    "payload": {
+      "mac": "00005e005301",
+      "hostname": "printer.example",
+      "ip": "192.0.2.10"
+    },
+    "commitment": "758605d8c5f7430fa2897d168e354d0bd602dc49b46962a5dc5b4b96e8c8f0b4"
+  }
+}

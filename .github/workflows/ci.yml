@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  spec:
+    name: Spec vectors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Every vector file is well-formed JSON
+        run: |
+          set -eu
+          for f in spec/vectors/*.json; do
+            jq empty "$f"
+            echo "ok $f"
+          done
