@@ -17,12 +17,13 @@
 //!   `Debug` form of a `Sighting`;
 //! - whatever an observer hands over is checked before it is signed: a signed event never changes, so one the service
 //!   would refuse would block the whole queue behind it. A field that does not fit is left out;
-//! - what one round of capture produces is appended in one transaction (per `DEVICES_PER_COMMIT` devices), and what
-//!   was reported is recorded in the pseudonym store in one more, after it: an event is either stored with its round or
-//!   not at all, and one whose record could not be stored is not appended again (what was reported is kept in memory
-//!   for the run, and the store write is retried). A failure to capture or to store never keeps what is queued from
-//!   being delivered. A stored record that cannot be read counts as none: that device is announced again, and it is
-//!   said once;
+//! - what one round of capture produces is appended in one transaction per chunk of `DEVICES_PER_COMMIT` devices (the
+//!   snapshots go with the last chunk), and what was reported is recorded in the pseudonym store in one more after
+//!   each: an event is either stored with its chunk or not at all. When a chunk fails, the chunks before it stay
+//!   stored and are delivered, and it and the ones after it are captured at the next tick; an event whose record could
+//!   not be stored is not appended again (what was reported is kept in memory for the run, and the store write is
+//!   retried). A failure to capture or to store never keeps what is queued from being delivered. A stored record that
+//!   cannot be read, in any way, counts as none: that device or segment is reported again, and it is said once a run;
 //! - the first request of a run is an empty heartbeat, even when events wait (protocol §11). Its answer gives the
 //!   service's clock and where the service stands in the sequence. The tick's clocks are read after it;
 //! - nothing is signed unless the hub's clock is trusted, and it is trusted only while there is a reading of the
@@ -89,7 +90,7 @@ use crate::keystore::{FileKeyStore, KeyStoreError};
 use crate::outbox::{NewEvent, Outbox, OutboxError, ResetReason, database_is_damaged};
 use crate::sender::{self, HaltReason, OriginError, Problem, SendOutcome, Sender, SenderError};
 use crate::state::{Confirmed, Mark, Pseudonyms, StateError};
-use crate::statedir::{self, Access, StateDirError};
+use crate::statedir::{self, Access, StateDirError, Writable};
 use crate::storage::Cause;
 
 pub const DEVICE_CLASSES: [&str; 7] = ["ot", "printer", "user_device", "server", "network", "iot", "unknown"];
@@ -414,6 +415,9 @@ pub struct Status {
     pub cause: Option<String>,
     /// While halted: the command that clears the halt once the fault is fixed.
     pub resume: Option<String>,
+    /// The figures are those last written to the queue's database file itself: `status` could not write in the state
+    /// directory, so it could not read what a write-ahead log beside it may still hold (`outbox::ReadMode`).
+    pub read_only: bool,
 }
 
 impl Status {
@@ -426,7 +430,7 @@ impl Status {
         format!(
             "{{\n  \"sourceId\": {},\n  \"keyId\": {},\n  \"lastAssignedSeq\": {},\n  \"lastAckedSeq\": {},\n  \
              \"pending\": {},\n  \"halted\": {},\n  \"haltedAt\": {},\n  \"waitingFor\": {},\n  \"service\": {},\n  \
-             \"problem\": {},\n  \"cause\": {},\n  \"resume\": {}\n}}",
+             \"problem\": {},\n  \"cause\": {},\n  \"resume\": {},\n  \"readOnly\": {}\n}}",
             text(Some(&self.source_id)),
             text(Some(&self.key_id)),
             self.last_assigned_seq,
@@ -439,6 +443,7 @@ impl Status {
             text(self.problem.as_deref()),
             text(self.cause.as_deref()),
             text(self.resume.as_deref()),
+            self.read_only,
         )
     }
 }
@@ -481,6 +486,7 @@ pub fn read_status(
         problem: saved.problem,
         cause: saved.cause,
         resume: is_halted.then(|| resume_command.to_owned()),
+        read_only: false,
     }
 }
 
@@ -584,10 +590,15 @@ pub fn check_own_files(state_dir: &Path) -> Result<(), AgentError> {
     Ok(())
 }
 
-/// Check the state directory as `access` needs it (`statedir::check`, the check `keygen` makes too).
-pub fn check_state_dir(state_dir: &Path, access: Access, expected_owner: Option<u32>) -> Result<(), AgentError> {
-    statedir::check(state_dir, access, expected_owner, &state_dir.join(KEY_FILE))?;
-    Ok(())
+/// Check the state directory as `access` needs it (`statedir::check`, the check `keygen` and `public-key` make too);
+/// whether this user can write in it.
+pub fn check_state_dir(state_dir: &Path, access: Access, expected_owner: Option<u32>) -> Result<Writable, AgentError> {
+    Ok(statedir::check(
+        state_dir,
+        access,
+        expected_owner,
+        &state_dir.join(KEY_FILE),
+    )?)
 }
 
 /// What `resume` is asked to do beyond clearing the halt.
@@ -1205,8 +1216,9 @@ impl Agent {
         Ok(true)
     }
 
-    /// One round of capture, unless the backlog is full. `Err`: capture failed (nothing of this round was stored).
-    /// `Ok(Some(_))`: everything due was stored, but the pseudonym store did not take what was reported.
+    /// One round of capture, unless the backlog is full. `Err`: capture failed; the chunks of `DEVICES_PER_COMMIT`
+    /// devices committed before the one that failed are stored (and what they reported is remembered), that chunk and
+    /// those after it are not, and are captured at the next tick. `Ok(Some(_))`: everything due was stored, but the pseudonym store did not take what was reported.
     fn capture(&mut self, wall: i64, at: &str) -> Result<Option<AgentError>, AgentError> {
         let outbox = self.sender.outbox();
         let pending = outbox.last_assigned()?.saturating_sub(outbox.last_acked()?);
@@ -1814,15 +1826,29 @@ fn wait_until(clock: &dyn Clock, wake: i64, stop: &AtomicBool, sleep: &mut impl 
     }
 }
 
+/// How long a lock that is held is tried again before it counts as another agent's.
+const LOCK_GRACE: Duration = Duration::from_millis(500);
+/// The pause between two tries.
+const LOCK_RETRY: Duration = Duration::from_millis(10);
+
 /// An exclusive lock on `agent.lock` for the life of the agent (the kernel drops it when the process ends).
+///
+/// A lock that is held is tried again for up to `LOCK_GRACE` before it counts as another agent's: a child process
+/// that another thread of this program starts holds a copy of every open descriptor until it executes its program
+/// (measured on macOS: a few in a thousand reopenings refused while a thread starts processes), and with it a lock
+/// this program has just released. An agent that really runs holds it for longer than that.
 pub fn lock_state_dir(state_dir: &Path) -> Result<File, AgentError> {
     let path = state_dir.join(LOCK_FILE);
     private_file(&path).map_err(|error| AgentError::Io(LOCK_FILE, error))?;
     let file = open_regular(&path, OpenOptions::new().write(true)).map_err(|error| AgentError::Io(LOCK_FILE, error))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(AgentError::AlreadyRunning(state_dir.to_path_buf())),
-        Err(TryLockError::Error(error)) => Err(AgentError::Io(LOCK_FILE, error)),
+    let started = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if started.elapsed() < LOCK_GRACE => std::thread::sleep(LOCK_RETRY),
+            Err(TryLockError::WouldBlock) => return Err(AgentError::AlreadyRunning(state_dir.to_path_buf())),
+            Err(TryLockError::Error(error)) => return Err(AgentError::Io(LOCK_FILE, error)),
+        }
     }
 }
 
@@ -1835,15 +1861,27 @@ fn is_our_temporary(name: &str) -> bool {
 /// points to) whose names are of this program's temporary form. A directory of such a name is left alone, as is
 /// every other name. Called with the lock held, so no agent is writing them.
 fn remove_leftover_temporaries(state_dir: &Path) -> io::Result<()> {
-    let mut removed = false;
+    let mut names = Vec::new();
     for entry in std::fs::read_dir(state_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
+        names.push(entry?.file_name());
+    }
+    sweep_temporaries(state_dir, names)
+}
+
+/// `remove_leftover_temporaries` over a listing of `state_dir` already taken.
+fn sweep_temporaries(state_dir: &Path, names: Vec<std::ffi::OsString>) -> io::Result<()> {
+    let mut removed = false;
+    for name in names {
         if !name.to_str().is_some_and(is_our_temporary) {
             continue;
         }
-        let path = entry.path();
-        let kind = std::fs::symlink_metadata(&path)?.file_type();
+        let path = state_dir.join(&name);
+        let kind = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta.file_type(),
+            // Gone since the listing: a `status` beside this start removes its own probe file. Gone either way.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         if kind.is_file() || kind.is_symlink() {
             match std::fs::remove_file(&path) {
                 Ok(()) => removed = true,
@@ -1947,6 +1985,26 @@ fn stored_millis(text: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sweep_passes_over_a_leftover_that_vanished_after_the_listing() {
+        let directory = std::env::temp_dir().join(format!("spacegoat-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap_or_default();
+        // A probe file a `status` beside this start created and removed between the listing and the look at it.
+        let gone = format!(
+            "{}{}",
+            crate::fsutil::temporary_prefix(statedir::PROBE_NAME),
+            "0".repeat(32)
+        );
+        let left = format!("{}{}", crate::fsutil::temporary_prefix(STATUS_FILE), "a".repeat(32));
+        let written = std::fs::write(directory.join(&left), b"half");
+        let swept = sweep_temporaries(&directory, vec![gone.into(), left.clone().into()]);
+        let still_there = directory.join(&left).exists();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(written.is_ok());
+        assert!(swept.is_ok(), "{swept:?}");
+        assert!(!still_there, "the leftover after it is still removed");
+    }
 
     #[test]
     fn a_stored_moment_reads_back_and_six_digit_fractions_are_read() {

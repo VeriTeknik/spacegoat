@@ -14,11 +14,12 @@ use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value};
 
 use crate::fsutil::{open_regular, private_file, write_own_file};
-use crate::outbox::{DurableError, FormatError, open_durable};
+use crate::outbox::{DurableError, FORMAT_VERSION, FormatError, ReadMode, open_durable, open_to_read};
 use crate::storage::Cause;
 
 #[derive(Debug)]
@@ -254,6 +255,28 @@ impl Pseudonyms {
         self.db.close().map_err(|(_, error)| error.into())
     }
 
+    /// Whether the store at `path` is of a format `open` accepts, read only (`status`): `Format` for one a newer
+    /// build wrote or one of no known format, as `open` refuses them; `Ok` when there is no store, an empty one, or
+    /// one of this format. Nothing is created and nothing is written, except what `ReadMode::Live` lets SQLite create.
+    pub fn check_format(path: &Path, mode: ReadMode) -> Result<(), StateError> {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let db = open_to_read(path, mode)?;
+        let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let empty: bool = db.query_row("SELECT NOT EXISTS (SELECT 1 FROM sqlite_schema)", [], |row| row.get(0))?;
+        let file = "pseudonyms.sqlite";
+        if version > FORMAT_VERSION {
+            return Err(StateError::Format(FormatError::Newer { file, found: version }));
+        }
+        if version != FORMAT_VERSION && !empty {
+            return Err(StateError::Format(FormatError::Unknown { file }));
+        }
+        Ok(())
+    }
+
     /// This connection's `PRAGMA synchronous` (2 = FULL); for tests and diagnostics.
     pub fn synchronous(&self) -> Result<i64, StateError> {
         Ok(self.db.query_row("PRAGMA synchronous", [], |row| row.get(0))?)
@@ -312,21 +335,33 @@ impl Pseudonyms {
     }
 
     /// What the hub last reported about `identity` (empty before its first report).
+    ///
+    /// A record this code never writes, in whatever way (text that is not a JSON object, text that is not UTF-8, a
+    /// cell of another type), is `Damaged`: the record of that one row. A failure of the database itself (I/O, a
+    /// corrupt page, a lock) stays what it is.
     pub fn facts(&self, scope: &str, identity: &str) -> Result<Map<String, Value>, StateError> {
-        let text: Option<String> = self
+        let cell: Option<Option<Map<String, Value>>> = self
             .db
             .query_row(
                 "SELECT facts FROM refs WHERE scope = ?1 AND identity = ?2",
                 params![scope, identity],
-                |row| row.get(0),
+                // The cell's bytes as they are: their type and their encoding are judged here, not by a conversion
+                // that would fail the whole read.
+                |row| {
+                    Ok(match row.get_ref(0)? {
+                        ValueRef::Text(bytes) => match serde_json::from_slice(bytes) {
+                            Ok(Value::Object(facts)) => Some(facts),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                },
             )
             .optional()?;
-        let Some(text) = text else {
-            return Ok(Map::new());
-        };
-        match serde_json::from_str(&text) {
-            Ok(Value::Object(facts)) => Ok(facts),
-            _ => Err(StateError::Damaged("stored facts are not a JSON object")),
+        match cell {
+            None => Ok(Map::new()),
+            Some(Some(facts)) => Ok(facts),
+            Some(None) => Err(StateError::Damaged("stored facts are not a JSON object")),
         }
     }
 

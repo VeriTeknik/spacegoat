@@ -2057,15 +2057,29 @@ fn a_state_that_flaps_is_reported_at_most_once_per_five_minutes_per_kind() {
 #[test]
 fn a_halt_is_reported_at_once_even_right_after_another_line() {
     let hub = Hub::new();
-    let agent = Agent::open(&hub.config, Box::new(Flipping(0)), hub.clock.as_clock()).unwrap();
-    hub.service.push(Step::Pass);
-    hub.service.push(Step::status(503, json!({"error": "unavailable"})));
-    hub.service.push(Step::Pass);
-    hub.service.push(Step::status(503, json!({"error": "unavailable"})));
+    let mut agent = Agent::open(&hub.config, Box::new(Flipping(0)), hub.clock.as_clock()).unwrap();
+    let taken = |agent: &mut Agent| std::iter::from_fn(|| agent.take_announcement()).collect::<Vec<String>>();
+    agent.tick().unwrap();
+    taken(&mut agent);
     hub.service.push(Step::status(400, json!({"error": "schema"})));
-    let lines = run_for(&hub, agent, 3, |_| {});
-    let halted = lines.iter().find(|(_, line)| line.contains("halted: schema"));
-    assert!(halted.is_some(), "{lines:?}");
+    hub.clock.advance_seconds(15);
+    agent.tick().unwrap();
+    let first = taken(&mut agent);
+    assert!(first.iter().any(|line| line.contains("halted: schema")), "{first:?}");
+    // Another line of the same kind (`halted`) one second after it: what the halt line says changed (here the command
+    // that clears it; a halt is not cleared, nor its reason changed, while an agent runs). A halt line is never held
+    // back by the five minutes a line of another kind waits after one of its own.
+    hub.clock.advance_seconds(1);
+    agent.set_resume_command("spacegoat-hub resume --config /elsewhere/hub.toml".to_owned());
+    agent.tick().unwrap();
+    let second = taken(&mut agent);
+    assert!(
+        second
+            .iter()
+            .any(|line| line.contains("halted: schema") && line.contains("/elsewhere/hub.toml")),
+        "{second:?}"
+    );
+    agent.close().unwrap();
 }
 
 /// Keeps a file from being replaced (macOS: the owner's immutable flag) until dropped.
@@ -2328,37 +2342,82 @@ fn a_confirmed_event_leaves_no_personal_data_in_the_queue_file() {
 
 // ---- One unreadable record of facts ----
 
-#[test]
-fn a_record_of_facts_that_cannot_be_read_is_reported_again_and_said_once() {
-    let hub = Hub::new();
-    hub.run(4).close().unwrap();
+/// What a stored record of facts can be that this code never writes: valid text that is not a JSON object, text that
+/// is not UTF-8, and a cell of another type.
+const UNREADABLE_FACTS: [(&str, &str); 3] = [
+    ("not an object", "'not an object'"),
+    ("invalid UTF-8", "CAST(x'7bff7d' AS TEXT)"),
+    ("a BLOB", "x'7b7d'"),
+];
+
+/// Make the stored facts of one subject unreadable in the way `value` (an SQL expression) says.
+fn spoil_facts(hub: &Hub, scope: &str, identity: &str, value: &str) {
     let db = rusqlite::Connection::open(hub.state.join("pseudonyms.sqlite")).unwrap();
-    db.execute(
-        "UPDATE refs SET facts = 'not an object' WHERE scope = 'device' AND identity = 'sim:printer'",
-        [],
-    )
-    .unwrap();
-    drop(db);
-    let printer = of_kind(&hub.service.accepted(), "site.device_appeared")[0]["attributes"]["deviceRef"].clone();
-    let lines = run_for(&hub, hub.agent(), 2, |_| {});
-    let again: Vec<Value> = of_kind(&hub.service.accepted(), "site.device_appeared")
-        .into_iter()
-        .filter(|event| event["attributes"]["deviceRef"] == printer)
-        .collect();
-    assert_eq!(again.len(), 2, "announced again, under the same reference");
+    let changed = db
+        .execute(
+            &format!("UPDATE refs SET facts = {value} WHERE scope = ?1 AND identity = ?2"),
+            [scope, identity],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "{scope} {identity}");
+}
+
+/// The lines that name the pseudonym store: one, and nothing personal in it.
+fn said_once(lines: &[(i64, String)], what: &str) {
     let said: Vec<&(i64, String)> = lines
         .iter()
         .filter(|(_, line)| line.contains("pseudonyms.sqlite"))
         .collect();
-    assert_eq!(said.len(), 1, "{lines:?}");
+    assert_eq!(said.len(), 1, "{what}: {lines:?}");
     assert_no_personal_data(&said[0].1, "the line");
-    assert_eq!(saved_json(&hub)["problem"], Value::Null);
 }
 
-// ---- One transaction per tick ----
+#[test]
+fn a_record_of_facts_that_cannot_be_read_is_reported_again_and_said_once() {
+    for (what, value) in UNREADABLE_FACTS {
+        let hub = Hub::new();
+        hub.run(4).close().unwrap();
+        spoil_facts(&hub, "device", "sim:printer", value);
+        let printer = of_kind(&hub.service.accepted(), "site.device_appeared")[0]["attributes"]["deviceRef"].clone();
+        let lines = run_for(&hub, hub.agent(), 2, |_| {});
+        let again: Vec<Value> = of_kind(&hub.service.accepted(), "site.device_appeared")
+            .into_iter()
+            .filter(|event| event["attributes"]["deviceRef"] == printer)
+            .collect();
+        assert_eq!(again.len(), 2, "{what}: announced again, under the same reference");
+        said_once(&lines, what);
+        assert_eq!(saved_json(&hub)["problem"], Value::Null, "{what}");
+        assert_gapless(&hub);
+    }
+}
 
 #[test]
-fn what_one_tick_captures_is_stored_whole_or_not_at_all() {
+fn a_segments_record_of_facts_that_cannot_be_read_gets_its_snapshot_again_and_is_said_once() {
+    for (what, value) in UNREADABLE_FACTS {
+        let hub = Hub::new();
+        hub.run(4).close().unwrap();
+        assert_eq!(of_kind(&hub.service.accepted(), "site.inventory_snapshot").len(), 1);
+        spoil_facts(&hub, "segment", "sim:lan", value);
+        // Two minutes: no snapshot is due by the clock (one an hour), only because its record cannot be read.
+        let lines = run_for(&hub, hub.agent(), 2, |_| {});
+        let snapshots = of_kind(&hub.service.accepted(), "site.inventory_snapshot");
+        assert_eq!(snapshots.len(), 2, "{what}");
+        assert_eq!(
+            snapshots[0]["attributes"]["segmentRef"], snapshots[1]["attributes"]["segmentRef"],
+            "{what}: under the same reference"
+        );
+        said_once(&lines, what);
+        assert_eq!(saved_json(&hub)["problem"], Value::Null, "{what}");
+        assert_gapless(&hub);
+    }
+}
+
+// ---- One transaction per chunk of `DEVICES_PER_COMMIT` devices ----
+
+/// With at most `DEVICES_PER_COMMIT` devices a tick is one chunk: its device events go with its snapshots, or none
+/// of them do.
+#[test]
+fn what_one_chunk_captures_is_stored_whole_or_not_at_all() {
     let hub = Hub::new();
     let mut agent = hub.agent();
     agent.tick().unwrap();
@@ -2386,6 +2445,56 @@ fn what_one_tick_captures_is_stored_whole_or_not_at_all() {
     assert_gapless(&hub);
 }
 
+#[test]
+fn when_a_later_chunk_fails_the_earlier_one_is_stored_and_delivered_once_and_nothing_is_repeated() {
+    let devices = agent::DEVICES_PER_COMMIT + 50;
+    let observer = Steered::default();
+    observer.set(
+        (0..devices)
+            .map(|index| sighting(&format!("bulk:{index}"), "printer", None, None, None))
+            .collect(),
+    );
+    let hub = Hub::new();
+    let mut agent = Agent::open(&hub.config, Box::new(observer.clone()), hub.clock.as_clock()).unwrap();
+    // The second chunk's first event cannot be stored: the first chunk is committed by then.
+    let db = rusqlite::Connection::open(hub.state.join("outbox.sqlite")).unwrap();
+    db.execute_batch(&format!(
+        "CREATE TRIGGER no_second_chunk BEFORE INSERT ON events WHEN NEW.seq > {} \
+         BEGIN SELECT RAISE(ABORT, 'no'); END",
+        agent::DEVICES_PER_COMMIT
+    ))
+    .unwrap();
+    assert!(agent.tick().is_err());
+    let first = agent::DEVICES_PER_COMMIT as u64;
+    assert_eq!(
+        agent.status().unwrap().last_assigned_seq,
+        first,
+        "the first chunk is stored"
+    );
+    assert_eq!(
+        hub.service.accepted_seqs(),
+        (1..=first).collect::<Vec<_>>(),
+        "and delivered"
+    );
+    // Repaired: the rest is captured, and nothing of the first chunk is told again.
+    db.execute_batch("DROP TRIGGER no_second_chunk").unwrap();
+    hub.clock.advance_seconds(15);
+    agent.tick().unwrap();
+    hub.clock.advance_seconds(15);
+    agent.tick().unwrap();
+    let accepted = hub.service.accepted();
+    let appeared = of_kind(&accepted, "site.device_appeared");
+    let refs: HashSet<&Value> = appeared.iter().map(|event| &event["attributes"]["deviceRef"]).collect();
+    assert_eq!((appeared.len(), refs.len()), (devices, devices), "each device once");
+    assert_eq!(of_kind(&accepted, "site.inventory_snapshot").len(), 1);
+    for seq in 1..=first {
+        assert_eq!(times_sent(&hub, seq), 1, "event {seq} of the first chunk went once");
+    }
+    assert_gapless(&hub);
+    assert_eq!(agent.status().unwrap().pending, 0);
+    agent.close().unwrap();
+}
+
 // ---- What the Debug form of a sighting shows ----
 
 #[test]
@@ -2397,4 +2506,41 @@ fn a_sighting_debug_form_shows_nothing_personal() {
         let pretty = format!("{sighting:#?}");
         assert_no_personal_data(&pretty, "Debug of a sighting");
     }
+}
+
+// ---- A child process another thread starts does not keep the lock ----
+
+#[test]
+fn a_lock_a_child_process_holds_for_a_moment_does_not_make_a_second_agent() {
+    // A process started meanwhile (by another thread of the same program: a test's `chflags`, the binary under test)
+    // holds a copy of every open descriptor until it executes, and with it the lock just released. That is not
+    // another agent.
+    let hub = Hub::new();
+    let stop = Arc::new(AtomicBool::new(false));
+    let spawner = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let _ = std::process::Command::new("true").status();
+            }
+        })
+    };
+    let mut refused = 0;
+    for _ in 0..2_000 {
+        match agent::lock_state_dir(&hub.state) {
+            Ok(lock) => drop(lock),
+            Err(AgentError::AlreadyRunning(_)) => refused += 1,
+            Err(error) => panic!("{error}"),
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    spawner.join().unwrap();
+    assert_eq!(refused, 0);
+    // A lock that is really held is still refused.
+    let held = agent::lock_state_dir(&hub.state).unwrap();
+    assert!(matches!(
+        agent::lock_state_dir(&hub.state),
+        Err(AgentError::AlreadyRunning(_))
+    ));
+    drop(held);
 }

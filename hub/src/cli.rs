@@ -14,9 +14,11 @@
 //! the outbox read-only. To learn which user it runs as it creates a file in the state directory for a moment and
 //! removes it again (`statedir`); on a state directory it cannot write it compares with the key file's owner instead.
 //! Reading a database in write-ahead-log mode can make SQLite create its `-wal` and `-shm` side files next to it when
-//! they are missing (it needs them to read a log a crash left behind, and an `immutable` read that would avoid them
-//! would also miss what that log holds); nothing else is written. It refuses what `run` refuses about the state
-//! directory, rather than print a status of nothing.
+//! they are missing (it needs them to read a log a crash left behind); nothing else is written. On a state directory
+//! it cannot write it reads the databases `immutable` instead, which needs no side file and misses what a log still
+//! holds: the figures are those last written to the database file itself, and the status says so (`"readOnly":
+//! true`). It refuses what `run` refuses about the state directory, and a store or mark a newer version wrote, rather
+//! than print a status of nothing.
 //!
 //! `run` stops on SIGTERM or SIGINT: the tick in progress is finished, the agent is closed and the exit status is 0.
 //! Once the agent is open, a failure while running does not end it (`agent::run_reporting`); each change of what the
@@ -33,15 +35,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use crate::agent::{self, Agent, AgentError, CONFIRMED_FILE, HALT_FILE, KEY_FILE, OUTBOX_FILE, ResumeOptions};
+use crate::agent::{
+    self, Agent, AgentError, CONFIRMED_FILE, HALT_FILE, KEY_FILE, OUTBOX_FILE, PSEUDONYMS_FILE, ResumeOptions,
+};
 use crate::clock::SystemClock;
 use crate::config;
 use crate::keystore::{FileKeyStore, KeyStoreError};
-use crate::outbox::{Outbox, OutboxError};
+use crate::outbox::{Outbox, OutboxError, ReadMode};
 use crate::sender::HaltReason;
 use crate::signing::{self, KEY_ID_RULE};
 use crate::simulate::SimulatedObserver;
-use crate::statedir::Access;
+use crate::state::{Confirmed, Mark, Pseudonyms, StateError};
+use crate::statedir::{Access, Writable};
 
 pub const USAGE: &str = "usage: spacegoat-hub [-h] [--version] {keygen,public-key,run,status,resume} ...
 
@@ -263,6 +268,10 @@ fn public_key(state_dir: &Path, given: Option<&str>, stdout: &mut dyn Write, std
     if given.is_some_and(|id| !signing::is_key_id(id)) {
         return could_not_start(stderr, KEY_ID_RULE);
     }
+    // The check every other command makes: it only reads, as `status` does.
+    if let Err(error) = agent::check_state_dir(state_dir, Access::Read, None) {
+        return could_not_start(stderr, error);
+    }
     let store = FileKeyStore::new(state_dir.join(KEY_FILE));
     let found = store.load().and_then(|key| Ok((key, store.read_key_id()?)));
     let (key, stored) = match found {
@@ -348,18 +357,35 @@ fn status(path: &Path, stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     // What `run` would refuse to start on, `status` refuses too: an all-zero status of a directory nobody can run on
     // would say "healthy, nothing yet" about it.
     let state_dir = &config.state_dir;
-    if let Err(error) =
-        agent::check_state_dir(state_dir, Access::Read, None).and_then(|()| agent::check_own_files(state_dir))
+    let writable = match agent::check_state_dir(state_dir, Access::Read, None)
+        .and_then(|writable| agent::check_own_files(state_dir).map(|()| writable))
     {
-        return could_not_start(stderr, error);
-    }
+        Ok(writable) => writable,
+        Err(error) => return could_not_start(stderr, error),
+    };
+    // A directory this user cannot write: SQLite could not create a write-ahead log's side files beside a database,
+    // so the databases are read as last written to their own files, and the status says so.
+    let mode = match writable {
+        Writable::Yes => ReadMode::Live,
+        Writable::No => ReadMode::LastWritten,
+    };
     // Read-only: asking where the hub stands must not create a queue, take a lock from the agent or open the key.
     let halt = match agent::read_halt(state_dir) {
         Ok(halt) => halt,
         Err(error) if error.could_not_start() => return could_not_start(stderr, error),
         Err(error) => return failed(stderr, error),
     };
-    let counters = match Outbox::read_counters(&state_dir.join(OUTBOX_FILE)) {
+    // What `run` refuses as a newer version's, `status` refuses too, in the same words.
+    match Confirmed::new(state_dir.join(CONFIRMED_FILE), &config.source_id).read() {
+        Ok(Mark::Newer(version)) => return could_not_start(stderr, AgentError::NewerFormat(CONFIRMED_FILE, version)),
+        Ok(_) => {}
+        Err(error) => return failed(stderr, AgentError::Io(CONFIRMED_FILE, error)),
+    }
+    // A store `run` would set aside as damaged is no reason for `status` to fail: it shows no figure from it.
+    if let Err(StateError::Format(error)) = Pseudonyms::check_format(&state_dir.join(PSEUDONYMS_FILE), mode) {
+        return could_not_start(stderr, error);
+    }
+    let counters = match Outbox::read_counters_as(&state_dir.join(OUTBOX_FILE), mode) {
         Ok(counters) => counters,
         // A queue a newer version wrote, or of no known format: as `run` refuses it.
         Err(error @ OutboxError::Format(_)) => return could_not_start(stderr, error),
@@ -369,7 +395,8 @@ fn status(path: &Path, stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
         Ok(saved) => saved,
         Err(error) => return failed(stderr, format!("{}: {error}", agent::STATUS_FILE)),
     };
-    let status = agent::read_status(&config, counters, halt, saved, &resume_command(path));
+    let mut status = agent::read_status(&config, counters, halt, saved, &resume_command(path));
+    status.read_only = writable == Writable::No;
     let _ = writeln!(stdout, "{}", status.to_json_text());
     EXIT_OK
 }

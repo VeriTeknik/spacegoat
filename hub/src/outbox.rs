@@ -101,10 +101,21 @@ impl fmt::Display for FormatError {
                 "{file} was written by a newer version of spacegoat-hub (format {found}; this one writes format \
                  {FORMAT_VERSION}) and is not written into: run that version again, or a person must look at it"
             ),
-            Self::Unknown { file } => write!(
-                f,
-                "{file} is a database of no format this program knows (it records none): a person must look at it"
-            ),
+            Self::Unknown { file } => {
+                write!(
+                    f,
+                    "{file} is a database of no format this program knows (it records none): a person must look at \
+                     it. To go on without it, move it aside; "
+                )?;
+                if *file == "outbox.sqlite" {
+                    f.write_str(
+                        "the hub then starts a new queue and declares the old one lost to the service, and its events \
+                         are not delivered",
+                    )
+                } else {
+                    f.write_str("the hub then starts a new one, and devices get new references")
+                }
+            }
         }
     }
 }
@@ -274,13 +285,17 @@ impl Outbox {
     /// lock away from the running agent, or need the private key. A file that exists but cannot be read is an error,
     /// not (0, 0): a status that says "nothing assigned" about an outbox it could not read would be untrue.
     pub fn read_counters(path: &Path) -> Result<(u64, u64), OutboxError> {
+        Self::read_counters_as(path, ReadMode::Live)
+    }
+
+    /// `read_counters`, opened as `mode` says.
+    pub fn read_counters_as(path: &Path, mode: ReadMode) -> Result<(u64, u64), OutboxError> {
         match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((0, 0)),
             Err(error) => return Err(error.into()),
             Ok(_) => {}
         }
-        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        db.busy_timeout(BUSY_TIMEOUT)?;
+        let db = open_to_read(path, mode)?;
         let has_meta: bool = db.query_row(
             "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'meta')",
             [],
@@ -575,6 +590,45 @@ impl Signer<'_> {
         set_meta(db, "last_assigned", &seq.to_string())?;
         Ok(())
     }
+}
+
+/// How a database is opened only to be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadMode {
+    /// Read-only, as it stands now: what a write-ahead log beside it holds is read too. SQLite may create the log's
+    /// `-wal` and `-shm` side files to do that, so the directory must be writable.
+    Live,
+    /// As last written to the database file itself (SQLite's `immutable`): nothing is created beside it, and what a
+    /// write-ahead log still holds is not seen. For a directory this user cannot write.
+    LastWritten,
+}
+
+/// Open the database at `path` only to read it (`ReadMode`).
+pub(crate) fn open_to_read(path: &Path, mode: ReadMode) -> Result<Connection, rusqlite::Error> {
+    let db = match mode {
+        ReadMode::Live => Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?,
+        ReadMode::LastWritten => Connection::open_with_flags(
+            format!("{}?immutable=1", file_uri(path)),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?,
+    };
+    db.busy_timeout(BUSY_TIMEOUT)?;
+    Ok(db)
+}
+
+/// `path` as an SQLite `file:` URI: every byte but the unreserved ones and `/` percent-encoded, so that a `?`, a `#`
+/// or a `%` in a directory name stays part of the name.
+fn file_uri(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut uri = String::from("file:");
+    for byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/".contains(byte) {
+            uri.push(char::from(*byte));
+        } else {
+            uri.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    uri
 }
 
 /// A connection in WAL mode with `synchronous=FULL` and `secure_delete=ON`, on a database of this code's format

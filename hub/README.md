@@ -22,10 +22,8 @@ The agent is written in Rust: one static binary, no async runtime, no `unsafe`.
 This version cannot observe a real network: `run` refuses to start without `--simulate`.
 It has been run on Linux (aarch64, musl) and macOS in tests only; it has not run on a real board or against a real hub service.
 
-Measured on `aarch64-unknown-linux-musl`, release build: a 3.0 MB static binary (2,969,688 bytes).
-Resident memory was 2.7 MB while waiting for a service it could not reach; that was measured before the last three rounds of fixes and has not been measured again.
-At idle the agent is one thread; the HTTP client resolves the service's name in a short-lived thread of its own for each request.
-Memory while delivering over TLS has not been measured yet.
+Measured on `aarch64-unknown-linux-musl`, release build, at the third review round: a 3.0 MB static binary (2,969,688 bytes), 2.9 MB resident (3.2 MB peak) and one thread while waiting for a service it could not reach; memory while delivering over TLS has not been measured.
+The HTTP client resolves the service's name in a short-lived thread of its own for each request.
 
 ## Build and try
 
@@ -85,8 +83,13 @@ The rest of this page is the behaviour the agent has, written apart from the cod
 
 ## Configuration
 
-The agent is given the service's origin, its source id, its key id and a private state directory.
-Unknown settings are refused.
+The agent is given the service's origin, its source id, its key id and a private state directory, all four as text and all required.
+Unknown settings are refused, and so is a value that breaks these rules:
+
+- `source_id` is the UUID the service assigned at registration, in its lowercase 8-4-4-4-12 form;
+- `key_id` is 3 to 63 characters of `a`-`z`, `0`-`9` and `-`, starting with a letter or a digit (the same rule `keygen` applies);
+- `state_dir` is an absolute path.
+
 The service address is an origin only: `https`, a host and optionally a port; no path, query or credentials.
 Plain `http` is accepted only for a service on this very machine named by a loopback address literally, `http://127.0.0.1:<port>` or `http://[::1]:<port>`; not `localhost`, because a name is resolved and a resolver can answer it with an address on the network.
 
@@ -102,15 +105,17 @@ All in its state directory, readable by its owner only:
 - why and since when it is halted (`halt.json`), until a person clears it.
 
 Every file records its format: `PRAGMA user_version = 1` in both databases (set when the file is created), `"version": 1` in `confirmed.json`, `halt.json` and `agent.json`.
-A database or a `confirmed.json` or `halt.json` that a newer version wrote is refused (exit 2), never written into or read as something else; so is a database that has tables but records no format.
+A database or a `confirmed.json` or `halt.json` that a newer version wrote is refused (exit 2) by `run` and by `status` alike, never written into or read as something else; so is a database that has tables but records no format ("of no format this program knows").
+Such a database is not this program's to repair: a person looks at it, and to go on without it moves it aside.
+The hub then starts that file anew: a new queue is declared lost to the service (a `site_source.reset`, under the rule in "How it behaves when things go wrong"), and its events are not delivered; a new pseudonym store gives devices new references.
 `agent.json` of another version is simply written anew.
 
 Both databases delete with `secure_delete` on: a confirmed event, or a record of facts that was forgotten, is overwritten in the database file, not left in a free page.
 The queue's write-ahead log (`outbox.sqlite-wal`) may still hold a copy of what was deleted until SQLite reuses that part of it.
 
-The agent refuses a state directory that is missing, is not a directory, that other users can enter, that belongs to another user, or that this user cannot write, and says which, in the same words in every command (`keygen` included); it never changes the permissions of one that already exists.
+The agent refuses a state directory that is missing, is not a directory, that other users can enter, that belongs to another user, or that this user cannot write, and says which, in the same words in every command (`keygen` and `public-key` included; `public-key` and `status` only read, and accept a directory this user cannot write); it never changes the permissions of one that already exists.
 It learns which user it runs as from a file it creates in the state directory for a moment and removes again; nothing outside the state directory is used, so a missing or unusable temporary directory (`TMPDIR`) does not matter.
-`status` on a state directory it cannot write compares the directory's owner with the owner of the key file in it instead.
+`status` and `public-key` on a state directory they cannot write (its permissions, or a file system mounted read-only) compare the directory's owner with the owner of the key file in it instead.
 A name of its own (`agent.json`, `halt.json`, `confirmed.json`, `outbox.sqlite`, `pseudonyms.sqlite`) that holds a symbolic link or a directory is refused by every command that meets it, by name: a person must look at it and remove it by hand.
 When it starts it removes temporary files a process that died mid-write left behind: only files (or symbolic links, which are removed and never followed) whose names have the exact form of its own temporary files; any other name, and a directory, is left alone.
 
@@ -132,6 +137,7 @@ It is personal data: keep the state directory private, and take it along when th
 | `problem` | The area of the hub's own trouble, or `null`: `outbox_failed`, `pseudonyms_failed`, `confirmed_failed`, `halt_file_failed`, `status_file_failed`, `compress_failed`, `state_directory_failed`; or what opening set right: `outbox_replaced`, `pseudonyms_replaced`, `pseudonyms_new` |
 | `cause` | For a storage failure, its cause (see below); otherwise `null` |
 | `resume` | While halted: the command that clears it, with the configuration's absolute path |
+| `readOnly` | `true` when `status` could not write in the state directory, so the figures are those last written to the database files themselves (see below); otherwise `false` |
 
 `service` is one of a closed list, taken from the kind of failure, never from an error's text:
 
@@ -151,7 +157,9 @@ The line `run` prints for a problem names the same two words: `problem: outbox_f
 
 It never prints a device, a name or an address.
 It refuses what `run` refuses about the state directory (exit 2) rather than print a status of nothing; a directory that is fine but has never run gives a status of zeros.
-It changes nothing the hub keeps: the only file it writes in the state directory is the moment's file that tells it which user it runs as, removed at once; reading the queue may make SQLite create the queue's `-wal` and `-shm` side files when they are missing.
+It changes nothing the hub keeps: the only file it writes in the state directory is the moment's file that tells it which user it runs as, removed at once; reading the queue and the pseudonym store (for their counts and their format) may make SQLite create their `-wal` and `-shm` side files when they are missing.
+On a state directory it cannot write it creates nothing: it reads the databases as they were last written to their own files (SQLite's `immutable` mode), which needs no side file, and says so with `"readOnly": true`.
+What a write-ahead log beside them still holds (one an agent that was killed left behind) is then not counted; an agent that stopped normally has written everything into the files themselves.
 
 ## Time
 
@@ -174,14 +182,14 @@ A time kept from an earlier run that lies in the future (the clock was ahead the
 - **No answer, or the service is down:** the same events are sent again later, with the same signatures. The service counts repeats; nothing is lost and nothing is recorded twice. Waits double from 5 seconds up to 240, so a hub that is running, not halted and not failing to capture is heard from at least every 300 seconds. The status says `waitingFor: service` and which kind of answer it got (`service`), until a confirming one.
 - **A `200` that confirms nothing** (a batch went and the confirmed mark did not move, or the counts are not integers the protocol's JSON can carry) is treated like no answer: the hub waits before it tries again.
 - **A confirmation the hub cannot record** (its disk is full, its file system read-only, the queue locked): a failure like any other. The same batch goes again at the back-off's pace, not at every round, and the status shows `problem: outbox_failed` with its cause.
-- **A request that times out:** when it carried more than one event, the next attempt carries half as many, as after a `413`; each confirmed request lets the batch grow back, doubling, up to 500.
+- **A request that times out:** when it carried more than one event and timed out once its body had started to go out, or while the answer was awaited or read, the next attempt carries half as many, as after a `413`. A timeout while resolving the name or connecting sent nothing of the batch, and halves nothing. When the client cannot say in which phase the time ran out (the overall 30-second limit, a socket's own timeout), the batch is halved. Each confirmed request lets the batch grow back by a quarter (at least one event) up to 500, so it does not jump straight back to the size that just failed.
 - **`rate_limited` (`429`):** it waits what `Retry-After` says, but never longer than 240 seconds, like every other wait.
 - **Power cut:** an event is either fully in the queue or not there at all. The sequence continues without a gap.
 - **The queue is new, lost or damaged:** before it produces anything, the hub compares what the service holds with what it remembers having been confirmed. Neither holds anything: it starts at 1. The service holds a history and the hub remembers nothing: a `site_source.reset` (`reinstall`) at the service's number. The hub remembers a confirmation and the service holds at least that much: a `site_source.reset` (`queue_lost`) at the service's number. The service holds less than the hub remembers being confirmed: the hub **halts** (`gap`); the service lost events, and the hub does not cover for it. Whenever it starts a new queue it reports every device again, under the same reference, since the reports in the lost queue may never have arrived. The service records a reset and a person is told. It never starts over silently.
 - **`confirmed.json` cannot be understood:** that is not "nothing was confirmed". Beside a queue that has numbered events, the mark is written again from the queue's own count and the hub says so. Beside a queue that never numbered one, the hub knows it was confirmed something but not how much: it does not apply the gap rule, takes the service's number as its starting point (a `site_source.reset`, `queue_lost`, when the service holds any; 1 when it holds none) and says so.
 - **A storage file is damaged:** a queue or pseudonym file that is not a database any more is moved aside (`outbox.sqlite.damaged`, `pseudonyms.sqlite.damaged`, replacing an earlier one) and started anew; the hub says so once on its error output and in its status. A new queue then goes through the rule above. A new pseudonym store means devices get new references: the service sees them as new devices. A pseudonym store that is new or empty beside a queue that has numbered events is said the same way (`pseudonyms_new`). Any other failure to open a file (permissions, a read-only file, I/O, a database another process holds locked) stops the hub from starting, and the file is left where it is: a sound file is never set aside.
-- **A storage error while running:** the round is shown as a `problem` with its `cause` in the status and said on the error output, and the next round comes after a back-off (5 seconds, doubling, at most 240; the same rule as the sender's). What is already queued is still delivered. No heartbeat goes out meanwhile: a heartbeat says "alive, nothing to report", which a hub that cannot capture cannot say, so the service's silence alert is the signal. What one round captures is stored in one transaction (per 200 devices): all of it or none of it. What was last reported about each device is kept in memory for the run: a store that fails to take it does not make the hub report the device again, and the write is retried. Failing to write `agent.json` or the confirmed mark is a problem in the status, not a reason to stop delivering; the confirmed mark's problem stays until the mark is written.
-- **One record of what was reported cannot be read:** that device (or segment) counts as never reported: it is announced again, under the same reference, and the hub says so once on its error output. Capture goes on.
+- **A storage error while running:** the round is shown as a `problem` with its `cause` in the status and said on the error output, and the next round comes after a back-off (5 seconds, doubling, at most 240; the same rule as the sender's). What is already queued is still delivered. No heartbeat goes out meanwhile: a heartbeat says "alive, nothing to report", which a hub that cannot capture cannot say, so the service's silence alert is the signal. What one round captures is stored in one transaction per 200 devices (the snapshots go with the last 200): each such part all or nothing. When a later part fails, the earlier parts stay stored and are delivered once, and the failed part is captured at the next round; nothing is reported twice. What was last reported about each device is kept in memory for the run: a store that fails to take it does not make the hub report the device again, and the write is retried. Failing to write `agent.json` or the confirmed mark is a problem in the status, not a reason to stop delivering; the confirmed mark's problem stays until the mark is written.
+- **One record of what was reported cannot be read**, in whatever way (text that is not a JSON object, text that is not UTF-8, a value that is not text): that device (or segment) counts as never reported: it is announced again (a segment gets its snapshot), under the same reference, and the hub says so once a run on its error output. Capture goes on. A failure of the database itself is a storage error, as above.
 - **A state that flaps** (a service that fails and confirms in turn): each kind of line is said at most once in five minutes, and the state that holds at the end of that time is said then. A halt is always said at once.
 - **Too much waits:** when 20 000 events wait, the hub stops producing (`waitingFor: backlog` while the service confirms; `service` while it does not) and keeps delivering, until fewer than half of them wait. After a restart it is full only if 20 000 still wait.
 - **Capture stopped for a while:** whenever the hub could not capture for more than 300 seconds while it was running (its clock not trusted, its storage failing, halted, its backlog full), it sends one `site_source.input_lost` (`capture_stopped`, until now, and from when it stopped if that was a trusted time) once capture resumes, also after a restart. A stop that spans a restart is measured by trusted wall time from its start, so a short one is still not declared; time the hub was simply not running is not declared.

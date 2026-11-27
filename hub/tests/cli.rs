@@ -126,6 +126,7 @@ fn test_status_prints_counts_and_no_device() {
         "problem",
         "cause",
         "resume",
+        "readOnly",
     ];
     // The order, as printed (serde_json's map sorts, so check the text).
     let positions: Vec<usize> = expected
@@ -498,8 +499,8 @@ fn public_key_prints_the_existing_keys_public_half_and_nothing_else() {
         "--key-id",
         "hub-key-1",
     ]);
-    assert_eq!(none.code, 2, "could not start: no key");
-    assert!(none.err.contains("no key"), "{}", none.err);
+    assert_eq!(none.code, 2, "could not start: no state directory, so no key");
+    assert!(none.err.contains("missing; run keygen first"), "{}", none.err);
     assert_eq!(
         cli(&["public-key", "--state-dir", path(&state), "--key-id", "Bad Id"]).code,
         2
@@ -1059,4 +1060,137 @@ fn an_outbox_with_a_hot_write_ahead_log_after_a_kill_is_not_set_aside() {
         agent.status().unwrap().last_assigned_seq,
         before["lastAssignedSeq"].as_u64().unwrap()
     );
+}
+
+// ---- Fourth review round ----
+
+/// `status` with the real binary; its exit code, stdout and stderr.
+fn binary_status(hub: &Hub) -> (Option<i32>, String, String) {
+    let output = Command::new(BINARY)
+        .args(["status", "--config", path(&hub.config_path)])
+        .output()
+        .unwrap();
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+    )
+}
+
+#[test]
+fn status_on_a_state_directory_it_cannot_write_reads_the_last_written_figures_and_says_so() {
+    if running_as_root() {
+        eprintln!("skipped: root writes a directory whatever its mode says, so there is no unwritable one to meet");
+        return;
+    }
+    let hub = Hub::new();
+    let agent = hub.run(6);
+    let before = agent.status().unwrap();
+    agent.close().unwrap();
+    let names = |hub: &Hub| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&hub.state)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    let present = names(&hub);
+    // As a closed agent leaves it: the write-ahead log folded into the database and its side files gone.
+    assert!(
+        !present
+            .iter()
+            .any(|name| name.ends_with("-shm") || name.ends_with("-wal")),
+        "{present:?}"
+    );
+    std::fs::set_permissions(&hub.state, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let (code, out, err) = binary_status(&hub);
+    std::fs::set_permissions(&hub.state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(err, "");
+    let status: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(status["readOnly"], true, "{out}");
+    let figures = |status: &Value| {
+        (
+            status["lastAssignedSeq"].as_u64(),
+            status["lastAckedSeq"].as_u64(),
+            status["pending"].as_u64(),
+        )
+    };
+    assert_eq!(
+        figures(&status),
+        (
+            Some(before.last_assigned_seq),
+            Some(before.last_acked_seq),
+            Some(before.pending)
+        ),
+        "{out}"
+    );
+    assert!(before.last_acked_seq > 0);
+    assert_eq!(names(&hub), present, "nothing was written beside the queue");
+    // Writable again: the field says so.
+    assert_eq!(status_of(&hub)["readOnly"], false);
+}
+
+#[test]
+fn status_refuses_a_confirmed_mark_or_a_pseudonym_store_a_newer_version_wrote_like_run() {
+    // The pseudonym store.
+    let hub = Hub::new();
+    hub.run(1).close().unwrap();
+    let db = rusqlite::Connection::open(hub.state.join("pseudonyms.sqlite")).unwrap();
+    db.execute_batch("PRAGMA user_version = 7").unwrap();
+    drop(db);
+    let ran = run_refused(&hub.config_path);
+    let status = cli(&["status", "--config", path(&hub.config_path)]);
+    assert_eq!((status.code, ran.code), (2, 2), "{} / {}", status.err, ran.err);
+    assert_eq!(status.err, ran.err);
+    assert!(
+        status.err.contains("pseudonyms.sqlite") && status.err.contains("newer"),
+        "{}",
+        status.err
+    );
+    assert!(status.out.is_empty());
+    // The confirmed mark.
+    let hub = Hub::new();
+    hub.run(1).close().unwrap();
+    std::fs::write(
+        hub.state.join("confirmed.json"),
+        format!(
+            r#"{{"version": 2, "lastAckedSeq": 1, "sourceId": "{}"}}"#,
+            support::hub::SOURCE
+        ),
+    )
+    .unwrap();
+    let ran = run_refused(&hub.config_path);
+    let status = cli(&["status", "--config", path(&hub.config_path)]);
+    assert_eq!((status.code, ran.code), (2, 2), "{} / {}", status.err, ran.err);
+    assert_eq!(status.err, ran.err);
+    assert!(
+        status.err.contains("confirmed.json") && status.err.contains("newer"),
+        "{}",
+        status.err
+    );
+    assert!(status.out.is_empty());
+}
+
+#[test]
+fn public_key_checks_the_state_directory_as_every_other_command_does() {
+    let tmp = TempDir::new();
+    let state = tmp.join("state");
+    assert_eq!(
+        cli(&["keygen", "--state-dir", path(&state), "--key-id", "hub-key-1"]).code,
+        0
+    );
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let open = cli(&["public-key", "--state-dir", path(&state)]);
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(open.code, 2, "{}", open.out);
+    assert!(open.err.contains("open to other users"), "{}", open.err);
+    assert!(open.out.is_empty());
+    let file = tmp.join("file");
+    std::fs::write(&file, "x").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let not_dir = cli(&["public-key", "--state-dir", path(&file), "--key-id", "hub-key-1"]);
+    assert_eq!(not_dir.code, 2);
+    assert!(not_dir.err.contains("not a directory"), "{}", not_dir.err);
 }

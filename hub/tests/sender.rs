@@ -1223,7 +1223,25 @@ fn a_request_that_times_out_halves_the_batch_and_a_confirmed_one_lets_it_grow_ag
     assert_eq!(sender.outbox().last_acked().unwrap(), 8);
     fill(sender.outbox_mut(), &clock, 30);
     drain(&mut sender);
-    assert_eq!(counts_per_request(&service), [8, 4, 2, 4, 8, 16, 2]);
+    // Back up by a quarter (at least one) per confirmed request, never straight to the size that just failed.
+    assert_eq!(counts_per_request(&service), [8, 4, 2, 3, 4, 5, 6, 7, 5]);
+}
+
+#[test]
+fn after_a_halving_a_batch_grows_back_by_a_quarter_up_to_500() {
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 1_200);
+    let mut sender = make_sender(&service, outbox, &clock);
+    // The service takes at most 300 at a time: 500 is refused, then 250 fits.
+    service.push(Step::MaxEvents(300));
+    assert_eq!(step(&mut sender), SendOutcome::RetryNow);
+    drain(&mut sender);
+    assert_eq!(counts_per_request(&service), [500, 250, 312, 390, 248]);
+    // 487 after the last of those, and a quarter more is past 500: back at the limit, and no further.
+    fill(sender.outbox_mut(), &clock, 1_001);
+    drain(&mut sender);
+    assert_eq!(counts_per_request(&service)[5..], [500, 500, 1]);
 }
 
 #[test]
@@ -1233,12 +1251,45 @@ fn a_timeout_of_a_single_event_or_a_heartbeat_backs_off_and_halves_nothing() {
     let mut outbox = open_outbox(&tmp, "outbox.sqlite");
     fill(&mut outbox, &clock, 1);
     let mut sender = make_sender(&service, outbox, &clock).with_request_timeout(Duration::from_millis(200));
+    // A heartbeat that times out: a back-off, and the batch keeps its size.
     service.push(Step::Delay(Duration::from_millis(600)));
-    assert_eq!(step(&mut sender), SendOutcome::RetryLater(BACKOFF_FIRST_SECONDS));
-    clock.advance_seconds(10);
+    assert_eq!(
+        sender.heartbeat().unwrap(),
+        SendOutcome::RetryLater(BACKOFF_FIRST_SECONDS)
+    );
+    assert_eq!(sender.trouble().map(|t| t.as_text()).as_deref(), Some("timeout"));
+    clock.advance_seconds(BACKOFF_FIRST_SECONDS as i64);
+    // One event that times out: a longer back-off, and still no halving.
+    service.push(Step::Delay(Duration::from_millis(600)));
+    assert_eq!(step(&mut sender), SendOutcome::RetryLater(2 * BACKOFF_FIRST_SECONDS));
+    assert_eq!(sender.trouble().map(|t| t.as_text()).as_deref(), Some("timeout"));
+    clock.advance_seconds(BACKOFF_MAX_SECONDS as i64);
     fill(sender.outbox_mut(), &clock, 3);
     drain(&mut sender);
-    assert_eq!(counts_per_request(&service), [1, 4]);
+    assert_eq!(counts_per_request(&service), [0, 1, 4]);
+}
+
+#[test]
+fn a_confirmation_whose_counters_cannot_be_read_backs_off_like_one_that_cannot_be_recorded() {
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 2);
+    let mut sender = make_sender(&service, outbox, &clock);
+    // Something this code never writes, where the count of assigned numbers belongs: read only once the answer is in.
+    let db = rusqlite::Connection::open(tmp.join("outbox.sqlite")).unwrap();
+    db.execute("UPDATE meta SET value = 'seven' WHERE key = 'last_assigned'", [])
+        .unwrap();
+    assert!(sender.step().is_err());
+    assert_eq!(
+        step(&mut sender),
+        SendOutcome::RetryLater(BACKOFF_FIRST_SECONDS),
+        "not again at once"
+    );
+    assert_eq!(service.requests().len(), 1);
+    db.execute("UPDATE meta SET value = '2' WHERE key = 'last_assigned'", [])
+        .unwrap();
+    clock.advance_seconds(BACKOFF_FIRST_SECONDS as i64);
+    assert_eq!(step(&mut sender), SendOutcome::Sent(2));
 }
 
 #[test]

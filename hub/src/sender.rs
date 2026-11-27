@@ -11,8 +11,10 @@
 //!   all integers from 0 to 2^53 - 1); any other `200` (a proxy page, a captive portal) confirms nothing. A `200` to
 //!   a batch that moves the confirmed mark nowhere is a failure: it backs off rather than send the batch again at once.
 //!   So is a confirmation the hub cannot record (its storage fails): it backs off, and the `Err` says why;
-//! - a request that carried more than one event and timed out halves the batch for the next attempt, as a `413`
-//!   does; a confirmed request lets it grow back, doubling, up to `MAX_EVENTS`;
+//! - a request that carried more than one event and timed out once its body had started to go out (or while the
+//!   answer was awaited or read) halves the batch for the next attempt, as a `413` does; a timeout while resolving or
+//!   connecting sent nothing, and halves nothing. A confirmed request lets the batch grow back by a quarter (at least
+//!   one event), up to `MAX_EVENTS`: never straight back to the size that just failed;
 //! - a failed or unanswered request is sent again with the same bytes, so the service counts duplicates, never gaps.
 //!   The body is the outbox's stored event texts spliced into `{"events":[...],"schemaVersion":N}`, never the events
 //!   parsed and written again, and a request carries events of one schema version only;
@@ -210,6 +212,45 @@ impl ServiceTrouble {
             _ => Self::NoConnection,
         }
     }
+}
+
+/// Whether a request error is a timeout at a point where the batch itself may be what took too long: once the body
+/// had started to go out, or while the answer was awaited or read.
+///
+/// From ureq 3.5.2's `Timeout`: `Resolve` and `Connect` (a TCP connect that timed out is reported as `Connect`, also
+/// when the overall limit was the one that ran out) and `SendRequest` (the request line and headers) come before the
+/// body, and nothing of the batch was sent. `SendBody`, `RecvResponse` and `RecvBody` come after. `Global` and
+/// `PerCall` name the overall limit, not the phase it ran out in, and an `Io` of kind `TimedOut` is a socket read or
+/// write: those cannot be told apart by phase, and count as after the body started (the batch is halved). The
+/// resolver below turns every resolution failure, a timeout included, into `HostNotFound`, which is no timeout.
+fn timed_out_after_sending(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect | ureq::Timeout::SendRequest) => false,
+        ureq::Error::Timeout(_) => true,
+        ureq::Error::Io(io) => io.kind() == io::ErrorKind::TimedOut,
+        _ => false,
+    }
+}
+
+/// No complete answer: what kind of none, and whether it timed out after the body started to go out.
+#[derive(Debug, Clone, Copy)]
+struct NoAnswer {
+    trouble: ServiceTrouble,
+    after_sending: bool,
+}
+
+impl NoAnswer {
+    fn of(error: &ureq::Error) -> Self {
+        Self {
+            trouble: ServiceTrouble::of_request_error(error),
+            after_sending: timed_out_after_sending(error),
+        }
+    }
+}
+
+/// The batch limit after a confirmed request: a quarter more, at least one, at most `MAX_EVENTS`.
+fn grown(limit: usize) -> usize {
+    limit.saturating_add((limit / 4).max(1)).min(MAX_EVENTS)
 }
 
 /// What one `step()` did, and so when the agent should call it again.
@@ -489,9 +530,9 @@ impl Sender {
         };
         let answer = match self.post(&body) {
             Ok(answer) => answer,
-            Err(trouble) => {
-                self.trouble = Some(trouble);
-                if trouble == ServiceTrouble::Timeout && count > 1 {
+            Err(none) => {
+                self.trouble = Some(none.trouble);
+                if none.after_sending && count > 1 {
                     // A batch the service could not answer for in time may be too much for the link or for it: the
                     // next attempt carries half, as after a `413`. A confirmed request lets it grow back.
                     self.batch_limit = (count / 2).max(1);
@@ -554,7 +595,7 @@ impl Sender {
 
     /// One signed POST, timestamped by the wall clock. An `Err` when there is no complete answer (and what kind of
     /// none): the request may or may not have arrived, and sending the same bytes again is always safe.
-    fn post(&mut self, body: &[u8]) -> Result<Answer, ServiceTrouble> {
+    fn post(&mut self, body: &[u8]) -> Result<Answer, NoAnswer> {
         let (wall, mono) = (self.clock.wall_millis(), self.clock.mono_millis());
         let timestamp = wall.div_euclid(MS_PER_SECOND).to_string();
         let message = signing::request_signing_message(&self.principal, "POST", INGEST_PATH, &timestamp, body);
@@ -569,7 +610,7 @@ impl Sender {
             .header("X-VT-Timestamp", &timestamp)
             .header("X-VT-Signature", &signature)
             .send(body)
-            .map_err(|error| ServiceTrouble::of_request_error(&error))?;
+            .map_err(|error| NoAnswer::of(&error))?;
         let status = response.status().as_u16();
         let single = |name: &str| {
             let mut values = response.headers().get_all(name).iter();
@@ -580,13 +621,23 @@ impl Sender {
         };
         let date = single("date");
         let retry_after = single("retry-after");
-        // Half an answer, or more than the cap: no answer.
+        // Half an answer, or more than the cap: no answer. One that stopped coming in time is a timeout.
         let raw = response
             .body_mut()
             .with_config()
             .limit(MAX_ANSWER_BYTES)
             .read_to_vec()
-            .map_err(|_| ServiceTrouble::Unreadable)?;
+            .map_err(|error| {
+                let after_sending = timed_out_after_sending(&error);
+                NoAnswer {
+                    trouble: if after_sending {
+                        ServiceTrouble::Timeout
+                    } else {
+                        ServiceTrouble::Unreadable
+                    },
+                    after_sending,
+                }
+            })?;
         let skew = date
             .as_deref()
             .and_then(clock::parse_http_date)
@@ -623,7 +674,9 @@ impl Sender {
         self.problem = None;
         // The service's own answer: it is there and speaking for itself, whatever it says next.
         self.trouble = None;
-        let last_assigned = self.outbox.last_assigned()?;
+        // A read that fails here is the hub's storage failing after the service answered, like an `ack` that fails:
+        // a back-off, so the same batch does not meet the same disk again at once.
+        let last_assigned = self.or_back_off(self.outbox.last_assigned())?;
         if last_seq > last_assigned {
             if last_assigned == 0 {
                 // This hub has no queue and the service has a history: the queue was lost, or this is a reinstall.
@@ -634,7 +687,7 @@ impl Sender {
             // writing into that sequence.
             return Ok(self.halt(HaltReason::Ahead));
         }
-        let before = self.outbox.last_acked()?;
+        let before = self.or_back_off(self.outbox.last_acked())?;
         match self.outbox.ack(last_seq) {
             Ok(()) => {}
             Err(OutboxError::AckAhead) => return Ok(self.halt(HaltReason::Ahead)),
@@ -645,14 +698,15 @@ impl Sender {
                 return Err(error.into());
             }
         }
-        if sent > 0 && self.outbox.last_acked()? <= before {
+        let after = self.or_back_off(self.outbox.last_acked())?;
+        if sent > 0 && after <= before {
             // Events went and the service confirmed none of them: whatever it is, sending the same batch again at
             // once will not change it.
             self.trouble = Some(ServiceTrouble::NotConfirming);
             return Ok(self.back_off());
         }
         self.failures = 0;
-        self.batch_limit = self.batch_limit.saturating_mul(2).min(MAX_EVENTS);
+        self.batch_limit = grown(self.batch_limit);
         self.last_success = Some(self.clock.wall_millis());
         Ok(SendOutcome::Sent(sent))
     }
@@ -662,6 +716,14 @@ impl Sender {
         let ms = i64::try_from(seconds).unwrap_or(i64::MAX).saturating_mul(MS_PER_SECOND);
         self.not_before = self.clock.mono_millis().saturating_add(ms);
         SendOutcome::RetryLater(seconds)
+    }
+
+    /// `result`, after a back-off when it is a failure of the hub's own storage.
+    fn or_back_off<T>(&mut self, result: Result<T, OutboxError>) -> Result<T, SenderError> {
+        if result.is_err() {
+            self.back_off();
+        }
+        result.map_err(SenderError::from)
     }
 
     /// The back-off after one more failure in a row (`backoff_seconds`).
@@ -862,5 +924,43 @@ impl Resolver for NameResolver {
         self.0
             .resolve(uri, config, timeout)
             .map_err(|_| ureq::Error::HostNotFound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_timeout_once_the_body_started_to_go_out_halves_the_batch() {
+        use ureq::Timeout;
+        let halves = |error: ureq::Error| timed_out_after_sending(&error);
+        // Nothing of the batch was sent.
+        for phase in [Timeout::Resolve, Timeout::Connect, Timeout::SendRequest] {
+            assert!(!halves(ureq::Error::Timeout(phase)), "{phase:?}");
+        }
+        // The body was going out, or the answer was awaited or read.
+        for phase in [Timeout::SendBody, Timeout::RecvResponse, Timeout::RecvBody] {
+            assert!(halves(ureq::Error::Timeout(phase)), "{phase:?}");
+        }
+        // The overall limit and a socket's own timeout do not say in which phase: as if the body had started.
+        for phase in [Timeout::Global, Timeout::PerCall, Timeout::PerRead, Timeout::PerWrite] {
+            assert!(halves(ureq::Error::Timeout(phase)), "{phase:?}");
+        }
+        assert!(halves(ureq::Error::Io(io::Error::from(io::ErrorKind::TimedOut))));
+        // No timeout at all.
+        assert!(!halves(ureq::Error::HostNotFound));
+        assert!(!halves(ureq::Error::Io(io::Error::from(
+            io::ErrorKind::ConnectionRefused
+        ))));
+    }
+
+    #[test]
+    fn a_batch_grows_back_by_a_quarter_and_at_least_one_up_to_the_limit() {
+        assert_eq!(grown(1), 2);
+        assert_eq!(grown(3), 4);
+        assert_eq!(grown(250), 312);
+        assert_eq!(grown(487), MAX_EVENTS);
+        assert_eq!(grown(MAX_EVENTS), MAX_EVENTS);
     }
 }
