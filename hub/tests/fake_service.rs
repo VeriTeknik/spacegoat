@@ -535,6 +535,44 @@ fn a_replayed_event_keeps_its_nonce_and_is_a_duplicate_not_a_reuse() {
     drop(tmp);
 }
 
+#[test]
+fn a_reset_sent_again_after_a_lost_answer_is_a_duplicate_not_a_refused_reset() {
+    // After the first delivery the service holds 2, and the reset still names 1: the reset rule is for events the
+    // service has not recorded, so the repeat is counted and nothing is refused (protocol, section 8).
+    let mut case = Case::new();
+    case.append(
+        "site.device_seen",
+        json!({"trustOrigin": "hub", "deviceRef": DEVICE, "segmentRef": SEGMENT}),
+        None,
+    )
+    .append(
+        "site_source.reset",
+        json!({"trustOrigin": "hub", "lastAckedSeq": 1, "reason": "queue_lost"}),
+        None,
+    );
+    case.service.push(support::fake_service::Step::LoseAnswer);
+    let Case {
+        tmp,
+        clock,
+        service,
+        outbox,
+    } = case;
+    let mut sender = Sender::new(
+        &service.base_url,
+        SOURCE,
+        KEY_ID,
+        vector_key(),
+        outbox,
+        clock.as_clock(),
+    )
+    .unwrap();
+    assert!(matches!(sender.step().unwrap(), SendOutcome::RetryLater(_)));
+    clock.advance_seconds(5);
+    assert_eq!(sender.step().unwrap(), SendOutcome::Sent(2));
+    assert_eq!(service.accepted_seqs(), [1, 2]);
+    drop(tmp);
+}
+
 // ---- The service authenticates before it judges anything else ----
 
 #[test]
