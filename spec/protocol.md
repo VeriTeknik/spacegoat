@@ -204,7 +204,7 @@ A device with such an address starts as ephemeral; when the same address is seen
 
 | Status | Body | What the hub does |
 |---|---|---|
-| 200 | `{ "accepted": n, "duplicates": m, "lastSeq": k }` | Removes from its queue the events this request carried, up to `k` |
+| 200 | `{ "accepted": n, "duplicates": m, "lastSeq": k }` | When `n + m` is the number of events the request carried and `k` is not below the last of them: may remove those events from its queue. Otherwise the answer confirms nothing, and the hub asks again |
 | 400 | `{ "error": "schema" }` | Stops sending and shows the fault locally; the answer never says which field |
 | 401 | `{ "error": "unauthorized" }` | Shows the fault locally and tries again slowly (every five minutes) |
 | 409 | `{ "error": "seq_gap", "expectedSeq": k }` | Stops sending: the service lost events it had confirmed |

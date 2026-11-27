@@ -24,6 +24,8 @@ jobs:
             jq empty "$f"
             echo "ok $f"
           done
+      - name: The regulation mapping keeps its form
+        run: sh docs/check-mapping.sh
       # Every line of every export vector is JSON. float-attribute.jsonl passes too: a float is valid JSON and is
       # refused only by the protocol, which is the verifier's business, not this step's.
       - name: Every export vector line is well-formed JSON

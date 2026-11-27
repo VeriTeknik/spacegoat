@@ -1007,13 +1007,19 @@ fn the_skew_now_follows_a_jump_of_the_wall_clock_after_the_reading() {
         vector_key(),
     );
     assert_eq!(sender.heartbeat().unwrap(), SendOutcome::Sent(0));
-    assert!(sender.clock_skew_millis().unwrap().abs() <= 1_000);
+    // The test wall clock runs with real time while its monotonic clock stands still, and the service's `Date` has
+    // whole seconds: the margin covers both on a loaded machine. The jump below is an hour.
+    let margin = 10_000;
+    let before = sender.clock_skew_millis().unwrap();
+    assert!(before.abs() <= margin, "{before}");
     hub_clock.step_wall_seconds(3600);
+    let jumped = 3_600_000 - margin..=3_600_000 + margin;
     let skew = sender.clock_skew_millis().unwrap();
-    assert!((3_599_000..=3_601_000).contains(&skew), "{skew}");
+    assert!(jumped.contains(&skew), "{skew}");
     // Time passing on both clocks is no jump.
     hub_clock.advance_seconds(600);
-    assert!((3_599_000..=3_601_000).contains(&sender.clock_skew_millis().unwrap()));
+    let skew = sender.clock_skew_millis().unwrap();
+    assert!(jumped.contains(&skew), "{skew}");
 }
 
 #[test]
@@ -1462,6 +1468,32 @@ fn one_lower_answer_followed_by_a_good_one_halts_nothing_and_loses_nothing() {
     clock.advance_seconds(BACKOFF_FIRST_SECONDS as i64);
     assert_eq!(step(&mut sender), SendOutcome::Sent(1));
     assert_eq!(service.accepted_seqs(), (1..=11).collect::<Vec<u64>>());
+}
+
+#[test]
+fn an_answer_that_contradicts_itself_is_asked_again_and_never_read_as_a_loss() {
+    // Ten confirmed; 11 and 12 go. The answer counts both as taken and names 9 as the last number held: its fields
+    // disagree, so it says nothing about what the service holds. Twice in a row is still no loss.
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 10);
+    let mut sender = make_sender(&service, outbox, &clock);
+    drain(&mut sender);
+    fill(sender.outbox_mut(), &clock, 2);
+    for _ in 0..3 {
+        service.push(Step::status(200, json!({"accepted": 2, "duplicates": 0, "lastSeq": 9})));
+        assert!(matches!(step(&mut sender), SendOutcome::RetryLater(_)));
+        assert_eq!(sender.halted(), None);
+        assert_eq!(sender.trouble().map(|t| t.as_text()).as_deref(), Some("not_confirming"));
+        assert_eq!(
+            sender.service_last_seq(),
+            Some(10),
+            "not taken as the service's position"
+        );
+        clock.advance_seconds(3600);
+    }
+    assert_eq!(step(&mut sender), SendOutcome::Sent(2));
+    assert_eq!(service.accepted_seqs(), (1..=12).collect::<Vec<u64>>());
 }
 
 #[test]

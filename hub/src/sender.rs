@@ -568,12 +568,22 @@ impl Sender {
         self.exchange(&[])
     }
 
+    /// Whether a request would carry an event now: something queued that the service has not confirmed. A queue of
+    /// confirmed events the hub still holds has nothing to send.
+    pub fn has_unsent(&self) -> Result<bool, SenderError> {
+        Ok(!self.outbox.pending(1, Some(self.first_unsent()?))?.is_empty())
+    }
+
+    /// The first number after what the service confirmed of what it was sent, held or not: a held event is not sent
+    /// again.
+    fn first_unsent(&self) -> Result<u64, SenderError> {
+        Ok(self.outbox.last_acked()?.max(self.confirmed_through).saturating_add(1))
+    }
+
     /// What waits, up to the batch limit, and only as far as it shares the first event's schema version: one request
     /// carries one `schemaVersion`.
     fn batch(&self) -> Result<Vec<StoredEvent>, SenderError> {
-        // From after what the service confirmed of what it was sent, held or not: a held event is not sent again.
-        let from = self.outbox.last_acked()?.max(self.confirmed_through).saturating_add(1);
-        let mut events = self.outbox.pending(self.batch_limit, Some(from))?;
+        let mut events = self.outbox.pending(self.batch_limit, Some(self.first_unsent()?))?;
         if let Some(first) = events.first().map(|event| event.schema_version) {
             let same = events.iter().take_while(|event| event.schema_version == first).count();
             events.truncate(same);
@@ -760,6 +770,13 @@ impl Sender {
             self.trouble = Some(ServiceTrouble::NotConfirming);
             return Ok(self.back_off());
         }
+        // Counts that say every event was taken, and a `lastSeq` below the last event carried: the two fields
+        // disagree, and neither is trusted. Such an answer says nothing about what the service holds, so it is
+        // neither its position nor a sign of a loss (a service that lost events refuses the batch with `seq_gap`).
+        if carried.is_some_and(|carried| sent > 0 && last_seq < carried) {
+            self.trouble = Some(ServiceTrouble::NotConfirming);
+            return Ok(self.back_off());
+        }
         self.service_last_seq = Some(last_seq);
         self.problem = None;
         // The service's own answer: it is there and speaking for itself, whatever it says next.
@@ -804,14 +821,8 @@ impl Sender {
             self.last_success = Some(self.clock.wall_millis());
             return Ok(SendOutcome::Sent(0));
         }
-        // Only what this request carried is removed, up to `lastSeq`: an event above it was never compared by the
-        // service, and goes in a later request that carries it. A `lastSeq` below the last event carried contradicts
-        // counts that say every event was taken: the two fields disagree, and neither is trusted.
+        // Only what this request carried is removed: `lastSeq` is at or above its last event (checked above).
         let carried = carried.unwrap_or(0);
-        if last_seq < carried {
-            self.trouble = Some(ServiceTrouble::NotConfirming);
-            return Ok(self.back_off());
-        }
         if carried <= before {
             // Events went and the service confirmed none of them: whatever it is, sending the same batch again at
             // once will not change it.
