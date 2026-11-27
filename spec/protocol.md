@@ -159,6 +159,7 @@ A `gap_declared` event carries the sequence number just after the gap.
 
 A `reset` event does not restart the sequence.
 Its `lastAckedSeq` must equal the last sequence number the **service** holds, and its own sequence number is that plus one; anything else is refused.
+The service recognises a repeated event first (section 10): a reset or a gap declaration it has already recorded is counted in `duplicates` when it is sent again, and these rules are applied only to events it has not recorded yet.
 A hub therefore asks before it declares: an empty request (section 7) is answered with `lastSeq`, and the hub uses that number, not its own memory of what was confirmed (the two differ whenever an answer was lost on the way back).
 Each of them is recorded and raises an alert for a person to look at. A hub never invents a sequence.
 
