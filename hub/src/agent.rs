@@ -1127,13 +1127,14 @@ impl Agent {
         // then the untrusted round below takes its readings at its usual cadence (at once after a jump, then when a
         // heartbeat is due), not one greeting per tick.
         let clock_known_wrong = self.sender.clock_reading().is_some() && !self.clock_trusted();
+        if self.settle_failed {
+            // No request while the storage settlement needs still fails, whatever would call for one (the greeting,
+            // a heartbeat that is due, the reading a clock that jumped takes): each would say "alive, nothing to
+            // report".
+            self.settlement_storage_works()?;
+            self.settle_failed = false;
+        }
         if !self.greeted && !clock_known_wrong {
-            if self.settle_failed {
-                // No request while the storage settlement needs still fails: a heartbeat would say "alive, nothing
-                // to report".
-                self.settlement_storage_works()?;
-                self.settle_failed = false;
-            }
             // The first request of a run is a heartbeat, whatever waits (protocol §11).
             let outcome = self.sender.heartbeat()?;
             self.after(outcome)?;

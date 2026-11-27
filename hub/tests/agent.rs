@@ -2923,6 +2923,34 @@ fn a_hub_whose_queue_cannot_store_the_reset_sends_nothing_until_it_can() {
 }
 
 #[test]
+fn a_hub_that_cannot_settle_asks_nothing_when_its_clock_jumps_either() {
+    // The reset cannot be stored, and then the wall clock jumps: the reading a jump calls for is a request too, and
+    // would say "alive, nothing to report". It waits for the storage like every other request.
+    let hub = Hub::new();
+    hub.run(4).close().unwrap();
+    hub.lose_outbox();
+    let hub_clock = TestClock::new();
+    let mut agent = agent_on(&hub, &hub_clock);
+    break_event_inserts(&hub, true);
+    assert!(agent.tick().is_err(), "the reset cannot be stored");
+    let after_first = hub.service.requests().len();
+    hub_clock.step_wall_seconds(3600);
+    for _ in 0..5 {
+        assert!(agent.tick().is_err(), "the queue still fails");
+        hub_clock.advance_seconds(60);
+    }
+    assert_eq!(
+        hub.service.requests().len(),
+        after_first,
+        "no request while it cannot settle"
+    );
+    break_event_inserts(&hub, false);
+    agent.tick().unwrap();
+    assert!(hub.service.requests().len() > after_first, "it asks again once it can");
+    agent.close().unwrap();
+}
+
+#[test]
 fn a_reference_record_that_is_not_text_does_not_stop_the_start_and_is_said_once() {
     // Events wait in the queue (the service was down for them); one reference record has been damaged out of band
     // (a value that is not text). The start goes on: that record is passed over, counted, and said.
