@@ -22,7 +22,7 @@ The agent is written in Rust: one static binary, no async runtime, no `unsafe`.
 This version cannot observe a real network: `run` refuses to start without `--simulate`.
 It has been run on Linux (aarch64, musl) and macOS in tests only; it has not run on a real board or against a real hub service.
 
-Measured on `aarch64-unknown-linux-musl`, release build, at the third review round: a 3.0 MB static binary (2,969,688 bytes), 2.9 MB resident (3.2 MB peak) and one thread while waiting for a service it could not reach; memory while delivering over TLS has not been measured.
+Measured on `aarch64-unknown-linux-musl`, release build, at the last review pass (memory at the round before it): a 3.0 MB static binary (3,035,224 bytes), 2.9 MB resident (3.2 MB peak) and one thread while waiting for a service it could not reach; memory while delivering over TLS has not been measured.
 The HTTP client resolves the service's name in a short-lived thread of its own for each request.
 
 ## Build and try
