@@ -568,12 +568,22 @@ impl Sender {
         self.exchange(&[])
     }
 
+    /// Whether a request would carry an event now: something queued that the service has not confirmed. A queue of
+    /// confirmed events the hub still holds has nothing to send.
+    pub fn has_unsent(&self) -> Result<bool, SenderError> {
+        Ok(!self.outbox.pending(1, Some(self.first_unsent()?))?.is_empty())
+    }
+
+    /// The first number after what the service confirmed of what it was sent, held or not: a held event is not sent
+    /// again.
+    fn first_unsent(&self) -> Result<u64, SenderError> {
+        Ok(self.outbox.last_acked()?.max(self.confirmed_through).saturating_add(1))
+    }
+
     /// What waits, up to the batch limit, and only as far as it shares the first event's schema version: one request
     /// carries one `schemaVersion`.
     fn batch(&self) -> Result<Vec<StoredEvent>, SenderError> {
-        // From after what the service confirmed of what it was sent, held or not: a held event is not sent again.
-        let from = self.outbox.last_acked()?.max(self.confirmed_through).saturating_add(1);
-        let mut events = self.outbox.pending(self.batch_limit, Some(from))?;
+        let mut events = self.outbox.pending(self.batch_limit, Some(self.first_unsent()?))?;
         if let Some(first) = events.first().map(|event| event.schema_version) {
             let same = events.iter().take_while(|event| event.schema_version == first).count();
             events.truncate(same);

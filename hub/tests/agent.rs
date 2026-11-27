@@ -3197,6 +3197,64 @@ fn a_backlog_of_held_events_stops_capture_at_the_cap_and_capture_resumes_once_th
 }
 
 #[test]
+fn a_backlog_of_held_events_that_stops_capture_sends_no_heartbeat() {
+    // Everything queued is confirmed and held, the backlog is full, capture is stopped. A heartbeat would say "alive,
+    // nothing to report" about a site that is not being watched: none goes.
+    let hub = Hub::new();
+    let settings = agent::AgentSettings {
+        backlog_cap: 4,
+        ..agent::AgentSettings::default()
+    };
+    let observer = Steered::default();
+    let mut agent = Agent::open_with(&hub.config, Box::new(observer.clone()), hub.clock.as_clock(), settings).unwrap();
+    agent.tick().unwrap();
+    break_updates(&hub, true);
+    for round in 0..10 {
+        observer.set(vec![sighting(&format!("odd:{round}"), "printer", None, None, None)]);
+        hub.clock.advance_seconds(sender::BACKOFF_MAX_SECONDS as i64);
+        let _ = agent.tick();
+        if agent.status().unwrap().waiting_for.as_deref() == Some("backlog") {
+            break;
+        }
+    }
+    assert_eq!(agent.status().unwrap().waiting_for.as_deref(), Some("backlog"));
+    let requests = hub.service.requests().len();
+    for _ in 0..3 {
+        hub.clock.advance_seconds(sender::HEARTBEAT_SECONDS);
+        let _ = agent.tick();
+    }
+    assert_eq!(
+        hub.service.requests().len(),
+        requests,
+        "no heartbeat while capture is stopped"
+    );
+    agent.close().unwrap();
+}
+
+#[test]
+fn a_clock_that_jumps_takes_its_reading_at_once_when_only_held_events_wait() {
+    // What is queued is confirmed and held: no request would carry it, so the reading a jump calls for is a
+    // heartbeat now, not at the next one due.
+    let hub = Hub::new();
+    let hub_clock = TestClock::new();
+    let observer = Steered::default();
+    let mut agent = Agent::open(&hub.config, Box::new(observer.clone()), hub_clock.as_clock()).unwrap();
+    agent.tick().unwrap();
+    break_updates(&hub, true);
+    observer.set(vec![sighting("odd:printer", "printer", None, None, None)]);
+    pass(&[&hub.clock, &hub_clock], 60);
+    let _ = agent.tick();
+    let status = agent.status().unwrap();
+    assert!(status.pending > 0, "held");
+    assert_eq!(hub.service.last_seq(), status.last_assigned_seq, "and confirmed");
+    let before = hub.service.requests().len();
+    hub_clock.step_wall_seconds(3600);
+    let _ = agent.tick();
+    assert_eq!(hub.service.requests().len(), before + 1, "a new reading at once");
+    agent.close().unwrap();
+}
+
+#[test]
 fn a_release_whose_removal_fails_is_retried_while_capture_is_stopped() {
     // An event is held (the store did not take its report) after the service confirmed it, and it fills the backlog,
     // so capture stops. The store recovers, but removing the confirmed event fails once. Capture, stopped by the full

@@ -1151,8 +1151,9 @@ impl Agent {
         self.trusted_before = trusted;
         let Some(at) = clock::observed_at_text(wall).filter(|_| trusted) else {
             // Produce nothing; deliver what was signed while the clock was trusted. A clock that was trusted until
-            // now takes a new reading at once: a heartbeat when nothing is queued, else the delivery itself.
-            if jumped && self.sender.outbox().pending(1, None)?.is_empty() {
+            // now takes a new reading at once: a heartbeat when no request would carry an event (nothing queued, or
+            // only confirmed events still held), else the delivery itself.
+            if jumped && !self.sender.has_unsent()? {
                 let outcome = self.sender.heartbeat()?;
                 self.after(outcome)?;
             }
@@ -1165,8 +1166,10 @@ impl Agent {
             return Ok(());
         }
         let capture = self.capture(wall, &at);
-        // A heartbeat says "alive, nothing to report": only when that is true.
-        let healthy = matches!(capture, Ok(None));
+        // A heartbeat says "alive, nothing to report": only when that is true, so only after a capture that
+        // happened. A full backlog captures nothing; when what fills it is confirmed and held, no event goes either,
+        // and the hub is silent until it can watch again.
+        let healthy = matches!(capture, Ok(None)) && self.captured;
         let delivered = self.deliver(healthy, true);
         // Trusted at the start of the round; the clock may have jumped during its requests.
         self.waiting_for = self.waiting(self.clock_trusted());
