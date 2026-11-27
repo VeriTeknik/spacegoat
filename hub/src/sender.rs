@@ -13,7 +13,8 @@
 //!   and only those it carried, up to `lastSeq`: a heartbeat's `lastSeq` says where the service stands, and an event
 //!   above the request's last one goes in a later request, where the service compares it with its record. Counts
 //!   that say every event was taken with a `lastSeq` below the last one sent disagree, and confirm nothing. Events the
-//!   agent still holds (`hold_acks_from`) stay queued whatever is confirmed, with a back-off. A `200` to a batch that
+//!   agent still holds (`hold_acks_from`) stay queued whatever is confirmed, but are not sent again in this run and
+//!   do not stop the events behind them (`confirmed_through`). A `200` to a batch that
 //!   moves the confirmed mark nowhere is a failure: it backs off rather than send the batch again at once. So is a
 //!   confirmation the hub cannot record (its storage fails): it backs off, and the `Err` says why;
 //! - a `lastSeq` below what the service once confirmed, to a heartbeat or a batch, confirms nothing and backs off
@@ -359,6 +360,10 @@ pub struct Sender {
     /// The first queued event the agent has not finished with (the pseudonym store has not taken what it reported):
     /// it and those after it are not removed from the queue, whatever is confirmed.
     hold_from: Option<u64>,
+    /// The last event the service confirmed in answer to a request that carried it, in this run: the queue may
+    /// still hold it (`hold_from`), and it is not sent again. Not kept across a restart: the events are then sent
+    /// once more and counted as duplicates.
+    confirmed_through: u64,
 }
 
 impl Sender {
@@ -395,6 +400,7 @@ impl Sender {
             service_last_seq: None,
             lower_once: false,
             hold_from: None,
+            confirmed_through: 0,
         })
     }
 
@@ -485,8 +491,21 @@ impl Sender {
     }
 
     /// Keep event `from` and those after it in the queue whatever is confirmed (`None`: no such event).
-    pub fn hold_acks_from(&mut self, from: Option<u64>) {
+    /// What was confirmed below a hold that is lowered or lifted leaves the queue at once, with no request.
+    pub fn hold_acks_from(&mut self, from: Option<u64>) -> Result<(), OutboxError> {
         self.hold_from = from;
+        self.remove_confirmed()
+    }
+
+    /// Remove from the queue what the service confirmed (`confirmed_through`), short of the first held event.
+    fn remove_confirmed(&mut self) -> Result<(), OutboxError> {
+        let through = self.hold_from.map_or(self.confirmed_through, |from| {
+            self.confirmed_through.min(from.saturating_sub(1))
+        });
+        if through > self.outbox.last_acked()? {
+            self.outbox.ack(through)?;
+        }
+        Ok(())
     }
 
     /// Forget where the service said it stands: an answer older than a failure the agent must not act on.
@@ -540,7 +559,9 @@ impl Sender {
     /// What waits, up to the batch limit, and only as far as it shares the first event's schema version: one request
     /// carries one `schemaVersion`.
     fn batch(&self) -> Result<Vec<StoredEvent>, SenderError> {
-        let mut events = self.outbox.pending(self.batch_limit, None)?;
+        // From after what the service confirmed of what it was sent, held or not: a held event is not sent again.
+        let from = self.outbox.last_acked()?.max(self.confirmed_through).saturating_add(1);
+        let mut events = self.outbox.pending(self.batch_limit, Some(from))?;
         if let Some(first) = events.first().map(|event| event.schema_version) {
             let same = events.iter().take_while(|event| event.schema_version == first).count();
             events.truncate(same);
@@ -744,7 +765,10 @@ impl Sender {
             // writing into that sequence.
             return Ok(self.halt(HaltReason::Ahead));
         }
-        let before = self.or_back_off(self.outbox.last_acked())?;
+        let acked = self.or_back_off(self.outbox.last_acked())?;
+        // What this hub knows the service confirmed: removed from the queue, or confirmed in answer to a request
+        // that carried it and still held here. Below either is the same loss.
+        let before = acked.max(self.confirmed_through);
         if last_seq < before {
             // The service once confirmed `before` and now says it holds less. An answer lost on the way back leaves
             // the hub's mark behind the service, never ahead, so this is a loss or something in between answering
@@ -776,34 +800,26 @@ impl Sender {
             self.trouble = Some(ServiceTrouble::NotConfirming);
             return Ok(self.back_off());
         }
-        // What the hub itself still holds on to stays queued (the service has it; it is sent again, as a
-        // duplicate, at the back-off's pace, until the agent lets it go).
-        let through = self
-            .hold_from
-            .map_or(carried, |from| carried.min(from.saturating_sub(1)));
-        if through < carried {
-            if through > before {
-                let acked = self.outbox.ack(through);
-                self.or_back_off(acked)?;
-            }
-            return Ok(self.back_off());
-        }
-        match self.outbox.ack(through) {
-            Ok(()) => {}
-            Err(OutboxError::AckAhead) => return Ok(self.halt(HaltReason::Ahead)),
-            Err(error) => {
-                // The service confirmed, the hub could not record it (a full disk, a read-only file system, a held
-                // lock): a failure like any other. Sending the same batch again at once only meets the same disk.
-                self.back_off();
-                return Err(error.into());
-            }
-        }
-        let after = self.or_back_off(self.outbox.last_acked())?;
-        if after <= before {
+        if carried <= before {
             // Events went and the service confirmed none of them: whatever it is, sending the same batch again at
             // once will not change it.
             self.trouble = Some(ServiceTrouble::NotConfirming);
             return Ok(self.back_off());
+        }
+        // What the hub itself still holds on to stays queued, confirmed (`confirmed_through`) and not sent again;
+        // it leaves the queue when the agent lets it go (`hold_acks_from`). A success all the same.
+        let previous = std::mem::replace(&mut self.confirmed_through, carried);
+        match self.remove_confirmed() {
+            Ok(()) => {}
+            Err(OutboxError::AckAhead) => return Ok(self.halt(HaltReason::Ahead)),
+            Err(error) => {
+                // The service confirmed, the hub could not record it (a full disk, a read-only file system, a held
+                // lock): a failure like any other, and the confirmation is not taken. Sending the same batch again
+                // at once only meets the same disk.
+                self.confirmed_through = previous;
+                self.back_off();
+                return Err(error.into());
+            }
         }
         self.failures = 0;
         self.batch_limit = grown(self.batch_limit);
