@@ -16,6 +16,14 @@ Its events are the events a hub signed, unchanged.
 - Each line is one JSON object; there are no empty lines and no comments.
 - The first line is the header (section 2); every further line is one event (section 3).
 
+Lines end with LF only.
+A line starts with the `{` of its object and ends with its `}`: a CR, or any other whitespace before or after the object, breaks the line (it fails `form`, and for the first line the header is unreadable).
+Whitespace between the tokens inside the object is JSON's and is accepted.
+
+An empty line is a line.
+As the first line it is an unreadable header; as any later line, including an empty line after the LF that ends the last event, it is an event line that fails `form` (section 5).
+The LF that ends the last line is not followed by a line: a file that ends with exactly one LF has no empty line.
+
 A producer writes each line as compact JSON with object keys sorted by code point, as the vectors do.
 A verifier does not require that form: the signature covers the canonical form of protocol section 2, which it rebuilds itself.
 
@@ -37,8 +45,8 @@ Each key object has exactly two fields:
 
 | Field | Rule |
 |---|---|
-| `keyId` | a key id of protocol section 3; no two key objects share one |
-| `publicKey` | public key text of protocol section 3: `ed25519:` and 43 base64url characters, without padding, that decode to 32 bytes |
+| `keyId` | a key id of protocol section 3, matched in full (nothing before or after the pattern, not even a line feed); no two key objects share one |
+| `publicKey` | public key text of protocol section 3: `ed25519:` and 43 base64url characters, without padding, that decode to 32 bytes, in the canonical spelling (section 4) |
 
 `keys` lists the keys the source has on record.
 Which key was valid at which moment is not part of version 1 (section 7).
@@ -55,9 +63,9 @@ Each event line is one event in the wire form of protocol section 7, as the hub 
 |---|---|
 | `sourceSeq` | integer, 1 to 2^53 - 1 |
 | `kind` | a non-empty string |
-| `observedAt` | the form of protocol section 4: `YYYY-MM-DDTHH:MM:SS.mmmZ`, a moment that exists in the proleptic Gregorian calendar, hours 00 to 23, minutes and seconds 00 to 59 |
+| `observedAt` | the form of protocol section 4: `YYYY-MM-DDTHH:MM:SS.mmmZ`, a moment that exists in the proleptic Gregorian calendar, hours 00 to 23, minutes and seconds 00 to 59; the form is checked, not whether the time is plausible, so the year `0000` is accepted |
 | `attributes` | an object |
-| `signature` | `ed25519:<keyId>:<signature>`: a key id of protocol section 3, and 86 base64url characters, without padding, that decode to 64 bytes |
+| `signature` | `ed25519:<keyId>:<signature>`: a key id of protocol section 3, matched in full, and 86 base64url characters, without padding, that decode to 64 bytes, in the canonical spelling (section 4) |
 | `pii` | an object |
 | `piiNonce` | 64 lowercase hex characters |
 | `piiCommitment` | 64 lowercase hex characters |
@@ -72,6 +80,7 @@ The personal-data fields come in exactly one of three shapes:
 | none | none of the three | the event has no personal data |
 
 Any other combination, and any other field, breaks the line.
+An event without personal data omits `piiCommitment` (protocol section 4): an explicit `"piiCommitment": null` is present, so it is none of the three shapes and the line fails `form`.
 
 A redacted event is not a fault.
 Only the commitment is signed (protocol section 6), so its signature stays verifiable after the personal data is gone.
@@ -86,7 +95,9 @@ These apply to every value on every line, the header included, at every depth:
 - an integer is a JSON number written as an optional `-` and digits, with no fraction and no exponent, within ±(2^53 - 1); any other number (`1.5`, `1.0`, `1e3`) is a floating-point number and is refused;
 - object keys are non-empty printable ASCII (`0x20` to `0x7E`);
 - text is valid Unicode: a lone surrogate, written as a `\u` escape, is refused;
-- no object has the same key twice.
+- no object has the same key twice;
+- nothing is nested deeper than 64 levels: the line's object is level 1, and each object or array inside it adds one level, so a line may hold objects and arrays nested 63 deep below its own object; a deeper line breaks the rule however deep the verifier's parser could read it;
+- base64url text (public keys and signatures) is accepted only in its canonical spelling: no padding, and the unused low bits of the last character are zero, so that every key and signature has exactly one spelling.
 
 A floating-point number is valid JSON, but it has more than one spelling and so has no place in a signed payload.
 A verifier refuses it and does not round it.
@@ -98,15 +109,17 @@ Each event line is judged by each check that can be evaluated for it, as follows
 
 ### `form`
 
-The line is valid UTF-8, one JSON object, and keeps the rules of sections 3 and 4.
+The line is valid UTF-8, one JSON object, and keeps the rules of sections 1, 3 and 4.
 
-A line that fails `form` is not evaluated by `key`, `signature` or `commitment`.
-For `sequence` it counts as the event that occupies the next expected number (previous + 1, or `fromSeq` for the first line), and nothing more: it justifies no jump.
+A line that fails `form` is evaluated by no other check except `sequence`, and there only as follows.
+It takes the next expected number (previous + 1, or `fromSeq` for the first line), whatever `sourceSeq` it may contain, and nothing more: it justifies no jump, and its kind and attributes are not read.
+It passes `sequence` unless that number is greater than `toSeq`, in which case it fails `sequence` too.
 This keeps the result independent of how far a verifier could read a broken line.
+An empty line after the last event (section 1) is such a line: it fails `form`, and also `sequence` when its number runs past `toSeq`.
 
 ### `key`
 
-The key id named in `signature` is the `keyId` of a key object in the header.
+The key id named in `signature` is, in full, the `keyId` of a key object in the header.
 
 An event that fails `key` is not evaluated by `signature`.
 
@@ -114,7 +127,16 @@ An event that fails `key` is not evaluated by `signature`.
 
 The signature verifies, under the public key the header gives for that key id, over the message of protocol section 4.
 The message is built from the header's `sourceId` and the event's `sourceSeq`, `kind`, `observedAt`, `attributes` and `piiCommitment` (`null` when the event has none).
-Verification follows RFC 8032 section 5.1.7; a signature whose `S` is not below the group order is refused.
+RFC 8032 section 5.1.7 allows two group equations that disagree on some crafted signatures; this check uses the cofactorless one, as the service and the common libraries do:
+
+1. Decode the 32 public key bytes `A` as in RFC 8032 section 5.1.3: a `y` that is not below p, or a `y` for which no point exists, fails the check.
+2. Read `S` from the last 32 signature bytes as a little-endian integer; an `S` that is not below the group order L fails the check.
+3. Compute `k` = SHA-512(`R` || `A` || message) mod L, where `R` is the first 32 signature bytes and `A` the public key bytes as given.
+4. Compute R' = [S]B - [k]A.
+5. The check passes only when the encoding of R' (RFC 8032 section 5.1.2) is byte for byte equal to `R`. `R` is never decoded, so a non-canonical or non-decodable `R` fails.
+
+A public key of small order is not refused.
+Such a key lets anyone produce signatures that pass; the defence is the comparison of each key's fingerprint with the registration record (section 7).
 
 ### `sequence`
 
@@ -128,8 +150,10 @@ An event with number `s` passes when one of these holds:
 
 The rules of the two sequence kinds of protocol section 8:
 
-- `site_source.gap_declared`: `attributes.fromSeq` and `attributes.toSeq` are integers, `toSeq` equals `s` - 1, `fromSeq` is at most `toSeq`, and, unless it is the first event, `fromSeq` equals `previous` + 1.
+- `site_source.gap_declared`: `attributes.fromSeq` and `attributes.toSeq` are integers, `toSeq` equals `s` - 1, `fromSeq` is at least 1 and at most `toSeq`, and, unless it is the first event, `fromSeq` equals `previous` + 1.
 - `site_source.reset`: `attributes.lastAckedSeq` is an integer equal to `s` - 1.
+
+An attribute these rules read that is missing or is not an integer makes the rule fail, so the event fails `sequence`; it does not fail `form`, which judges no attribute against its kind (section 3).
 
 An event whose number is greater than `toSeq` fails.
 After the last line, `previous` must equal `toSeq`; otherwise the check fails at the number `previous` + 1 (at `fromSeq` when there is no event line).

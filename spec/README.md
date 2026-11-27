@@ -8,7 +8,9 @@ Licence: Apache-2.0 ([`LICENSE`](LICENSE)), so that anyone may build a compatibl
 | [`protocol.md`](protocol.md) | What a hub sends, how it signs it, what the service answers |
 | [`vectors/signing.json`](vectors/signing.json) | Canonical JSON cases, signed events, a signed request and a personal-data commitment |
 | [`export.md`](export.md) | The evidence export: a file an auditor can check without SpaceGoat's software, and the checks a verifier runs |
-| [`vectors/export/`](vectors/export/) | Ten export files, one valid and the others each broken in one way, and the expected result for each in `expected.json` |
+| [`vectors/export/`](vectors/export/) | Ten export files, four valid (one plain, one with redacted personal data, one with a declared gap, one with a reset) and six each broken in one way, and the expected result for each in `expected.json` |
+| [`verify/spacegoat_verify.py`](verify/spacegoat_verify.py) | A reference verifier for exports in one file of standard-library Python, written from these documents alone; see [`verify/README.md`](verify/README.md) |
+| [`verify/test_verify.py`](verify/test_verify.py) | Its tests: every signing vector, RFC 8032 tests 1 to 3, every export vector and malformed input |
 
 ## The vectors
 

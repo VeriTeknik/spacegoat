@@ -35,6 +35,11 @@ jobs:
           done
           jq empty spec/vectors/export/expected.json
           echo "ok spec/vectors/export/expected.json"
+      # The reference verifier is plain standard-library Python; the runner's python3 is enough.
+      - name: Reference verifier tests
+        run: python3 -m unittest spec/verify/test_verify.py
+      - name: Reference verifier agrees with every export vector
+        run: python3 spec/verify/spacegoat_verify.py --self-test spec/vectors/export
 
   hub:
     name: Hub agent

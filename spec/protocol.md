@@ -25,6 +25,7 @@ Everything that is signed is signed over canonical JSON:
 - object keys sorted by code point, at every level;
 - no whitespace: separators are `,` and `:`;
 - text is UTF-8 and is not escaped to ASCII (`"ş"` stays `"ş"`); `"` and `\` are escaped, `/` is not;
+- the control characters U+0000 to U+001F are escaped, the short way where JSON has one (`\b`, `\t`, `\n`, `\f`, `\r`) and otherwise as `\u00xx` with lowercase hex (`\u001f`); nothing else is escaped (DEL, U+2028 and U+2029 stay as they are);
 - the only values are strings, integers, booleans, `null`, objects and arrays;
 - integers stay within ±(2^53 - 1);
 - object keys are non-empty printable ASCII;
@@ -63,7 +64,7 @@ Each event is signed over:
 - `observedAt` is UTC with millisecond precision and a literal `Z`: `2026-11-24T10:00:00.123Z`. No offset form is accepted.
 - `observedAt` must be within 2^31 - 1 milliseconds (about 24.8 days) of the moment the service receives the event, in either direction. An event outside that window is refused with `schema` (section 10).
 - `attributes` carries no personal data (section 6).
-- `piiCommitment` is `null` when the event has no personal data.
+- `piiCommitment` is `null` when the event has no personal data. That `null` is part of the signed message only: on the wire (section 7) and in an export, an event without personal data omits `piiCommitment`.
 
 The service stores the signature with the event and can verify it again at any later time from the stored fields.
 
