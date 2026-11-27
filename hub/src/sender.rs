@@ -9,11 +9,13 @@
 //! What it guarantees:
 //! - an event is forgotten only after the service confirmed it (`200` with `accepted`, `duplicates` and `lastSeq`,
 //!   all integers from 0 to 2^53 - 1, `accepted` and `duplicates` adding up to the events sent); any other `200` (a
-//!   proxy page, a captive portal) confirms nothing. Only an answer to a request that carried events confirms them:
-//!   a heartbeat's `lastSeq` says where the service stands, and the events queued here go in the next request, where
-//!   the service compares each with its record. A `200` to a batch that moves the confirmed mark nowhere is a
-//!   failure: it backs off rather than send the batch again at once. So is a confirmation the hub cannot record (its
-//!   storage fails): it backs off, and the `Err` says why;
+//!   proxy page, a captive portal) confirms nothing. Only an answer to a request that carried events confirms them,
+//!   and only those it carried, up to `lastSeq`: a heartbeat's `lastSeq` says where the service stands, and an event
+//!   above the request's last one goes in a later request, where the service compares it with its record. Counts
+//!   that say every event was taken with a `lastSeq` below the last one sent disagree, and confirm nothing. Events the
+//!   agent still holds (`hold_acks_from`) stay queued whatever is confirmed, with a back-off. A `200` to a batch that
+//!   moves the confirmed mark nowhere is a failure: it backs off rather than send the batch again at once. So is a
+//!   confirmation the hub cannot record (its storage fails): it backs off, and the `Err` says why;
 //! - a `lastSeq` below what the service once confirmed, to a heartbeat or a batch, confirms nothing and backs off
 //!   (`not_confirming`); the next such answer, with none at or above the mark between, means the service lost
 //!   events: it HALTS (`gap`), as `seq_gap` does;
@@ -354,6 +356,9 @@ pub struct Sender {
     /// The last confirming answer said the service holds less than it once confirmed: one more such answer, with
     /// none at or above the mark between, is a `gap`.
     lower_once: bool,
+    /// The first queued event the agent has not finished with (the pseudonym store has not taken what it reported):
+    /// it and those after it are not removed from the queue, whatever is confirmed.
+    hold_from: Option<u64>,
 }
 
 impl Sender {
@@ -389,6 +394,7 @@ impl Sender {
             reading: None,
             service_last_seq: None,
             lower_once: false,
+            hold_from: None,
         })
     }
 
@@ -468,6 +474,19 @@ impl Sender {
     /// The last sequence number the service said it holds; `None` before any confirmed answer.
     pub fn service_last_seq(&self) -> Option<u64> {
         self.service_last_seq
+    }
+
+    /// The agent found the last confirming answer below what this hub remembers as confirmed (`Agent::settle`): it
+    /// is treated as one that confirmed nothing, with the back-off of any such answer.
+    pub fn distrust_last_answer(&mut self) -> SendOutcome {
+        self.service_last_seq = None;
+        self.trouble = Some(ServiceTrouble::NotConfirming);
+        self.back_off()
+    }
+
+    /// Keep event `from` and those after it in the queue whatever is confirmed (`None`: no such event).
+    pub fn hold_acks_from(&mut self, from: Option<u64>) {
+        self.hold_from = from;
     }
 
     /// Forget where the service said it stands: an answer older than a failure the agent must not act on.
@@ -563,7 +582,13 @@ impl Sender {
         let error = answer.object.get("error").and_then(Value::as_str);
         let carried = count > 0;
         Ok(match (answer.status, error) {
-            (200, _) => self.confirmed(&answer.object, count)?,
+            (200, _) => {
+                let carried = count
+                    .checked_sub(1)
+                    .and_then(|last| events.get(last))
+                    .map(|event| event.seq);
+                self.confirmed(&answer.object, count, carried)?
+            }
             // The refusals below halt only a request that carried events: to a heartbeat, nothing was refused.
             // The service expects a number this hub has already been told was confirmed, and has forgotten: the
             // service lost events. A hub cannot send what it no longer has, and it does not invent a sequence.
@@ -672,7 +697,13 @@ impl Sender {
         })
     }
 
-    fn confirmed(&mut self, answer: &Map<String, Value>, sent: usize) -> Result<SendOutcome, SenderError> {
+    /// A `200` to a request that carried `sent` events, the last of them numbered `carried` (`None`: a heartbeat).
+    fn confirmed(
+        &mut self,
+        answer: &Map<String, Value>,
+        sent: usize,
+        carried: Option<u64>,
+    ) -> Result<SendOutcome, SenderError> {
         // A count the protocol's JSON cannot carry exactly (above 2^53 - 1) is no count: the answer is malformed.
         let field = |name: &str| {
             answer
@@ -737,7 +768,27 @@ impl Sender {
             self.last_success = Some(self.clock.wall_millis());
             return Ok(SendOutcome::Sent(0));
         }
-        match self.outbox.ack(last_seq) {
+        // Only what this request carried is removed, up to `lastSeq`: an event above it was never compared by the
+        // service, and goes in a later request that carries it. A `lastSeq` below the last event carried contradicts
+        // counts that say every event was taken: the two fields disagree, and neither is trusted.
+        let carried = carried.unwrap_or(0);
+        if last_seq < carried {
+            self.trouble = Some(ServiceTrouble::NotConfirming);
+            return Ok(self.back_off());
+        }
+        // What the hub itself still holds on to stays queued (the service has it; it is sent again, as a
+        // duplicate, at the back-off's pace, until the agent lets it go).
+        let through = self
+            .hold_from
+            .map_or(carried, |from| carried.min(from.saturating_sub(1)));
+        if through < carried {
+            if through > before {
+                let acked = self.outbox.ack(through);
+                self.or_back_off(acked)?;
+            }
+            return Ok(self.back_off());
+        }
+        match self.outbox.ack(through) {
             Ok(()) => {}
             Err(OutboxError::AckAhead) => return Ok(self.halt(HaltReason::Ahead)),
             Err(error) => {

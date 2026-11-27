@@ -204,7 +204,7 @@ A device with such an address starts as ephemeral; when the same address is seen
 
 | Status | Body | What the hub does |
 |---|---|---|
-| 200 | `{ "accepted": n, "duplicates": m, "lastSeq": k }` | Forgets everything up to `k` |
+| 200 | `{ "accepted": n, "duplicates": m, "lastSeq": k }` | Removes from its queue the events this request carried, up to `k` |
 | 400 | `{ "error": "schema" }` | Stops sending and shows the fault locally; the answer never says which field |
 | 401 | `{ "error": "unauthorized" }` | Shows the fault locally and tries again slowly (every five minutes) |
 | 409 | `{ "error": "seq_gap", "expectedSeq": k }` | Stops sending: the service lost events it had confirmed |
@@ -213,7 +213,7 @@ A device with such an address starts as ephemeral; when the same address is seen
 | 429 | `{ "error": "rate_limited" }` with `Retry-After` | Waits what `Retry-After` says, but never longer than its liveness interval (section 11) allows |
 | 503 | `{ "error": "unavailable" }` | Backs off and tries again |
 
-An answer to an empty request confirms no queued event: a hub removes an event from its queue only after an answer to a request that carried it.
+A hub removes from its queue only events the answered request carried, up to `lastSeq`: an answer to an empty request confirms no queued event, and an event above the request's last one is confirmed only by an answer to a request that carries it.
 An event the service has already accepted is counted in `duplicates` and changes nothing, so sending a batch again after a lost answer is always safe.
 The service compares a repeated event with the one it has on record; a different event under a number already used is a `replay_conflict`.
 

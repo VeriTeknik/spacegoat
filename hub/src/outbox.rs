@@ -462,10 +462,14 @@ impl Outbox {
         Ok(())
     }
 
-    /// A write that changes nothing (a counter rewritten as it is), to learn whether the queue takes writes now.
+    /// A committed write that leaves nothing behind, of the kinds a reset makes (`declare_reset`): a counter rewritten
+    /// as it is, and an event row stored and removed again. To learn whether the queue takes writes now. The row's
+    /// number (0) is one no event ever has.
     pub fn probe_write(&mut self) -> Result<(), OutboxError> {
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("UPDATE meta SET value = value WHERE key = 'last_acked'", [])?;
+        tx.execute("INSERT INTO events (seq, schema_version, body) VALUES (0, 0, '')", [])?;
+        tx.execute("DELETE FROM events WHERE seq = 0", [])?;
         tx.commit()?;
         Ok(())
     }
