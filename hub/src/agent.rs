@@ -13,12 +13,16 @@
 //!
 //! What it guarantees:
 //! - personal data (hardware address, name, IP) goes into the event's separate personal-data part and nowhere else:
-//!   not into the attributes, not into `agent.json`, not into `status()`, not into an error or a reported line;
+//!   not into the attributes, not into `agent.json`, not into `status()`, not into an error, a reported line or the
+//!   `Debug` form of a `Sighting`;
 //! - whatever an observer hands over is checked before it is signed: a signed event never changes, so one the service
 //!   would refuse would block the whole queue behind it. A field that does not fit is left out;
-//! - what was last reported about each device is kept in memory for the run, with the pseudonym store as its
-//!   persistence: a store write that fails after the event was appended is retried, and the event is not appended
-//!   again. A failure to capture or to store never keeps what is queued from being delivered;
+//! - what one round of capture produces is appended in one transaction (per `DEVICES_PER_COMMIT` devices), and what
+//!   was reported is recorded in the pseudonym store in one more, after it: an event is either stored with its round or
+//!   not at all, and one whose record could not be stored is not appended again (what was reported is kept in memory
+//!   for the run, and the store write is retried). A failure to capture or to store never keeps what is queued from
+//!   being delivered. A stored record that cannot be read counts as none: that device is announced again, and it is
+//!   said once;
 //! - the first request of a run is an empty heartbeat, even when events wait (protocol §11). Its answer gives the
 //!   service's clock and where the service stands in the sequence. The tick's clocks are read after it;
 //! - nothing is signed unless the hub's clock is trusted, and it is trusted only while there is a reading of the
@@ -31,18 +35,21 @@
 //!   answer it was (`service`), until the next confirming one;
 //! - an outbox that has never assigned a number (new, lost, or set aside as damaged) starts where the service and
 //!   `confirmed.json` say it must (`settle`): from 1 when neither has anything; a `site_source.reset` at the
-//!   service's number (`reinstall` when this hub remembers no confirmation, `queue_lost` when it does, or when its
-//!   mark cannot be understood); and a halt (`gap`) when the service holds less than it once confirmed. The hub
+//!   service's number (`reinstall` when this hub remembers no confirmation, `queue_lost` when it does, when its mark
+//!   cannot be understood, or when a person accepted the service's state with `resume --from-service`, then also
+//!   when the service holds nothing); and a halt (`gap`) when the service holds less than it once confirmed. The hub
 //!   never covers for a service that lost events;
 //! - a halt is written to `halt.json` and survives a restart: a halted agent makes no request at all, heartbeats
 //!   included, and produces no event until a person runs `spacegoat-hub resume`. A queue that grows while nothing can
 //!   be delivered only makes the eventual backlog older than the service will accept;
 //! - at most `MAX_PENDING_EVENTS` wait: beyond that the agent stops producing (`waitingFor: backlog`) and keeps
-//!   delivering, until fewer than half wait;
-//! - whenever the hub could not capture for more than `STOP_DECLARED_AFTER_SECONDS` (its clock not trusted, its
-//!   storage failing, halted, its backlog full), it says so once capture resumes, with one `site_source.input_lost`
-//!   (`capture_stopped`, `fromTime` only when the stop began at a trusted time). The mark lives in the outbox and
-//!   survives a restart; a shorter stop is not declared;
+//!   delivering, until fewer than half wait. After a restart it is full only if that many wait;
+//! - whenever the running hub could not capture for more than `STOP_DECLARED_AFTER_SECONDS` (its clock not trusted,
+//!   its storage failing, halted, its backlog full), it says so once capture resumes, with one
+//!   `site_source.input_lost` (`capture_stopped`, `fromTime` only when the stop began at a trusted time). The mark
+//!   lives in the outbox and survives a restart; a stop that spans a restart is judged long by trusted wall time from
+//!   its start (the restart's own downtime included), and a shorter stop is not declared. Time the hub was simply not
+//!   running is not declared;
 //! - while the last tick failed with a storage error, no keep-alive heartbeat goes out (it would say "alive, nothing
 //!   to report", which is not true then; the service's silence alert is the signal). Events already queued are
 //!   still delivered when the queue can be read;
@@ -50,23 +57,24 @@
 //!   the same sequence): it holds an exclusive lock on `agent.lock` while it runs, and a second agent refuses to
 //!   start. The kernel drops the lock when the process ends, however it ends;
 //! - a storage file that is not a database any more (`outbox.sqlite`, `pseudonyms.sqlite`) is set aside as
-//!   `<name>.damaged` and started anew, and said so; any other failure to open is an error. A name of the agent's
+//!   `<name>.damaged` and started anew, and said so; one a newer build wrote (its format version) is refused, as are
+//!   `halt.json` and `confirmed.json` of a newer version; any other failure to open is an error. A name of the agent's
 //!   own that holds a symbolic link or a directory is refused, by name, for a person to remove. A failure while
-//!   running is a `problem` in the status, never the end of the process (`run`);
+//!   running is a `problem` (its area) with a `cause` in the status, never the end of the process (`run`);
 //! - `run` reports each change of what the status says (halted, what it waits for, its problem) as one line, never
-//!   one per tick;
+//!   one per tick, and a state that flaps at most once per five minutes per kind of line; a halt is said at once;
 //! - the clocks are injected (`clock::Clock`) and `tick` never sleeps; `run` sleeps through an injected function and
 //!   measures every interval on the monotonic clock.
 //!
 //! The rule for devices whose identity keeps changing (protocol §9, the seven days) belongs to the real observers
 //! and is not in this version: an observer says whether a sighting is ephemeral.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read};
 use std::net::IpAddr;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -76,13 +84,13 @@ use serde_json::{Map, Value};
 
 use crate::clock::{self, Clock};
 use crate::config::Config;
-use crate::fsutil::{
-    create_temporary, current_uid, fsync_directory, non_file_kind, open_regular, private_file, write_own_file,
-};
+use crate::fsutil::{fsync_directory, is_temporary_of, non_file_kind, open_regular, private_file, write_own_file};
 use crate::keystore::{FileKeyStore, KeyStoreError};
-use crate::outbox::{Outbox, OutboxError, ResetReason, database_is_damaged};
-use crate::sender::{HaltReason, OriginError, Problem, SendOutcome, Sender, SenderError};
+use crate::outbox::{NewEvent, Outbox, OutboxError, ResetReason, database_is_damaged};
+use crate::sender::{self, HaltReason, OriginError, Problem, SendOutcome, Sender, SenderError};
 use crate::state::{Confirmed, Mark, Pseudonyms, StateError};
+use crate::statedir::{self, Access, StateDirError};
+use crate::storage::Cause;
 
 pub const DEVICE_CLASSES: [&str; 7] = ["ot", "printer", "user_device", "server", "network", "iot", "unknown"];
 pub const SEEN_EVERY_MS: i64 = 24 * 3_600 * 1_000;
@@ -95,15 +103,18 @@ pub const MAX_CLOCK_SKEW_SECONDS: i64 = 240;
 pub const TICK_SECONDS: u64 = 15;
 /// When this many events wait, the agent stops producing until fewer than half of them do.
 pub const MAX_PENDING_EVENTS: usize = 20_000;
-/// After a tick that failed, `run` waits this long before the next one, doubling, at most `TICK_BACKOFF_MAX_SECONDS`.
-pub const TICK_BACKOFF_FIRST_SECONDS: u64 = 5;
-pub const TICK_BACKOFF_MAX_SECONDS: u64 = 240;
 /// A stop in capture longer than this is declared (`site_source.input_lost`) when capture resumes.
 pub const STOP_DECLARED_AFTER_SECONDS: i64 = 300;
+/// The same line kind is reported at most once in this many seconds of monotonic time (a halt: always at once).
+pub const REPORT_EVERY_SECONDS: i64 = 300;
+/// At most this many devices' events go into one transaction of the outbox (and one of the pseudonym store).
+pub const DEVICES_PER_COMMIT: usize = 200;
 /// How often `run` looks at the stop flag while it waits.
 const STOP_POLL: Duration = Duration::from_millis(100);
 /// `agent.json` and `halt.json` are a few short fields; anything larger is not one, and is not read whole.
 const MAX_SMALL_FILE: u64 = 64 * 1024;
+/// The format of `halt.json` and `agent.json` this code writes (their `version` field).
+pub const SMALL_FILE_VERSION: u64 = 1;
 
 pub const KEY_FILE: &str = "hub.key";
 /// The id the key was generated under, beside it (`keystore::KEY_ID_SUFFIX`).
@@ -118,20 +129,17 @@ pub const LOCK_FILE: &str = "agent.lock";
 pub const DAMAGED_SUFFIX: &str = ".damaged";
 /// The names of the agent's own that must hold a regular file when they hold anything.
 pub const OWN_FILES: [&str; 5] = [STATUS_FILE, HALT_FILE, CONFIRMED_FILE, OUTBOX_FILE, PSEUDONYMS_FILE];
-
-/// The prefixes of this program's temporary files in the state directory (`fsutil::create_temporary`: the prefix and
-/// 32 lowercase hex characters). Only names of exactly that form are ever removed as leftovers.
-const TEMPORARY_PREFIXES: [&str; 6] = [
-    ".agent.json.",
-    ".confirmed.json.",
-    ".hub.key.",
-    ".hub.key.id.",
-    ".halt.json.",
-    WRITE_CHECK_PREFIX,
+/// Every name this program writes through a temporary file in the state directory (`fsutil::write_atomic`, the key's
+/// installation, the state directory's probe). The one list: the temporary names are made from these
+/// (`fsutil::temporary_prefix`), and only names of exactly that form are ever removed as leftovers.
+pub const TEMPORARY_NAMES: [&str; 6] = [
+    STATUS_FILE,
+    CONFIRMED_FILE,
+    HALT_FILE,
+    KEY_FILE,
+    KEY_ID_FILE,
+    statedir::PROBE_NAME,
 ];
-/// The file `check_state_dir` creates for a moment to learn whether this process can write the directory.
-const WRITE_CHECK_PREFIX: &str = ".owner-check.";
-const TEMPORARY_RANDOM_HEX: usize = 32;
 
 /// The agent's clocks, shared with the sender.
 pub type SharedClock = Arc<dyn Clock>;
@@ -141,7 +149,10 @@ pub type SharedClock = Arc<dyn Clock>;
 ///
 /// An `ephemeral` sighting is a device whose identity keeps changing: it is counted in its segment's snapshot and
 /// nothing else is done with it (no event, no reference, nothing kept).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Its `Debug` form shows the class and whether it is ephemeral; the identity, the segment, the hardware address,
+/// the name and the IP address are personal or local and are shown as `<redacted>` (or `None`).
+#[derive(Clone, PartialEq, Eq)]
 pub struct Sighting {
     pub identity: String,
     pub segment: String,
@@ -150,6 +161,21 @@ pub struct Sighting {
     pub hostname: Option<String>,
     pub ip: Option<String>,
     pub ephemeral: bool,
+}
+
+impl fmt::Debug for Sighting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let hidden = |value: &Option<String>| value.as_ref().map(|_| "<redacted>");
+        f.debug_struct("Sighting")
+            .field("identity", &"<redacted>")
+            .field("segment", &"<redacted>")
+            .field("device_class", &self.device_class)
+            .field("mac", &hidden(&self.mac))
+            .field("hostname", &hidden(&self.hostname))
+            .field("ip", &hidden(&self.ip))
+            .field("ephemeral", &self.ephemeral)
+            .finish()
+    }
 }
 
 /// What is on the network right now. A real listener implements this; so does the simulation.
@@ -195,12 +221,15 @@ pub fn halt_meaning(reason: HaltReason) -> &'static str {
 
 #[derive(Debug)]
 pub enum AgentError {
-    /// The state directory is missing, not a directory, open to other users, another user's, or not writable.
-    StateDirectory(PathBuf, &'static str),
+    /// The state directory is not one the hub may keep its key and records in (`statedir::check`).
+    StateDirectory(StateDirError),
     /// Another agent holds the state directory's lock.
     AlreadyRunning(PathBuf),
     /// A name of the agent's own (`OWN_FILES`) holds something other than a regular file: the name, and what it holds.
     NotAFile(&'static str, &'static str),
+    /// A small file of the agent's own (`halt.json`, `confirmed.json`) was written by a newer version: its name and
+    /// the version it records.
+    NewerFormat(&'static str, u64),
     /// The configuration's key id is not the one the key was generated under.
     KeyIdMismatch {
         configured: String,
@@ -217,49 +246,82 @@ pub enum AgentError {
     Sender(SenderError),
     /// A file of the agent's own, by name, and what went wrong with it.
     Io(&'static str, io::Error),
+    /// A database of the agent's own, by name, that could not be looked at.
+    Sqlite(&'static str, rusqlite::Error),
 }
 
 impl AgentError {
-    /// A short reason with no values in it (no path, no content): what the status shows as its `problem`.
+    /// A short reason with no values in it (no path, no content): what the status shows as its `problem`. It names
+    /// the area the failure is in: the file it happened to, or the part of the hub.
     pub fn problem(&self) -> &'static str {
         match self {
             Self::Outbox(_) | Self::Sender(SenderError::Outbox(_)) => "outbox_failed",
             Self::Sender(SenderError::Compress(_)) => "compress_failed",
             Self::State(_) => "pseudonyms_failed",
-            Self::Io(CONFIRMED_FILE, _) => "confirmed_failed",
-            Self::Io(HALT_FILE, _) => "halt_file_failed",
-            Self::Io(STATUS_FILE, _) => "status_file_failed",
-            Self::Io(..) | Self::NotAFile(..) | Self::NotAGap(_) | Self::QueueHoldsNumbers => "state_directory_failed",
-            Self::StateDirectory(..) | Self::AlreadyRunning(_) => "state_directory_failed",
+            Self::Io(name, _) | Self::NewerFormat(name, _) | Self::Sqlite(name, _) => file_area(name),
+            Self::StateDirectory(_) | Self::AlreadyRunning(_) | Self::NotAFile(..) => "state_directory_failed",
+            Self::NotAGap(_) | Self::QueueHoldsNumbers => "resume_refused",
             Self::Key(_) | Self::KeyIdMismatch { .. } => "key_failed",
             Self::Origin(_) => "configuration_failed",
         }
     }
 
+    /// What kind of storage failure it is, for the errors that are one (`storage::Cause`); `None` for the others.
+    pub fn cause(&self) -> Option<Cause> {
+        match self {
+            Self::Outbox(error) | Self::Sender(SenderError::Outbox(error)) => Some(error.cause()),
+            Self::Sender(SenderError::Compress(error)) | Self::Io(_, error) => Some(Cause::of_io(error)),
+            Self::State(error) => Some(error.cause()),
+            Self::Sqlite(_, error) => Some(Cause::of_sqlite(error)),
+            _ => None,
+        }
+    }
+
     /// Whether the error means the command could not start (the state directory, a file of its own that is not a
-    /// file, the key, the lock), as opposed to having run and failed.
-    pub fn is_start_refusal(&self) -> bool {
+    /// file or a newer version's, the key, the configuration, the lock), as opposed to having run and failed.
+    pub fn could_not_start(&self) -> bool {
         matches!(
             self,
-            Self::StateDirectory(..)
+            Self::StateDirectory(_)
                 | Self::AlreadyRunning(_)
                 | Self::NotAFile(..)
+                | Self::NewerFormat(..)
                 | Self::KeyIdMismatch { .. }
                 | Self::Key(_)
                 | Self::Origin(_)
+                | Self::Outbox(OutboxError::Format(_))
+                | Self::State(StateError::Format(_))
         )
+    }
+}
+
+/// The status's area for a failure at a file of the agent's own.
+fn file_area(name: &str) -> &'static str {
+    match name {
+        CONFIRMED_FILE => "confirmed_failed",
+        HALT_FILE => "halt_file_failed",
+        STATUS_FILE => "status_file_failed",
+        OUTBOX_FILE => "outbox_failed",
+        PSEUDONYMS_FILE => "pseudonyms_failed",
+        _ => "state_directory_failed",
     }
 }
 
 impl fmt::Display for AgentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::StateDirectory(path, why) => write!(f, "state directory {}: {why}", path.display()),
+            Self::StateDirectory(error) => error.fmt(f),
             Self::AlreadyRunning(path) => write!(f, "another agent is already running on {}", path.display()),
             Self::NotAFile(name, kind) => write!(
                 f,
                 "{name} in the state directory is {kind}, not a file the hub wrote; a person must look at it and \
                  remove it by hand"
+            ),
+            Self::NewerFormat(name, version) => write!(
+                f,
+                "{name} was written by a newer version of spacegoat-hub (version {version}; this one writes \
+                 {SMALL_FILE_VERSION}) and is not read as anything else: run that version again, or a person must \
+                 look at it"
             ),
             Self::KeyIdMismatch { configured, stored } => write!(
                 f,
@@ -281,6 +343,7 @@ impl fmt::Display for AgentError {
             Self::State(error) => error.fmt(f),
             Self::Sender(error) => error.fmt(f),
             Self::Io(what, error) => write!(f, "{what}: {error}"),
+            Self::Sqlite(what, error) => write!(f, "{what}: {error}"),
         }
     }
 }
@@ -288,12 +351,14 @@ impl fmt::Display for AgentError {
 impl std::error::Error for AgentError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::StateDirectory(error) => Some(error),
             Self::Key(error) => Some(error),
             Self::Origin(error) => Some(error),
             Self::Outbox(error) => Some(error),
             Self::State(error) => Some(error),
             Self::Sender(error) => Some(error),
             Self::Io(_, error) => Some(error),
+            Self::Sqlite(_, error) => Some(error),
             _ => None,
         }
     }
@@ -317,6 +382,12 @@ impl From<SenderError> for AgentError {
     }
 }
 
+impl From<StateDirError> for AgentError {
+    fn from(error: StateDirError) -> Self {
+        Self::StateDirectory(error)
+    }
+}
+
 /// A halt as `halt.json` records it: the reason (`HaltReason::as_str`) and when, if the clock could say.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedHalt {
@@ -337,7 +408,10 @@ pub struct Status {
     pub waiting_for: Option<String>,
     /// Why the last request got no confirming answer (`sender::ServiceTrouble::as_text`), until one does.
     pub service: Option<String>,
+    /// The area of the hub's own trouble (`AgentError::problem`, or what opening set right).
     pub problem: Option<String>,
+    /// Its cause, when it is a storage failure (`storage::Cause::as_str`).
+    pub cause: Option<String>,
     /// While halted: the command that clears the halt once the fault is fixed.
     pub resume: Option<String>,
 }
@@ -352,7 +426,7 @@ impl Status {
         format!(
             "{{\n  \"sourceId\": {},\n  \"keyId\": {},\n  \"lastAssignedSeq\": {},\n  \"lastAckedSeq\": {},\n  \
              \"pending\": {},\n  \"halted\": {},\n  \"haltedAt\": {},\n  \"waitingFor\": {},\n  \"service\": {},\n  \
-             \"problem\": {},\n  \"resume\": {}\n}}",
+             \"problem\": {},\n  \"cause\": {},\n  \"resume\": {}\n}}",
             text(Some(&self.source_id)),
             text(Some(&self.key_id)),
             self.last_assigned_seq,
@@ -363,18 +437,20 @@ impl Status {
             text(self.waiting_for.as_deref()),
             text(self.service.as_deref()),
             text(self.problem.as_deref()),
+            text(self.cause.as_deref()),
             text(self.resume.as_deref()),
         )
     }
 }
 
-/// What the agent last saved in `agent.json`: why it is waiting, the kind of answer the service last gave, and its
-/// problem.
+/// What the agent last saved in `agent.json`: why it is waiting, the kind of answer the service last gave, its
+/// problem and that problem's cause.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SavedStatus {
     pub waiting_for: Option<String>,
     pub service: Option<String>,
     pub problem: Option<String>,
+    pub cause: Option<String>,
 }
 
 /// The status from its parts (the running agent's, or what `status` reads off the disk). `resume_command` is how
@@ -403,6 +479,7 @@ pub fn read_status(
         waiting_for: saved.waiting_for,
         service: saved.service,
         problem: saved.problem,
+        cause: saved.cause,
         resume: is_halted.then(|| resume_command.to_owned()),
     }
 }
@@ -423,35 +500,51 @@ fn read_small_object(path: &Path) -> io::Result<Option<Map<String, Value>>> {
     })
 }
 
-/// (waitingFor, service, problem) as the agent last saved them in `agent.json`.
+/// (waitingFor, service, problem, cause) as the agent last saved them in `agent.json`. The file is advisory: one of
+/// another version, or that cannot be understood, says nothing (and the agent writes it anew).
 pub fn read_saved_status(state_dir: &Path) -> io::Result<SavedStatus> {
     let Some(saved) = read_small_object(&state_dir.join(STATUS_FILE))? else {
         return Ok(SavedStatus::default());
     };
+    if saved.get("version").and_then(Value::as_u64) != Some(SMALL_FILE_VERSION) {
+        return Ok(SavedStatus::default());
+    }
     let text = |name: &str| saved.get(name).and_then(Value::as_str).map(str::to_owned);
     Ok(SavedStatus {
         waiting_for: text("waitingFor"),
         service: text("service"),
         problem: text("problem"),
+        cause: text("cause"),
     })
 }
 
-/// The halt recorded in `halt.json`, if there is one. A file that is there but unreadable as JSON is still a halt
-/// (reason `unknown`): a halt is cleared by a person, never by damage.
-pub fn read_halt(state_dir: &Path) -> io::Result<Option<RecordedHalt>> {
+/// The halt recorded in `halt.json`, if there is one. A file that is there but cannot be understood is still a halt
+/// (reason `unknown`): a halt is cleared by a person, never by damage. One a newer version wrote is refused.
+pub fn read_halt(state_dir: &Path) -> Result<Option<RecordedHalt>, AgentError> {
     let path = state_dir.join(HALT_FILE);
     if let Err(error) = std::fs::symlink_metadata(&path) {
         return if error.kind() == io::ErrorKind::NotFound {
             Ok(None)
         } else {
-            Err(error)
+            Err(AgentError::Io(HALT_FILE, error))
         };
     }
-    let saved = read_small_object(&path)?.unwrap_or_default();
-    let reason = saved.get("reason").and_then(Value::as_str);
+    let saved = read_small_object(&path)
+        .map_err(|error| AgentError::Io(HALT_FILE, error))?
+        .unwrap_or_default();
+    let version = saved.get("version").and_then(Value::as_u64);
+    if let Some(newer) = version.filter(|version| *version > SMALL_FILE_VERSION) {
+        return Err(AgentError::NewerFormat(HALT_FILE, newer));
+    }
+    let understood = version == Some(SMALL_FILE_VERSION);
+    let reason = saved.get("reason").and_then(Value::as_str).filter(|_| understood);
     Ok(Some(RecordedHalt {
         reason: HaltReason::from_text(reason.unwrap_or_default()).as_str().to_owned(),
-        at: saved.get("at").and_then(Value::as_str).map(str::to_owned),
+        at: saved
+            .get("at")
+            .and_then(Value::as_str)
+            .filter(|_| understood)
+            .map(str::to_owned),
     }))
 }
 
@@ -459,25 +552,24 @@ fn write_halt(state_dir: &Path, reason: HaltReason, wall_millis: i64) -> io::Res
     let at = clock::observed_at_text(wall_millis)
         .filter(|_| clock::clock_is_set(wall_millis))
         .map_or(Value::Null, Value::from);
-    let text = format!("{{\"reason\": {}, \"at\": {}}}", Value::from(reason.as_str()), at);
+    let text = format!(
+        "{{\"version\": {SMALL_FILE_VERSION}, \"reason\": {}, \"at\": {}}}",
+        Value::from(reason.as_str()),
+        at
+    );
     write_own_file(&state_dir.join(HALT_FILE), text.as_bytes())
 }
 
-/// `agent.json`'s text: why the agent is halted or waiting, the kind of answer the service last gave, its problem,
-/// and nothing else.
-fn status_file_text(
-    halted: Option<&str>,
-    waiting_for: Option<&str>,
-    service: Option<&str>,
-    problem: Option<&str>,
-) -> String {
-    let text = |value: Option<&str>| value.map_or(Value::Null, Value::from).to_string();
+/// `agent.json`'s text: why the agent is waiting, the kind of answer the service last gave, its problem and its
+/// cause, and nothing else. The halt is not repeated here: `halt.json` is the one record of it.
+fn status_file_text(saved: &SavedStatus) -> String {
+    let text = |value: &Option<String>| value.as_deref().map_or(Value::Null, Value::from).to_string();
     format!(
-        "{{\"halted\": {}, \"waitingFor\": {}, \"service\": {}, \"problem\": {}}}",
-        text(halted),
-        text(waiting_for),
-        text(service),
-        text(problem),
+        "{{\"version\": {SMALL_FILE_VERSION}, \"waitingFor\": {}, \"service\": {}, \"problem\": {}, \"cause\": {}}}",
+        text(&saved.waiting_for),
+        text(&saved.service),
+        text(&saved.problem),
+        text(&saved.cause),
     )
 }
 
@@ -492,13 +584,20 @@ pub fn check_own_files(state_dir: &Path) -> Result<(), AgentError> {
     Ok(())
 }
 
+/// Check the state directory as `access` needs it (`statedir::check`, the check `keygen` makes too).
+pub fn check_state_dir(state_dir: &Path, access: Access, expected_owner: Option<u32>) -> Result<(), AgentError> {
+    statedir::check(state_dir, access, expected_owner, &state_dir.join(KEY_FILE))?;
+    Ok(())
+}
+
 /// What `resume` is asked to do beyond clearing the halt.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ResumeOptions {
     /// The user the state directory must belong to (tests); by default the user this process creates files as.
     pub expected_owner: Option<u32>,
-    /// Also set the confirmed mark to 0, so that the hub takes the service's number as its starting point at its
-    /// next greeting: the way out of a `gap` halt, for an outbox that has never assigned a number.
+    /// Also record that the hub takes the service's state as its starting point (`Mark::AcceptService`): at its next
+    /// greeting it declares a lost queue at the service's number. The way out of a `gap` halt, for an outbox that
+    /// has never assigned a number.
     pub from_service: bool,
 }
 
@@ -514,8 +613,10 @@ pub fn resume(config: &Config, expected_owner: Option<u32>) -> Result<Option<Rec
 
 /// `resume` with its options, and `remove` as the way `halt.json` is removed (tests make it fail).
 ///
-/// The order: `agent.json` is rewritten first (it no longer says halted), then `halt.json` is removed. If removing
-/// fails the hub is still halted (`halt.json` is what decides), and the error says so.
+/// The order: everything is checked first; `halt.json` is removed (and the directory synced); only then, with
+/// `from_service`, is the confirmed mark replaced, the one step that cannot be taken back. If removing fails, the hub
+/// is still halted and nothing else changed. If the mark cannot be written after the halt was cleared, the old mark
+/// is still there: the hub halts again with `gap` at its next start, and `resume --from-service` can be run again.
 #[doc(hidden)]
 pub fn resume_with(
     config: &Config,
@@ -523,12 +624,13 @@ pub fn resume_with(
     remove: &dyn Fn(&Path) -> io::Result<()>,
 ) -> Result<Option<RecordedHalt>, AgentError> {
     let state_dir = &config.state_dir;
-    check_state_dir(state_dir, options.expected_owner, true)?;
+    check_state_dir(state_dir, Access::Write, options.expected_owner)?;
     check_own_files(state_dir)?;
     let lock = lock_state_dir(state_dir)?;
-    let Some(halt) = read_halt(state_dir).map_err(|error| AgentError::Io(HALT_FILE, error))? else {
+    let Some(halt) = read_halt(state_dir)? else {
         return Ok(None);
     };
+    let confirmed = Confirmed::new(state_dir.join(CONFIRMED_FILE), &config.source_id);
     if options.from_service {
         if halt.reason != HaltReason::Gap.as_str() {
             return Err(AgentError::NotAGap(halt.reason));
@@ -537,21 +639,20 @@ pub fn resume_with(
         if assigned != 0 {
             return Err(AgentError::QueueHoldsNumbers);
         }
-        Confirmed::new(state_dir.join(CONFIRMED_FILE), &config.source_id)
-            .replace(0)
-            .map_err(|error| AgentError::Io(CONFIRMED_FILE, error))?;
+        if let Mark::Newer(version) = confirmed
+            .read()
+            .map_err(|error| AgentError::Io(CONFIRMED_FILE, error))?
+        {
+            return Err(AgentError::NewerFormat(CONFIRMED_FILE, version));
+        }
     }
-    let saved = read_saved_status(state_dir).map_err(|error| AgentError::Io(STATUS_FILE, error))?;
-    let text = status_file_text(
-        None,
-        saved.waiting_for.as_deref(),
-        saved.service.as_deref(),
-        saved.problem.as_deref(),
-    );
-    write_own_file(&state_dir.join(STATUS_FILE), text.as_bytes())
-        .map_err(|error| AgentError::Io(STATUS_FILE, error))?;
     remove(&state_dir.join(HALT_FILE)).map_err(|error| AgentError::Io(HALT_FILE, error))?;
     fsync_directory(state_dir).map_err(|error| AgentError::Io(HALT_FILE, error))?;
+    if options.from_service {
+        confirmed
+            .accept_service()
+            .map_err(|error| AgentError::Io(CONFIRMED_FILE, error))?;
+    }
     drop(lock);
     Ok(Some(halt))
 }
@@ -587,8 +688,35 @@ struct CaptureStop {
 /// A reference's scope and local identity: the key of what was last reported about it.
 type Subject = (String, String);
 
+/// What the hub's own trouble is: the area (`AgentError::problem`) and, for a storage failure, its cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OwnProblem {
+    area: &'static str,
+    cause: Option<Cause>,
+}
+
+impl OwnProblem {
+    fn of(error: &AgentError) -> Self {
+        Self {
+            area: error.problem(),
+            cause: error.cause(),
+        }
+    }
+}
+
+/// One event a round of capture is about to append, and what is recorded about its subject once it is stored.
+struct Planned {
+    kind: &'static str,
+    attributes: Map<String, Value>,
+    pii: Option<Map<String, Value>>,
+    subject: Subject,
+    facts: Map<String, Value>,
+}
+
 /// What `run` prints when nothing is wrong: the state a healthy run starts from, so it says nothing.
 const RUNNING: &str = "running normally";
+/// The kind of a halt's line: reported at once, always.
+const HALTED_KIND: &str = "halted";
 
 pub struct Agent {
     config: Config,
@@ -606,8 +734,10 @@ pub struct Agent {
     settled: bool,
     /// True while `halt.json` holds the sender's halt.
     halt_saved: bool,
-    /// What went wrong in the last tick (a short reason, no values).
-    problem: Option<&'static str>,
+    /// What went wrong in the last tick.
+    problem: Option<OwnProblem>,
+    /// The confirmed mark could not be written and has not been since: its problem stays until it is.
+    confirmed_behind: Option<OwnProblem>,
     /// What opening set right, shown while nothing else is wrong: a damaged store set aside, a new pseudonym store.
     replaced: Option<&'static str>,
     /// What `open` has to tell a person once (no contents): a store set aside.
@@ -634,10 +764,16 @@ pub struct Agent {
     /// `confirmed.json` could not be understood and the outbox has never assigned a number: something was confirmed
     /// once, nobody knows how much.
     confirmed_unknown: bool,
+    /// Whether a stored record of facts that could not be read has been said this run.
+    unreadable_said: bool,
     resume_command: String,
-    /// The state `run` last reported (or the healthy one it starts from), and the line not yet taken.
+    /// The state `run` last reported (or the healthy one it starts from), and its kind.
     announced: String,
-    announcement: Option<String>,
+    announced_kind: String,
+    /// When each kind of line was last reported (monotonic milliseconds).
+    reported_at: HashMap<String, i64>,
+    /// The lines not taken yet.
+    lines: VecDeque<String>,
 }
 
 impl Agent {
@@ -655,7 +791,7 @@ impl Agent {
         settings: AgentSettings,
     ) -> Result<Self, AgentError> {
         let state_dir = &config.state_dir;
-        check_state_dir(state_dir, settings.expected_owner, true)?;
+        check_state_dir(state_dir, Access::Write, settings.expected_owner)?;
         check_own_files(state_dir)?;
         let store = FileKeyStore::new(state_dir.join(KEY_FILE));
         let key = store.load().map_err(AgentError::Key)?;
@@ -670,7 +806,7 @@ impl Agent {
         let lock = lock_state_dir(state_dir)?;
         // Only now: another agent could have been writing them a moment ago.
         remove_leftover_temporaries(state_dir).map_err(|error| AgentError::Io("state directory", error))?;
-        let halt = read_halt(state_dir).map_err(|error| AgentError::Io(HALT_FILE, error))?;
+        let halt = read_halt(state_dir)?;
         let mut notices = Vec::new();
         let mut replaced = None;
         let outbox_path = state_dir.join(OUTBOX_FILE);
@@ -704,6 +840,12 @@ impl Agent {
         let confirmed = Confirmed::new(state_dir.join(CONFIRMED_FILE), &config.source_id);
         let mut confirmed_unknown = false;
         match confirmed.read() {
+            Ok(Mark::Newer(version)) => return Err(AgentError::NewerFormat(CONFIRMED_FILE, version)),
+            // A person's decision, carried out already: the queue that numbered events began with its reset. (A
+            // crash between the reset and the mark that follows it leaves this.)
+            Ok(Mark::AcceptService) if assigned > 0 => {
+                let _ = confirmed.replace(acked);
+            }
             Ok(Mark::NotUnderstood) if assigned > 0 => {
                 if confirmed.replace(acked).is_ok() {
                     notices.push(format!(
@@ -725,7 +867,7 @@ impl Agent {
                      takes the service's number as its starting point and declares a lost queue there"
                 ));
             }
-            Ok(Mark::Nothing | Mark::Confirmed(_)) => {}
+            Ok(Mark::Nothing | Mark::Confirmed(_) | Mark::AcceptService) => {}
             Err(error) => return Err(AgentError::Io(CONFIRMED_FILE, error)),
         }
         let capture_stop = outbox.capture_stop()?.map(|since_wall| CaptureStop {
@@ -734,7 +876,8 @@ impl Agent {
             persisted: true,
         });
         let backlog_cap = u64::try_from(settings.backlog_cap.max(1)).unwrap_or(u64::MAX);
-        let backlog_full = capture_stop.is_some() && assigned.saturating_sub(acked).saturating_mul(2) >= backlog_cap;
+        // Full only if it is: a mark and a queue above half are what a stop of another kind leaves too.
+        let backlog_full = assigned.saturating_sub(acked) >= backlog_cap;
         let mut sender = Sender::new(
             &config.base_url,
             &config.source_id,
@@ -760,6 +903,7 @@ impl Agent {
             settled: false,
             halt_saved: halt.is_some(),
             problem: None,
+            confirmed_behind: None,
             replaced,
             notices,
             last_saved: None,
@@ -774,9 +918,12 @@ impl Agent {
             capture_failed: false,
             tick_failed: false,
             confirmed_unknown,
+            unreadable_said: false,
             resume_command: "spacegoat-hub resume --config FILE".to_owned(),
             announced: RUNNING.to_owned(),
-            announcement: None,
+            announced_kind: "running".to_owned(),
+            reported_at: HashMap::new(),
+            lines: VecDeque::new(),
         })
     }
 
@@ -819,7 +966,7 @@ impl Agent {
         self.captured = false;
         let result = self.round();
         if let Err(error) = &result {
-            self.problem = Some(error.problem());
+            self.problem = Some(OwnProblem::of(error));
         }
         self.tick_failed = result.is_err();
         let halted = self.sender.halted().is_some();
@@ -833,22 +980,17 @@ impl Agent {
         result
     }
 
-    /// Between ticks: a heartbeat if one is due and the sender can still work; after a tick that failed, only the
-    /// delivery of what is queued, never a heartbeat. Never fails.
+    /// Between ticks, after a tick that failed (`run` comes here only then): the delivery of what is queued, never a
+    /// heartbeat, which would say "alive, nothing to report". Never fails.
     pub fn keep_alive(&mut self) {
         if self.sender.halted().is_none() && clock::clock_is_set(self.clock.wall_millis()) {
-            let outcome = if self.tick_failed {
-                self.sender.step_events()
-            } else {
-                self.sender.heartbeat_if_due()
-            };
-            match outcome {
+            match self.sender.step_events() {
                 Ok(outcome) => {
                     if let Err(error) = self.after(outcome) {
-                        self.problem = Some(error.problem());
+                        self.problem = Some(OwnProblem::of(&error));
                     }
                 }
-                Err(error) => self.problem = Some(AgentError::Sender(error).problem()),
+                Err(error) => self.problem = Some(OwnProblem::of(&AgentError::Sender(error))),
             }
         }
         self.persist_halt();
@@ -856,9 +998,9 @@ impl Agent {
         self.announce();
     }
 
-    /// The line `run` reports for the last change of state, once; `None` when nothing changed since it was taken.
+    /// The next line `run` reports (a change of state, or something said once); `None` when there is none.
     pub fn take_announcement(&mut self) -> Option<String> {
-        self.announcement.take()
+        self.lines.pop_front()
     }
 
     /// Where the hub stands now: counts and state only.
@@ -869,16 +1011,36 @@ impl Agent {
             reason: reason.as_str().to_owned(),
             at: None,
         });
-        let saved = SavedStatus {
-            waiting_for: self.waiting_for.map(|waiting| waiting.as_str().to_owned()),
-            service: self.sender.trouble().map(|trouble| trouble.as_text()),
-            problem: self.current_problem().map(str::to_owned),
-        };
-        Ok(read_status(&self.config, counters, halt, saved, &self.resume_command))
+        Ok(read_status(
+            &self.config,
+            counters,
+            halt,
+            self.saved(),
+            &self.resume_command,
+        ))
     }
 
-    fn current_problem(&self) -> Option<&'static str> {
-        self.problem.or(self.replaced)
+    /// The status as `agent.json` keeps it.
+    fn saved(&self) -> SavedStatus {
+        let problem = self.current_problem();
+        SavedStatus {
+            waiting_for: self.waiting_for.map(|waiting| waiting.as_str().to_owned()),
+            service: self.sender.trouble().map(|trouble| trouble.as_text()),
+            problem: problem.map(|problem| problem.area.to_owned()),
+            cause: problem
+                .and_then(|problem| problem.cause)
+                .map(|cause| cause.as_str().to_owned()),
+        }
+    }
+
+    /// The trouble of this tick, else a confirmed mark still not written, else what opening set right.
+    fn own_problem(&self) -> Option<OwnProblem> {
+        self.problem.or(self.confirmed_behind)
+    }
+
+    fn current_problem(&self) -> Option<OwnProblem> {
+        self.own_problem()
+            .or(self.replaced.map(|area| OwnProblem { area, cause: None }))
     }
 
     fn round(&mut self) -> Result<(), AgentError> {
@@ -1006,32 +1168,27 @@ impl Agent {
         let Some(held) = self.sender.service_last_seq() else {
             return Ok(false);
         };
-        let confirmed = if self.confirmed_unknown {
-            None
+        let mark = if self.confirmed_unknown {
+            Mark::NotUnderstood
         } else {
-            match self
-                .confirmed
+            self.confirmed
                 .read()
                 .map_err(|error| AgentError::Io(CONFIRMED_FILE, error))?
-            {
-                Mark::Nothing => Some(0),
-                Mark::Confirmed(confirmed) => Some(confirmed),
-                Mark::NotUnderstood => {
-                    self.confirmed_unknown = true;
-                    None
-                }
-            }
         };
-        let reason = match (confirmed, held) {
+        let reason = match (mark, held) {
+            (Mark::Newer(version), _) => return Err(AgentError::NewerFormat(CONFIRMED_FILE, version)),
+            // A person accepted the service's state: a lost queue at the service's number, whatever it is (a reset
+            // as event 1, `lastAckedSeq` 0, when the service holds nothing).
+            (Mark::AcceptService, _) => Some(ResetReason::QueueLost),
             // Confirmed something once, nobody knows how much: the gap rule cannot be applied. What the service
             // holds is taken as the starting point and declared as a lost queue.
-            (None, 0) => None,
-            (None, _) => Some(ResetReason::QueueLost),
-            (Some(0), 0) => None,
-            (Some(0), _) => Some(ResetReason::Reinstall),
-            (Some(confirmed), held) if held >= confirmed => Some(ResetReason::QueueLost),
+            (Mark::NotUnderstood, 0) => None,
+            (Mark::NotUnderstood, _) => Some(ResetReason::QueueLost),
+            (Mark::Nothing | Mark::Confirmed(0), 0) => None,
+            (Mark::Nothing | Mark::Confirmed(0), _) => Some(ResetReason::Reinstall),
+            (Mark::Confirmed(confirmed), held) if held >= confirmed => Some(ResetReason::QueueLost),
             // The service holds less than it once confirmed: it lost events. The hub does not cover for that.
-            (Some(_), _) => {
+            (Mark::Confirmed(_), _) => {
                 self.sender.halt(HaltReason::Gap);
                 return Ok(false);
             }
@@ -1048,8 +1205,8 @@ impl Agent {
         Ok(true)
     }
 
-    /// One round of capture, unless the backlog is full. `Err`: capture failed (nothing, or not everything, was
-    /// produced). `Ok(Some(_))`: everything due was produced, but the store did not take what was reported.
+    /// One round of capture, unless the backlog is full. `Err`: capture failed (nothing of this round was stored).
+    /// `Ok(Some(_))`: everything due was stored, but the pseudonym store did not take what was reported.
     fn capture(&mut self, wall: i64, at: &str) -> Result<Option<AgentError>, AgentError> {
         let outbox = self.sender.outbox();
         let pending = outbox.last_assigned()?.saturating_sub(outbox.last_acked()?);
@@ -1100,7 +1257,7 @@ impl Agent {
                 stop
             }
         };
-        if stop.persisted || !(persist_now || is_long(stop, mono)) {
+        if stop.persisted || !(persist_now || self.is_long(stop)) {
             return;
         }
         if self.sender.outbox_mut().stop_capture(stop.since_wall).is_ok() {
@@ -1111,16 +1268,28 @@ impl Agent {
         }
     }
 
-    /// Capture works again: a stop longer than `STOP_DECLARED_AFTER_SECONDS` (or one from an earlier run, whose
-    /// length is not known here) is declared with one `site_source.input_lost`, and the mark is cleared in the same
-    /// transaction; a shorter one is forgotten.
+    /// Whether a stop has lasted longer than `STOP_DECLARED_AFTER_SECONDS`: on this run's monotonic clock when it
+    /// began in this run; else by trusted wall time from its trusted start; a stop whose start is not known at all
+    /// (it began before this run, at a time that was not trusted) counts as long: it was kept because it was.
+    fn is_long(&self, stop: CaptureStop) -> bool {
+        let limit = STOP_DECLARED_AFTER_SECONDS * 1_000;
+        match (stop.since_mono, stop.since_wall, self.trusted_wall()) {
+            (Some(since), _, _) => self.clock.mono_millis().saturating_sub(since) > limit,
+            (None, Some(since), Some(now)) => now.saturating_sub(since) > limit,
+            _ => true,
+        }
+    }
+
+    /// Capture works again: a stop longer than `STOP_DECLARED_AFTER_SECONDS` is declared with one
+    /// `site_source.input_lost`, and the mark is cleared in the same transaction; a shorter one is forgotten.
     fn end_stop(&mut self, wall: i64, at: &str) -> Result<(), AgentError> {
         let Some(stop) = self.capture_stop else {
             return Ok(());
         };
+        let long = self.is_long(stop);
         let outbox = self.sender.outbox_mut();
         let mark = outbox.capture_stop()?;
-        if !is_long(stop, self.clock.mono_millis()) {
+        if !long {
             if mark.is_some() {
                 outbox.clear_capture_stop()?;
             }
@@ -1172,61 +1341,70 @@ impl Agent {
     }
 
     /// Best effort: a mark that cannot be written is a problem in the status, not a reason to stop delivering. It is
-    /// written again with the next answer.
+    /// written again with the next answer, and the problem stays until it is.
     fn write_confirmed(&mut self, last_acked_seq: u64) {
-        if self.confirmed.write(last_acked_seq).is_err() {
-            self.problem = Some("confirmed_failed");
+        match self.confirmed.write(last_acked_seq) {
+            Ok(()) => self.confirmed_behind = None,
+            Err(error) => {
+                self.confirmed_behind = Some(OwnProblem::of(&AgentError::Io(CONFIRMED_FILE, error)));
+            }
         }
     }
 
-    /// What was last reported about a subject: from memory, or from the store the first time it is asked.
-    fn facts(&mut self, scope: &str, identity: &str) -> Result<Map<String, Value>, AgentError> {
+    /// What was last reported about a subject: what this round has planned already, else from memory, else from the
+    /// store the first time it is asked. A stored record that cannot be read counts as none (the subject is reported
+    /// again) and is said once a run.
+    fn facts(
+        &mut self,
+        planned: &HashMap<Subject, Map<String, Value>>,
+        scope: &str,
+        identity: &str,
+    ) -> Result<Map<String, Value>, AgentError> {
         let subject = (scope.to_owned(), identity.to_owned());
-        if let Some(facts) = self.reported.get(&subject) {
+        if let Some(facts) = planned.get(&subject).or_else(|| self.reported.get(&subject)) {
             return Ok(facts.clone());
         }
-        let facts = self.pseudonyms.facts(scope, identity)?;
+        let facts = match self.pseudonyms.facts(scope, identity) {
+            Ok(facts) => facts,
+            Err(StateError::Damaged(_)) => {
+                if !self.unreadable_said {
+                    self.unreadable_said = true;
+                    self.lines.push_back(format!(
+                        "spacegoat-hub: {PSEUDONYMS_FILE} holds a record of what was reported that cannot be read; \
+                         that device or segment is reported again (under the same reference)"
+                    ));
+                }
+                Map::new()
+            }
+            Err(error) => return Err(error.into()),
+        };
         self.reported.insert(subject, facts.clone());
         Ok(facts)
     }
 
-    /// Remember what was just reported: at once in memory, and in the store. A store that does not take it is
-    /// returned as the error and tried again (`save_unsaved`); the report is not made again meanwhile.
-    fn remember(&mut self, scope: &str, identity: &str, facts: Map<String, Value>) -> Option<AgentError> {
-        let subject = (scope.to_owned(), identity.to_owned());
-        let stored = self.pseudonyms.remember(scope, identity, &facts);
-        self.reported.insert(subject.clone(), facts);
-        match stored {
+    /// Give the store what it did not take before, in one transaction. Its failure, if it failed.
+    fn save_unsaved(&mut self) -> Option<AgentError> {
+        let subjects: Vec<Subject> = self
+            .unsaved
+            .iter()
+            .filter(|subject| self.reported.contains_key(*subject))
+            .cloned()
+            .collect();
+        let reports: Vec<(&str, &str, &Map<String, Value>)> = subjects
+            .iter()
+            .filter_map(|subject| {
+                self.reported
+                    .get(subject)
+                    .map(|facts| (subject.0.as_str(), subject.1.as_str(), facts))
+            })
+            .collect();
+        match self.pseudonyms.remember_all(&reports) {
             Ok(()) => {
-                self.unsaved.remove(&subject);
+                self.unsaved.clear();
                 None
             }
-            Err(error) => {
-                self.unsaved.insert(subject);
-                Some(error.into())
-            }
+            Err(error) => Some(error.into()),
         }
-    }
-
-    /// Give the store what it did not take before. The first failure, if any.
-    fn save_unsaved(&mut self) -> Option<AgentError> {
-        let mut failed = None;
-        let subjects: Vec<Subject> = self.unsaved.iter().cloned().collect();
-        for subject in subjects {
-            let Some(facts) = self.reported.get(&subject) else {
-                self.unsaved.remove(&subject);
-                continue;
-            };
-            match self.pseudonyms.remember(&subject.0, &subject.1, facts) {
-                Ok(()) => {
-                    self.unsaved.remove(&subject);
-                }
-                Err(error) => {
-                    failed.get_or_insert(AgentError::from(error));
-                }
-            }
-        }
-        failed
     }
 
     /// Forget what was reported, in memory and in the store; keep the references.
@@ -1237,6 +1415,8 @@ impl Agent {
         Ok(())
     }
 
+    /// Report what this round saw: the events in one outbox transaction per `DEVICES_PER_COMMIT` devices (the
+    /// snapshots go with the last), and what was reported in one pseudonym-store transaction after each.
     fn report(&mut self, sightings: Vec<Sighting>, moment: i64, at: &str) -> Result<Option<AgentError>, AgentError> {
         let mut unsaved = self.save_unsaved();
         let mut lasting = Vec::with_capacity(sightings.len());
@@ -1246,21 +1426,57 @@ impl Agent {
                 let count = ephemeral.entry(sighting.segment).or_default();
                 *count = count.saturating_add(1);
             } else {
-                let (segment, class, failed) = self.report_device(sighting, moment, at)?;
-                if unsaved.is_none() {
-                    unsaved = failed;
-                }
-                lasting.push((segment, class));
+                lasting.push(sighting);
             }
         }
-        // Every segment ever reported, so that one that has emptied still says so.
+        // Every segment ever reported, so that one that has emptied still says so; and its counts per class.
         let mut segments: BTreeSet<String> = self.pseudonyms.identities("segment")?.into_iter().collect();
-        segments.extend(lasting.iter().map(|(segment, _)| segment.clone()));
+        segments.extend(lasting.iter().map(|sighting| sighting.segment.clone()));
         segments.extend(ephemeral.keys().cloned());
-        for segment in segments {
-            let classes = lasting.iter().filter(|(s, _)| *s == segment).map(|(_, class)| *class);
-            let changing = ephemeral.get(&segment).copied().unwrap_or(0);
-            let failed = self.report_snapshot(&segment, classes, changing, moment, at)?;
+        let classes: Vec<(String, &'static str)> = lasting
+            .iter()
+            .map(|sighting| (sighting.segment.clone(), checked_class(&sighting.device_class)))
+            .collect();
+        let chunks: Vec<&[Sighting]> = if lasting.is_empty() {
+            vec![&[]]
+        } else {
+            lasting.chunks(DEVICES_PER_COMMIT).collect()
+        };
+        let last = chunks.len().saturating_sub(1);
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let mut subjects: Vec<(&str, &str)> = Vec::new();
+            for sighting in chunk {
+                subjects.push(("device", &sighting.identity));
+                subjects.push(("segment", &sighting.segment));
+            }
+            if index == last {
+                subjects.extend(segments.iter().map(|segment| ("segment", segment.as_str())));
+            }
+            // The references first, in their own transaction: an event is never stored with a reference the store
+            // could still lose.
+            let refs: HashMap<(String, String), String> = subjects
+                .iter()
+                .map(|(scope, identity)| ((*scope).to_owned(), (*identity).to_owned()))
+                .zip(self.pseudonyms.references(&subjects)?)
+                .collect();
+            let mut plans = Vec::new();
+            let mut planned: HashMap<Subject, Map<String, Value>> = HashMap::new();
+            for sighting in chunk {
+                if let Some(plan) = self.plan_device(sighting, &refs, &planned, moment)? {
+                    planned.insert(plan.subject.clone(), plan.facts.clone());
+                    plans.push(plan);
+                }
+            }
+            if index == last {
+                for segment in &segments {
+                    let counted = classes.iter().filter(|(s, _)| s == segment).map(|(_, class)| *class);
+                    let changing = ephemeral.get(segment).copied().unwrap_or(0);
+                    if let Some(plan) = self.plan_snapshot(segment, counted, changing, &refs, &planned, moment)? {
+                        plans.push(plan);
+                    }
+                }
+            }
+            let failed = self.commit(plans, at)?;
             if unsaved.is_none() {
                 unsaved = failed;
             }
@@ -1268,25 +1484,63 @@ impl Agent {
         Ok(unsaved)
     }
 
-    /// Report one device if anything is due; returns its segment, its checked class (for the snapshot), and the
-    /// store's failure to take what was reported, if it failed.
-    fn report_device(
+    /// Store what a round planned: the events in one transaction (all or none; `Err` when none), then what was
+    /// reported, kept in memory at once and in the store in one more (its failure is returned, and retried).
+    fn commit(&mut self, plans: Vec<Planned>, at: &str) -> Result<Option<AgentError>, AgentError> {
+        if plans.is_empty() {
+            return Ok(None);
+        }
+        let events: Vec<NewEvent<'_>> = plans
+            .iter()
+            .map(|plan| NewEvent {
+                kind: plan.kind,
+                observed_at: at,
+                attributes: &plan.attributes,
+                pii: plan.pii.as_ref(),
+            })
+            .collect();
+        self.sender.outbox_mut().append_all(&events)?;
+        // After the events are durably in the outbox: what was reported is now what the hub last said.
+        for plan in &plans {
+            self.reported.insert(plan.subject.clone(), plan.facts.clone());
+        }
+        let reports: Vec<(&str, &str, &Map<String, Value>)> = plans
+            .iter()
+            .map(|plan| (plan.subject.0.as_str(), plan.subject.1.as_str(), &plan.facts))
+            .collect();
+        match self.pseudonyms.remember_all(&reports) {
+            Ok(()) => Ok(None),
+            Err(error) => {
+                self.unsaved.extend(plans.into_iter().map(|plan| plan.subject));
+                Ok(Some(error.into()))
+            }
+        }
+    }
+
+    /// The event one device is due, if any.
+    fn plan_device(
         &mut self,
-        sighting: Sighting,
+        sighting: &Sighting,
+        refs: &HashMap<(String, String), String>,
+        planned: &HashMap<Subject, Map<String, Value>>,
         moment: i64,
-        at: &str,
-    ) -> Result<(String, &'static str, Option<AgentError>), AgentError> {
+    ) -> Result<Option<Planned>, AgentError> {
+        let reference = |scope: &str, identity: &str| {
+            refs.get(&(scope.to_owned(), identity.to_owned()))
+                .cloned()
+                .ok_or(AgentError::State(StateError::Damaged("a reference that was not made")))
+        };
         let mut attributes = Map::new();
         attributes.insert("trustOrigin".into(), Value::from("hub"));
         attributes.insert(
             "deviceRef".into(),
-            Value::from(self.pseudonyms.reference("device", &sighting.identity)?),
+            Value::from(reference("device", &sighting.identity)?),
         );
         attributes.insert(
             "segmentRef".into(),
-            Value::from(self.pseudonyms.reference("segment", &sighting.segment)?),
+            Value::from(reference("segment", &sighting.segment)?),
         );
-        let known = self.facts("device", &sighting.identity)?;
+        let known = self.facts(planned, "device", &sighting.identity)?;
         let device_class = checked_class(&sighting.device_class);
         let mac = sighting.mac.as_deref().filter(|mac| is_mac(mac));
         let hostname = sighting.hostname.as_deref().filter(|name| is_hostname(name));
@@ -1306,11 +1560,10 @@ impl Agent {
                 pii.insert(name.into(), Value::from(value));
             }
         }
-        let pii = (!pii.is_empty()).then_some(&pii);
-        let outbox = self.sender.outbox_mut();
-        if known.is_empty() {
+        let pii = (!pii.is_empty()).then_some(pii);
+        let (kind, pii) = if known.is_empty() {
             attributes.insert("deviceClass".into(), Value::from(device_class));
-            outbox.append("site.device_appeared", at, &attributes, pii)?;
+            ("site.device_appeared", pii)
         } else {
             let changed: Vec<Value> = ["class", "name", "address"]
                 .into_iter()
@@ -1321,29 +1574,34 @@ impl Agent {
             if !changed.is_empty() {
                 attributes.insert("deviceClass".into(), Value::from(device_class));
                 attributes.insert("changed".into(), Value::Array(changed));
-                outbox.append("site.device_changed", at, &attributes, pii)?;
+                ("site.device_changed", pii)
             } else if told_at.is_none_or(|told| is_due(told, moment, SEEN_EVERY_MS)) {
-                outbox.append("site.device_seen", at, &attributes, None)?;
+                ("site.device_seen", None)
             } else {
-                return Ok((sighting.segment, device_class, None));
+                return Ok(None);
             }
-        }
-        // After the event is durably in the outbox: what was reported is now what the hub last said.
+        };
         facts.insert("toldAt".into(), Value::from(stored_text(moment)));
-        let failed = self.remember("device", &sighting.identity, facts);
-        Ok((sighting.segment, device_class, failed))
+        Ok(Some(Planned {
+            kind,
+            attributes,
+            pii,
+            subject: ("device".to_owned(), sighting.identity.clone()),
+            facts,
+        }))
     }
 
-    /// A segment's snapshot, if one is due; the store's failure to take what was reported, if it failed.
-    fn report_snapshot(
+    /// A segment's snapshot, if one is due.
+    fn plan_snapshot(
         &mut self,
         segment: &str,
         classes: impl Iterator<Item = &'static str>,
         ephemeral: u64,
+        refs: &HashMap<(String, String), String>,
+        planned: &HashMap<Subject, Map<String, Value>>,
         moment: i64,
-        at: &str,
-    ) -> Result<Option<AgentError>, AgentError> {
-        let known = self.facts("segment", segment)?;
+    ) -> Result<Option<Planned>, AgentError> {
+        let known = self.facts(planned, "segment", segment)?;
         let last = known.get("snapshotAt").and_then(Value::as_str).and_then(stored_millis);
         if last.is_some_and(|last| !is_due(last, moment, SNAPSHOT_EVERY_MS)) {
             return Ok(None);
@@ -1358,20 +1616,24 @@ impl Agent {
                 counts.insert(class.into(), Value::from(next));
             }
         }
+        let reference = refs
+            .get(&("segment".to_owned(), segment.to_owned()))
+            .cloned()
+            .ok_or(AgentError::State(StateError::Damaged("a reference that was not made")))?;
         let mut attributes = Map::new();
         attributes.insert("trustOrigin".into(), Value::from("hub"));
-        attributes.insert(
-            "segmentRef".into(),
-            Value::from(self.pseudonyms.reference("segment", segment)?),
-        );
+        attributes.insert("segmentRef".into(), Value::from(reference));
         attributes.insert("counts".into(), Value::Object(counts));
         attributes.insert("ephemeral".into(), Value::from(ephemeral));
-        self.sender
-            .outbox_mut()
-            .append("site.inventory_snapshot", at, &attributes, None)?;
         let mut facts = Map::new();
         facts.insert("snapshotAt".into(), Value::from(stored_text(moment)));
-        Ok(self.remember("segment", segment, facts))
+        Ok(Some(Planned {
+            kind: "site.inventory_snapshot",
+            attributes,
+            pii: None,
+            subject: ("segment".to_owned(), segment.to_owned()),
+            facts,
+        }))
     }
 
     /// Write `halt.json` once for the sender's halt. Best effort: a failure is the status's problem and is tried
@@ -1385,39 +1647,39 @@ impl Agent {
         }
         match write_halt(&self.config.state_dir, reason, self.clock.wall_millis()) {
             Ok(()) => self.halt_saved = true,
-            Err(_) => self.problem = Some("halt_file_failed"),
+            Err(error) => self.problem = Some(OwnProblem::of(&AgentError::Io(HALT_FILE, error))),
         }
     }
 
     /// `agent.json`, written only when its text changes. Best effort: a failure is the status's problem.
     fn save_status(&mut self) {
-        let service = self.sender.trouble().map(|trouble| trouble.as_text());
-        let text = status_file_text(
-            self.sender.halted().map(HaltReason::as_str),
-            self.waiting_for.map(WaitingFor::as_str),
-            service.as_deref(),
-            self.current_problem(),
-        );
+        let text = status_file_text(&self.saved());
         if self.last_saved.as_deref() == Some(text.as_str()) {
             return;
         }
         match write_own_file(&self.config.state_dir.join(STATUS_FILE), text.as_bytes()) {
             Ok(()) => self.last_saved = Some(text),
-            Err(_) => self.problem = Some("status_file_failed"),
+            Err(error) => self.problem = Some(OwnProblem::of(&AgentError::Io(STATUS_FILE, error))),
         }
     }
 
-    /// The state as one line for a person: halted (and how to resume), what it waits for, its problem. No device,
+    /// The state as one line for a person, and the kind of line it is (what is wrong, without the details that
+    /// change while it stays wrong): halted (and how to resume), what it waits for, its problem and cause. No device,
     /// name, address or file content. What `open` said in a notice (a store set aside) is not repeated here.
-    fn state_line(&self) -> String {
+    fn state_line(&self) -> (String, String) {
         if let Some(reason) = self.sender.halted() {
-            return format!(
+            let line = format!(
                 "halted: {reason} ({}); once that is dealt with: {}",
                 halt_meaning(reason),
                 self.resume_command
             );
+            return (HALTED_KIND.to_owned(), line);
         }
         let mut parts = Vec::new();
+        let mut kind = Vec::new();
+        if let Some(waiting) = self.waiting_for {
+            kind.push(waiting.as_str());
+        }
         match self.waiting_for {
             Some(WaitingFor::Service) => parts.push(match self.sender.trouble() {
                 Some(trouble) => format!("waiting for the service ({})", trouble.as_text()),
@@ -1434,31 +1696,41 @@ impl Agent {
             }
             None => {}
         }
-        if let Some(problem) = self.problem {
-            parts.push(format!("problem: {problem}"));
+        if let Some(problem) = self.own_problem() {
+            kind.push(problem.area);
+            parts.push(match problem.cause {
+                Some(cause) => format!("problem: {} ({})", problem.area, cause.as_str()),
+                None => format!("problem: {}", problem.area),
+            });
         }
         if parts.is_empty() {
-            RUNNING.to_owned()
+            ("running".to_owned(), RUNNING.to_owned())
         } else {
-            parts.join("; ")
+            (kind.join("+"), parts.join("; "))
         }
     }
 
-    /// Note the state for `run` to report, if it changed.
+    /// Note the state for `run` to report, if it changed: at once when it is the first line of its kind in
+    /// `REPORT_EVERY_SECONDS`, or a halt; otherwise it waits, and is reported once that time is up if it still
+    /// holds.
     fn announce(&mut self) {
-        let line = self.state_line();
-        if line != self.announced {
-            self.announcement = Some(format!("spacegoat-hub: {line}"));
+        let (kind, line) = self.state_line();
+        if line == self.announced {
+            return;
+        }
+        let now = self.clock.mono_millis();
+        let urgent = kind == HALTED_KIND || self.announced_kind == HALTED_KIND;
+        let free = self
+            .reported_at
+            .get(&kind)
+            .is_none_or(|at| now.saturating_sub(*at) >= REPORT_EVERY_SECONDS * 1_000);
+        if urgent || free {
+            self.lines.push_back(format!("spacegoat-hub: {line}"));
+            self.reported_at.insert(kind.clone(), now);
             self.announced = line;
+            self.announced_kind = kind;
         }
     }
-}
-
-/// Whether a stop has lasted longer than `STOP_DECLARED_AFTER_SECONDS` at `mono`; one from an earlier run (its start
-/// not on this run's monotonic clock) counts as long: it was kept because it was.
-fn is_long(stop: CaptureStop, mono: i64) -> bool {
-    stop.since_mono
-        .is_none_or(|since| mono.saturating_sub(since) > STOP_DECLARED_AFTER_SECONDS * 1_000)
 }
 
 /// Names the source, never the key or a device.
@@ -1468,7 +1740,7 @@ impl fmt::Debug for Agent {
             .field("source_id", &self.config.source_id)
             .field("waiting_for", &self.waiting_for)
             .field("greeted", &self.greeted)
-            .field("problem", &self.current_problem())
+            .field("problem", &self.current_problem().map(|problem| problem.area))
             .finish_non_exhaustive()
     }
 }
@@ -1481,11 +1753,11 @@ pub fn run(agent: Agent, stop: Arc<AtomicBool>, sleep: impl FnMut(Duration)) -> 
 /// Tick every `TICK_SECONDS` of monotonic time until `stop` is set, then close. `sleep` is how time passes
 /// (`std::thread::sleep` in the binary); the flag is looked at every 100 ms and between the requests of a tick.
 /// `report` is given one line whenever what the status says changes (halted, what it waits for, its problem), never
-/// one per tick.
+/// one per tick, and a line said once (an unreadable record).
 ///
-/// A tick that fails does not end the run: its problem is in the status, the next tick comes after a back-off (5 s,
-/// doubling, at most `TICK_BACKOFF_MAX_SECONDS`), and meanwhile what is queued is still delivered (but no heartbeat
-/// goes out). Only closing can fail here.
+/// A tick that fails does not end the run: its problem is in the status, the next tick comes after a back-off
+/// (`sender::backoff_seconds`, the sender's own rule), and meanwhile what is queued is still delivered (`keep_alive`,
+/// no heartbeat). Only closing can fail here.
 pub fn run_reporting(
     mut agent: Agent,
     stop: Arc<AtomicBool>,
@@ -1506,17 +1778,15 @@ pub fn run_reporting(
                     next_tick = now.saturating_add(tick_ms);
                 }
                 Err(_) => {
-                    let wait = TICK_BACKOFF_FIRST_SECONDS
-                        .saturating_mul(1u64 << failures.min(16))
-                        .min(TICK_BACKOFF_MAX_SECONDS);
+                    next_tick = now.saturating_add(millis(sender::backoff_seconds(failures)));
                     failures = failures.saturating_add(1);
-                    next_tick = now.saturating_add(millis(wait));
                 }
             }
         } else {
+            // Woken before the tick, which happens only after a failed one with a back-off longer than a tick.
             agent.keep_alive();
         }
-        if let Some(line) = agent.take_announcement() {
+        while let Some(line) = agent.take_announcement() {
             report(&line);
         }
         let wake = next_tick.min(clock.mono_millis().saturating_add(tick_ms));
@@ -1544,51 +1814,6 @@ fn wait_until(clock: &dyn Clock, wake: i64, stop: &AtomicBool, sleep: &mut impl 
     }
 }
 
-/// Refuse a state directory that is missing, not a directory, open to other users, or owned by another user than
-/// the one this process creates files as (`expected_owner` stands for that user in tests); with `writable`, also one
-/// this user cannot write. Never changed here: it may not be this agent's to change. Without `writable` nothing is
-/// written in it (`status`).
-pub fn check_state_dir(state_dir: &Path, expected_owner: Option<u32>, writable: bool) -> Result<(), AgentError> {
-    let refuse = |why| AgentError::StateDirectory(state_dir.to_path_buf(), why);
-    let found = match std::fs::metadata(state_dir) {
-        Ok(found) => found,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(refuse("missing; run keygen first")),
-        Err(_) => return Err(refuse("cannot be read")),
-    };
-    if !found.is_dir() {
-        return Err(refuse("not a directory"));
-    }
-    if found.permissions().mode() & 0o077 != 0 {
-        return Err(refuse("open to other users; use one only the hub's user can enter"));
-    }
-    let me = match expected_owner {
-        Some(uid) => uid,
-        None => current_uid().map_err(|error| AgentError::Io("the user this process runs as", error))?,
-    };
-    if found.uid() != me {
-        // Whoever owns the directory can swap what is in it.
-        return Err(refuse("belongs to another user"));
-    }
-    if writable {
-        match create_temporary(state_dir, WRITE_CHECK_PREFIX) {
-            Ok((file, path)) => {
-                drop(file);
-                match std::fs::remove_file(&path) {
-                    // Swept by another agent's start meanwhile: gone either way.
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(AgentError::Io("state directory", error)),
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                return Err(refuse("cannot be written by this user"));
-            }
-            Err(error) => return Err(AgentError::Io("state directory", error)),
-        }
-    }
-    Ok(())
-}
-
 /// An exclusive lock on `agent.lock` for the life of the agent (the kernel drops it when the process ends).
 pub fn lock_state_dir(state_dir: &Path) -> Result<File, AgentError> {
     let path = state_dir.join(LOCK_FILE);
@@ -1601,13 +1826,9 @@ pub fn lock_state_dir(state_dir: &Path) -> Result<File, AgentError> {
     }
 }
 
-/// Whether `name` is one of this program's temporary file names: a known prefix and exactly 32 lowercase hex.
+/// Whether `name` is one of this program's temporary file names (`TEMPORARY_NAMES`, `fsutil::is_temporary_of`).
 fn is_our_temporary(name: &str) -> bool {
-    TEMPORARY_PREFIXES.iter().any(|prefix| {
-        name.strip_prefix(prefix).is_some_and(|rest| {
-            rest.len() == TEMPORARY_RANDOM_HEX && rest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        })
-    })
+    TEMPORARY_NAMES.iter().any(|own| is_temporary_of(own, name))
 }
 
 /// Remove what a process that died mid-write left behind: files (and symbolic links: the link itself, never what it
@@ -1647,7 +1868,7 @@ fn set_aside_if_damaged(path: &Path, what: &'static str) -> Result<bool, AgentEr
         _ => return Ok(false),
     }
     let io_error = |error: io::Error| AgentError::Io(what, error);
-    if !database_is_damaged(path).map_err(|error| io_error(io::Error::other(error)))? {
+    if !database_is_damaged(path).map_err(|error| AgentError::Sqlite(what, error))? {
         return Ok(false);
     }
     let sidecar = |suffix: &str| {

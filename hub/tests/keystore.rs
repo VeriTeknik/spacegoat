@@ -8,6 +8,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use spacegoat_hub::keystore::{FileKeyStore, KeyStoreError};
 use spacegoat_hub::signing::public_key_text;
+use spacegoat_hub::statedir::StateDirError;
 use support::{TempDir, mode, vector_key};
 
 fn set_mode(path: &std::path::Path, mode: u32) {
@@ -45,7 +46,10 @@ fn an_existing_directory_is_never_changed_and_a_shared_one_is_refused() {
     std::fs::create_dir(&shared).unwrap();
     set_mode(&shared, 0o1777);
     let error = FileKeyStore::new(shared.join("hub.key")).create().unwrap_err();
-    assert!(matches!(error, KeyStoreError::DirectoryOpenToOthers(_)), "{error}");
+    assert!(
+        matches!(error, KeyStoreError::StateDirectory(StateDirError::OpenToOthers(_))),
+        "{error}"
+    );
     assert!(error.to_string().contains("open to other users"));
     assert_eq!(mode(&shared), 0o1777);
     assert!(!shared.join("hub.key").exists());
@@ -67,7 +71,7 @@ fn a_directory_only_its_group_can_enter_is_refused_too() {
         set_mode(&dir, open);
         let error = FileKeyStore::new(dir.join("hub.key")).create().unwrap_err();
         assert!(
-            matches!(error, KeyStoreError::DirectoryOpenToOthers(_)),
+            matches!(error, KeyStoreError::StateDirectory(StateDirError::OpenToOthers(_))),
             "{open:o}: {error}"
         );
         assert_eq!(mode(&dir), open);
@@ -123,7 +127,10 @@ fn a_directory_of_another_user_is_refused() {
         .expecting_owner(theirs)
         .create()
         .unwrap_err();
-    assert!(matches!(error, KeyStoreError::DirectoryOfAnotherUser(_)), "{error}");
+    assert!(
+        matches!(error, KeyStoreError::StateDirectory(StateDirError::OfAnotherUser(_))),
+        "{error}"
+    );
     assert!(error.to_string().contains("another user"));
     // Nothing was left in it, not even the temporary file.
     assert!(names_in(&state).is_empty());

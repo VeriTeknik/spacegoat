@@ -12,8 +12,8 @@ use serde_json::{Map, Value, json};
 use spacegoat_hub::clock;
 use spacegoat_hub::outbox::Outbox;
 use spacegoat_hub::sender::{
-    HEARTBEAT_SECONDS, HaltReason, MAX_COMPRESSED_BYTES, MAX_UNCOMPRESSED_BYTES, Problem, SendOutcome, Sender,
-    service_origin,
+    BACKOFF_FIRST_SECONDS, BACKOFF_MAX_SECONDS, HEARTBEAT_SECONDS, HaltReason, MAX_COMPRESSED_BYTES,
+    MAX_UNCOMPRESSED_BYTES, Problem, SendOutcome, Sender, service_origin,
 };
 use support::fake_service::{FakeService, PATH, Step, TestClock, http_date};
 use support::{TempDir, vector_key};
@@ -601,6 +601,7 @@ fn the_service_address_is_an_https_origin_and_nothing_else() {
         "https://[not-an-address]",
         "http://[::2]:8080",
         "http://127.0.0.2:8080",
+        "http://localhost:8080",
     ] {
         assert!(service_origin(base_url).is_err(), "{base_url}");
         let outbox = open_outbox(&tmp, "outbox.sqlite");
@@ -619,7 +620,6 @@ fn accepted_service_addresses() {
         ("https://hub.example/", "https://hub.example"),
         ("https://hub.example:8443", "https://hub.example:8443"),
         ("http://127.0.0.1:8080", "http://127.0.0.1:8080"),
-        ("http://localhost:8080", "http://localhost:8080"),
         ("http://[::1]:8080", "http://[::1]:8080"),
         ("HTTPS://Hub.Example", "https://hub.example"),
     ] {
@@ -1001,12 +1001,10 @@ fn heartbeat_sends_an_empty_request_even_when_events_wait() {
     assert_eq!(events_per_request(&service), [Some(vec![])]);
     assert_eq!(sender.service_last_seq(), Some(0));
     assert_eq!(step(&mut sender), SendOutcome::Sent(3));
-    // `heartbeat_if_due` sends nothing before it is due, and never events.
-    assert_eq!(sender.heartbeat_if_due().unwrap(), SendOutcome::Idle);
-    fill(sender.outbox_mut(), &clock, 1);
+    // `step_events` never sends a heartbeat, however long it has been.
     clock.advance_seconds(HEARTBEAT_SECONDS);
-    assert_eq!(sender.heartbeat_if_due().unwrap(), SendOutcome::Sent(0));
-    assert_eq!(service.requests().last().unwrap().events, Some(vec![]));
+    assert_eq!(sender.step_events().unwrap(), SendOutcome::Idle);
+    assert_eq!(service.requests().len(), 2);
 }
 
 // ---- 413 ----
@@ -1174,7 +1172,7 @@ fn the_sender_says_which_kind_of_answer_confirmed_nothing_until_one_does() {
         assert!(matches!(step(&mut sender), SendOutcome::Sent(_)), "{trouble:?}");
         assert_eq!(sender.trouble(), None, "a confirming answer clears it");
     }
-    // Nobody there at all.
+    // Nobody there at all: the port refuses.
     let (tmp, clock) = (TempDir::new(), TestClock::new());
     let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let mut sender = sender_with_key(
@@ -1184,9 +1182,150 @@ fn the_sender_says_which_kind_of_answer_confirmed_nothing_until_one_does() {
         vector_key(),
     );
     assert!(matches!(sender.heartbeat().unwrap(), SendOutcome::RetryLater(_)));
-    assert_eq!(sender.trouble(), Some(ServiceTrouble::NoConnection));
+    assert_eq!(sender.trouble(), Some(ServiceTrouble::Refused));
     assert_eq!(ServiceTrouble::Http(503).as_text(), "http_503");
     assert_eq!(ServiceTrouble::NoConnection.as_text(), "no_connection");
+    assert_eq!(ServiceTrouble::Refused.as_text(), "refused");
+    assert_eq!(ServiceTrouble::Dns.as_text(), "dns");
+    assert_eq!(ServiceTrouble::Timeout.as_text(), "timeout");
+    assert_eq!(ServiceTrouble::Tls.as_text(), "tls");
     assert_eq!(ServiceTrouble::Unreadable.as_text(), "unreadable");
     assert_eq!(ServiceTrouble::NotConfirming.as_text(), "not_confirming");
+}
+
+// ---- Third review round ----
+
+/// The events each request carried, by count.
+fn counts_per_request(service: &FakeService) -> Vec<usize> {
+    service
+        .requests()
+        .into_iter()
+        .map(|r| r.events.map_or(0, |events| events.len()))
+        .collect()
+}
+
+#[test]
+fn a_request_that_times_out_halves_the_batch_and_a_confirmed_one_lets_it_grow_again() {
+    use std::time::Duration;
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 8);
+    // The answer comes after the hub has given up on it (a real 200 ms against an answer 600 ms late).
+    let mut sender = make_sender(&service, outbox, &clock).with_request_timeout(Duration::from_millis(200));
+    for _ in 0..2 {
+        service.push(Step::Delay(Duration::from_millis(600)));
+        assert!(matches!(step(&mut sender), SendOutcome::RetryLater(_)));
+        assert_eq!(sender.trouble().map(|t| t.as_text()).as_deref(), Some("timeout"));
+        clock.advance_seconds(BACKOFF_MAX_SECONDS as i64);
+    }
+    // The service took all eight at the first request; the next answer that arrives confirms them.
+    assert_eq!(step(&mut sender), SendOutcome::Sent(2));
+    assert_eq!(sender.outbox().last_acked().unwrap(), 8);
+    fill(sender.outbox_mut(), &clock, 30);
+    drain(&mut sender);
+    assert_eq!(counts_per_request(&service), [8, 4, 2, 4, 8, 16, 2]);
+}
+
+#[test]
+fn a_timeout_of_a_single_event_or_a_heartbeat_backs_off_and_halves_nothing() {
+    use std::time::Duration;
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 1);
+    let mut sender = make_sender(&service, outbox, &clock).with_request_timeout(Duration::from_millis(200));
+    service.push(Step::Delay(Duration::from_millis(600)));
+    assert_eq!(step(&mut sender), SendOutcome::RetryLater(BACKOFF_FIRST_SECONDS));
+    clock.advance_seconds(10);
+    fill(sender.outbox_mut(), &clock, 3);
+    drain(&mut sender);
+    assert_eq!(counts_per_request(&service), [1, 4]);
+}
+
+#[test]
+fn a_connection_refused_a_timeout_and_a_tls_failure_are_told_apart() {
+    use std::io::{Read, Write};
+    use std::time::Duration;
+    // Refused: a port that was free a moment ago and has no listener now.
+    let (tmp, clock) = (TempDir::new(), TestClock::new());
+    let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let mut sender = sender_with_key(
+        &format!("http://127.0.0.1:{port}"),
+        open_outbox(&tmp, "refused.sqlite"),
+        &clock,
+        vector_key(),
+    );
+    assert!(matches!(sender.heartbeat().unwrap(), SendOutcome::RetryLater(_)));
+    assert_eq!(sender.trouble().map(|t| t.as_text()).as_deref(), Some("refused"));
+    // A timeout: a listener that takes the connection and never answers.
+    let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = silent.local_addr().unwrap();
+    let mut sender = sender_with_key(
+        &format!("http://{address}"),
+        open_outbox(&tmp, "timeout.sqlite"),
+        &clock,
+        vector_key(),
+    )
+    .with_request_timeout(Duration::from_millis(200));
+    assert!(matches!(sender.heartbeat().unwrap(), SendOutcome::RetryLater(_)));
+    assert_eq!(sender.trouble().map(|t| t.as_text()).as_deref(), Some("timeout"));
+    drop(silent);
+    // TLS: an https origin on loopback whose peer answers in plain HTTP.
+    let plain = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = plain.local_addr().unwrap().port();
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = plain.accept().unwrap();
+        let mut first = [0u8; 16];
+        let _ = stream.read(&mut first);
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    });
+    let mut sender = sender_with_key(
+        &format!("https://127.0.0.1:{port}"),
+        open_outbox(&tmp, "tls.sqlite"),
+        &clock,
+        vector_key(),
+    );
+    assert!(matches!(sender.heartbeat().unwrap(), SendOutcome::RetryLater(_)));
+    peer.join().unwrap();
+    assert_eq!(sender.trouble().map(|t| t.as_text()).as_deref(), Some("tls"));
+}
+
+#[test]
+fn plain_http_is_for_the_loopback_literals_only_not_the_name_localhost() {
+    assert!(
+        service_origin("http://localhost:8080").is_err(),
+        "a name can be answered by the network"
+    );
+    assert!(service_origin("http://LOCALHOST:8080").is_err());
+    assert_eq!(
+        service_origin("http://127.0.0.1:8080").unwrap(),
+        "http://127.0.0.1:8080"
+    );
+    assert_eq!(service_origin("http://[::1]:8080").unwrap(), "http://[::1]:8080");
+    assert_eq!(
+        service_origin("https://localhost:8443").unwrap(),
+        "https://localhost:8443"
+    );
+}
+
+#[test]
+fn a_request_carries_events_of_one_schema_version_only() {
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 4);
+    // As if a later build had queued the last two for another schema version.
+    let db = rusqlite::Connection::open(tmp.join("outbox.sqlite")).unwrap();
+    db.execute("UPDATE events SET schema_version = 2 WHERE seq > 2", [])
+        .unwrap();
+    drop(db);
+    let mut sender = make_sender(&service, outbox, &clock);
+    assert_eq!(step(&mut sender), SendOutcome::Sent(2));
+    let _ = step(&mut sender);
+    let requests = service.requests();
+    assert_eq!(requests[0].events, Some(vec![1, 2]));
+    assert_eq!(requests[1].events, Some(vec![3, 4]));
+    let body = |index: usize| -> Value { serde_json::from_slice(requests[index].plain.as_ref().unwrap()).unwrap() };
+    assert_eq!(
+        (body(0)["schemaVersion"].clone(), body(1)["schemaVersion"].clone()),
+        (json!(1), json!(2))
+    );
 }

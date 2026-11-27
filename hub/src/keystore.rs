@@ -9,12 +9,15 @@
 //! Ed25519 tool reads. It is read strictly: exactly that structure, nothing before or after it.
 //!
 //! Beside it, `hub.key.id` holds the key id it was generated under (one line), so that `public-key` and `run` know it
-//! without being told. A state directory made before that file existed works as before.
+//! without being told. A key without it (a `keygen` that died between the two writes) still works: `run` then checks
+//! nothing about the id, and `public-key` needs `--key-id`.
+//!
+//! Where it lives must be a private state directory of this user (`statedir::check`, the check the agent makes too).
 
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
@@ -22,7 +25,8 @@ use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::SigningKey;
 use zeroize::Zeroizing;
 
-use crate::fsutil::{create_temporary, fsync_directory, open_regular};
+use crate::fsutil::{create_temporary, fsync_directory, open_regular, temporary_prefix};
+use crate::statedir::{self, Access, StateDirError};
 
 const PEM_BEGIN: &str = "-----BEGIN PRIVATE KEY-----\n";
 const PEM_END: &str = "-----END PRIVATE KEY-----\n";
@@ -46,14 +50,8 @@ pub enum KeyStoreError {
     NoKey(PathBuf),
     /// `create` found a key, or anything else, under the key's name.
     AlreadyExists(PathBuf),
-    /// The state directory can be entered by users other than its owner.
-    DirectoryOpenToOthers(PathBuf),
-    /// The state directory belongs to another user.
-    DirectoryOfAnotherUser(PathBuf),
-    /// The state directory's name is a file, not a directory.
-    NotADirectory(PathBuf),
-    /// The state directory belongs to this user, who cannot write it.
-    DirectoryNotWritable(PathBuf),
+    /// The state directory is not one the key may live in.
+    StateDirectory(StateDirError),
     /// The key id file does not hold a key id.
     NotAKeyId(PathBuf),
     /// The key file can be read or written by users other than its owner.
@@ -71,14 +69,7 @@ impl fmt::Display for KeyStoreError {
         match self {
             Self::NoKey(path) => write!(f, "no key at {}; run `spacegoat-hub keygen` first", path.display()),
             Self::AlreadyExists(path) => write!(f, "a key already exists at {}", path.display()),
-            Self::DirectoryOpenToOthers(path) => write!(
-                f,
-                "{} is open to other users; use one only the hub's user can enter",
-                path.display()
-            ),
-            Self::DirectoryOfAnotherUser(path) => write!(f, "{} belongs to another user", path.display()),
-            Self::NotADirectory(path) => write!(f, "{} is not a directory", path.display()),
-            Self::DirectoryNotWritable(path) => write!(f, "{} cannot be written by this user", path.display()),
+            Self::StateDirectory(error) => error.fmt(f),
             Self::NotAKeyId(path) => write!(f, "{} does not hold a key id", path.display()),
             Self::Permissions(path) => write!(
                 f,
@@ -92,23 +83,11 @@ impl fmt::Display for KeyStoreError {
     }
 }
 
-impl KeyStoreError {
-    /// Whether the error is about where the key lives (the state directory), rather than the key itself.
-    pub fn is_directory(&self) -> bool {
-        matches!(
-            self,
-            Self::DirectoryOpenToOthers(_)
-                | Self::DirectoryOfAnotherUser(_)
-                | Self::NotADirectory(_)
-                | Self::DirectoryNotWritable(_)
-        )
-    }
-}
-
 impl std::error::Error for KeyStoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(_, error) => Some(error),
+            Self::StateDirectory(error) => Some(error),
             _ => None,
         }
     }
@@ -132,8 +111,8 @@ impl FileKeyStore {
         &self.path
     }
 
-    /// The user the state directory must belong to. By default it is the user this process creates files as (read
-    /// from the temporary key file, since std cannot ask for the effective uid); tests set another to see the refusal.
+    /// The user the state directory must belong to. By default it is the user this process creates files as
+    /// (`statedir::check`); tests set another to see the refusal.
     #[doc(hidden)]
     pub fn expecting_owner(mut self, uid: u32) -> Self {
         self.expected_owner = Some(uid);
@@ -147,23 +126,16 @@ impl FileKeyStore {
             let path = path.to_path_buf();
             move |error| KeyStoreError::Io(path, error)
         };
-        let directory_uid = match std::fs::metadata(directory) {
-            Ok(found) => {
-                if !found.is_dir() {
-                    return Err(KeyStoreError::NotADirectory(directory.to_path_buf()));
-                }
-                // Never change a directory this call did not create: it may be shared (`/tmp`, `/var/lib`).
-                if found.permissions().mode() & 0o077 != 0 {
-                    return Err(KeyStoreError::DirectoryOpenToOthers(directory.to_path_buf()));
-                }
-                found.uid()
-            }
+        match std::fs::symlink_metadata(directory) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 create_private_directory(directory).map_err(io_at(directory))?;
-                std::fs::metadata(directory).map_err(io_at(directory))?.uid()
             }
-            Err(error) => return Err(KeyStoreError::Io(directory.to_path_buf(), error)),
-        };
+            // Never change a directory this call did not create: it may be shared (`/tmp`, `/var/lib`). The check
+            // says what is wrong with it.
+            _ => {}
+        }
+        statedir::check(directory, Access::Write, self.expected_owner, &self.path)
+            .map_err(KeyStoreError::StateDirectory)?;
 
         let mut seed = Zeroizing::new([0u8; 32]);
         getrandom::fill(seed.as_mut_slice())
@@ -175,34 +147,11 @@ impl FileKeyStore {
         // the name exists (a symbolic link there included, which is never followed), so a key is still never
         // replaced; and there is no moment at which a half-written key sits under the real name.
         let name = self.path.file_name().map(|n| n.to_string_lossy().into_owned());
-        let prefix = format!(".{}.", name.unwrap_or_default());
-        let (mut file, temporary) = match create_temporary(directory, &prefix) {
-            Ok(created) => created,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                // Whose directory it is decides what to say: another user's, or this user's without write access.
-                let me = match self.expected_owner {
-                    Some(uid) => Some(uid),
-                    None => crate::fsutil::current_uid().ok(),
-                };
-                return Err(if me.is_some_and(|me| me != directory_uid) {
-                    KeyStoreError::DirectoryOfAnotherUser(directory.to_path_buf())
-                } else {
-                    KeyStoreError::DirectoryNotWritable(directory.to_path_buf())
-                });
-            }
-            Err(error) => return Err(KeyStoreError::Io(directory.to_path_buf(), error)),
-        };
+        let prefix = temporary_prefix(&name.unwrap_or_default());
+        let (mut file, temporary) = create_temporary(directory, &prefix).map_err(io_at(directory))?;
         let installed = (|| {
             file.write_all(pem.as_bytes()).map_err(io_at(&temporary))?;
             file.sync_all().map_err(io_at(&temporary))?;
-            let owner = match self.expected_owner {
-                Some(uid) => uid,
-                None => file.metadata().map_err(io_at(&temporary))?.uid(),
-            };
-            if owner != directory_uid {
-                // Whoever owns the directory can swap what is in it; the key would be theirs, not this user's.
-                return Err(KeyStoreError::DirectoryOfAnotherUser(directory.to_path_buf()));
-            }
             match std::fs::hard_link(&temporary, &self.path) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {

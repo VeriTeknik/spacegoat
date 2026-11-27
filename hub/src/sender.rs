@@ -9,10 +9,13 @@
 //! What it guarantees:
 //! - an event is forgotten only after the service confirmed it (`200` with `accepted`, `duplicates` and `lastSeq`,
 //!   all integers from 0 to 2^53 - 1); any other `200` (a proxy page, a captive portal) confirms nothing. A `200` to
-//!   a batch that moves the confirmed mark nowhere is a failure: it backs off rather than send the batch again at once;
+//!   a batch that moves the confirmed mark nowhere is a failure: it backs off rather than send the batch again at once.
+//!   So is a confirmation the hub cannot record (its storage fails): it backs off, and the `Err` says why;
+//! - a request that carried more than one event and timed out halves the batch for the next attempt, as a `413`
+//!   does; a confirmed request lets it grow back, doubling, up to `MAX_EVENTS`;
 //! - a failed or unanswered request is sent again with the same bytes, so the service counts duplicates, never gaps.
-//!   The body is the outbox's stored event texts spliced into `{"events":[...],"schemaVersion":1}`, never the events
-//!   parsed and written again;
+//!   The body is the outbox's stored event texts spliced into `{"events":[...],"schemaVersion":N}`, never the events
+//!   parsed and written again, and a request carries events of one schema version only;
 //! - a refusal no retry can fix (rejected content, a conflicting replay, a service that lost what it had confirmed,
 //!   one event the service says is too large) to a request that carried events HALTS the sender (the same answer to
 //!   a heartbeat refused nothing, and backs off). A halted sender makes no request at all: knocking for
@@ -24,7 +27,8 @@
 //! - `401` does not halt. The service gives the same answer for an unknown key and for a clock that is more than five
 //!   minutes off, and a clock corrects itself: the sender says so (`problem`) and tries again, slowly;
 //! - it talks to one origin only: a redirect is never followed (the signed headers and the events would go with it),
-//!   no proxy is taken from the environment, and it is `https` unless the service is on this very machine;
+//!   no proxy is taken from the environment, and it is `https` unless the service is on this very machine, named
+//!   by a loopback literal (`127.0.0.1`, `[::1]`);
 //! - an answer that cannot be read in full, or is larger than 64 KiB, is no answer: the events are sent again.
 //!
 //! It also reads two things off every answer for the agent: how far the hub's clock is from the service's (`Date`,
@@ -42,10 +46,12 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde_json::{Map, Value};
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 
 use crate::canonical::MAX_SAFE_INTEGER;
 use crate::clock::{self, Clock, ClockReading};
-use crate::outbox::{Outbox, OutboxError, StoredEvent};
+use crate::outbox::{Outbox, OutboxError, SCHEMA_VERSION, StoredEvent};
 use crate::signing;
 
 pub const INGEST_PATH: &str = "/api/ops/evidence/ingest";
@@ -67,8 +73,9 @@ pub const CONNECT_TIMEOUT_SECONDS: u64 = 10;
 pub const UNAUTHORIZED_RETRY_SECONDS: u64 = 240;
 pub const MAX_ANSWER_BYTES: u64 = 64 * 1024;
 
-/// The hosts plain `http` is allowed for: this very machine.
-const LOCAL_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
+/// The hosts plain `http` is allowed for: this very machine, by its loopback address literally. Not the name
+/// `localhost`: a name is resolved, and a resolver can answer it with an address on the network.
+const LOCAL_HOSTS: [&str; 2] = ["127.0.0.1", "::1"];
 const MS_PER_SECOND: i64 = 1000;
 
 /// Why the sender stopped for good (until a person starts the agent again).
@@ -146,7 +153,17 @@ impl fmt::Display for Problem {
 /// Why the last request confirmed nothing (closed list; the status shows `as_text`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceTrouble {
-    /// No answer at all: nobody there, a connection refused or dropped, a timeout, a TLS failure.
+    /// The service's name could not be resolved to an address.
+    Dns,
+    /// The connection was refused: nothing listens there.
+    Refused,
+    /// No complete answer within the request's time (`REQUEST_TIMEOUT_SECONDS`), or no connection within
+    /// `CONNECT_TIMEOUT_SECONDS`.
+    Timeout,
+    /// The TLS handshake failed: a certificate that does not verify (or a clock it is not valid at), or a peer that
+    /// does not speak TLS.
+    Tls,
+    /// No answer for any other reason: a connection reset or dropped, a network that is unreachable.
     NoConnection,
     /// An answer with this HTTP status that confirmed nothing.
     Http(u16),
@@ -159,10 +176,38 @@ pub enum ServiceTrouble {
 impl ServiceTrouble {
     pub fn as_text(self) -> String {
         match self {
+            Self::Dns => "dns".to_owned(),
+            Self::Refused => "refused".to_owned(),
+            Self::Timeout => "timeout".to_owned(),
+            Self::Tls => "tls".to_owned(),
             Self::NoConnection => "no_connection".to_owned(),
             Self::Http(status) => format!("http_{status}"),
             Self::Unreadable => "unreadable".to_owned(),
             Self::NotConfirming => "not_confirming".to_owned(),
+        }
+    }
+
+    /// What kind of "no answer" a request error is, from its kind alone: the error's text is never looked at, and
+    /// never kept (it can name the service's address).
+    ///
+    /// From ureq 3.5's own sources: a name that does not resolve is `HostNotFound` (the resolver below turns every
+    /// resolution failure into it); a refused connect is an `Io` of kind `ConnectionRefused`; every timeout ureq
+    /// enforces is `Timeout` (an `Io` of kind `TimedOut` is the socket's own); a TLS failure is `Tls`, `Rustls` or
+    /// `Pem`, or an `Io` of kind `InvalidData`, which is how rustls's `complete_io` reports a handshake that failed
+    /// (a certificate, an alert, a peer that answered in plain text) and which nothing else on the plain-TCP path
+    /// produces.
+    fn of_request_error(error: &ureq::Error) -> Self {
+        match error {
+            ureq::Error::HostNotFound => Self::Dns,
+            ureq::Error::Timeout(_) => Self::Timeout,
+            ureq::Error::Tls(_) | ureq::Error::Rustls(_) | ureq::Error::Pem(_) | ureq::Error::TlsRequired => Self::Tls,
+            ureq::Error::Io(io) => match io.kind() {
+                io::ErrorKind::ConnectionRefused => Self::Refused,
+                io::ErrorKind::TimedOut => Self::Timeout,
+                io::ErrorKind::InvalidData => Self::Tls,
+                _ => Self::NoConnection,
+            },
+            _ => Self::NoConnection,
         }
     }
 }
@@ -273,31 +318,9 @@ impl Sender {
         clock: Arc<dyn Clock>,
     ) -> Result<Self, OriginError> {
         let url = format!("{}{INGEST_PATH}", service_origin(base_url)?);
-        let config = ureq::Agent::config_builder()
-            // An answer that points elsewhere is an answer, not an instruction. With 0 the 3xx itself is returned.
-            .max_redirects(0)
-            // Config::default() reads HTTP(S)_PROXY and ALL_PROXY from the environment; this hub talks to one origin.
-            .proxy(None)
-            // 4xx and 5xx are answers the protocol defines, read like any other.
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(REQUEST_TIMEOUT_SECONDS)))
-            .timeout_connect(Some(Duration::from_secs(CONNECT_TIMEOUT_SECONDS)))
-            // One request every few minutes: a kept connection would only go stale and fail the next request.
-            .max_idle_connections(0)
-            .max_idle_connections_per_host(0)
-            .user_agent(concat!("spacegoat-hub/", env!("CARGO_PKG_VERSION")))
-            // rustls (ring) with Mozilla's roots compiled in: a device image without a CA bundle still verifies the
-            // service, and nothing on the device's disk decides whom the hub trusts.
-            .tls_config(
-                TlsConfig::builder()
-                    .provider(TlsProvider::Rustls)
-                    .root_certs(RootCerts::WebPki)
-                    .build(),
-            )
-            .build();
         Ok(Self {
             url,
-            agent: ureq::Agent::new_with_config(config),
+            agent: http_agent(Duration::from_secs(REQUEST_TIMEOUT_SECONDS)),
             principal: format!("source:{source_id}"),
             key_id: key_id.to_owned(),
             key,
@@ -316,6 +339,14 @@ impl Sender {
             reading: None,
             service_last_seq: None,
         })
+    }
+
+    /// A shorter request timeout than `REQUEST_TIMEOUT_SECONDS`, for tests that must see one expire. Production
+    /// never calls it.
+    #[doc(hidden)]
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.agent = http_agent(timeout);
+        self
     }
 
     /// Smaller request limits than the protocol's (for tests, or a service that asks for less). Never larger: the
@@ -401,7 +432,7 @@ impl Sender {
         if let Some(waiting) = self.gate() {
             return Ok(waiting);
         }
-        let events = self.outbox.pending(self.batch_limit, None)?;
+        let events = self.batch()?;
         if events.is_empty() && !self.heartbeat_due() {
             return Ok(SendOutcome::Idle);
         }
@@ -414,7 +445,7 @@ impl Sender {
         if let Some(waiting) = self.gate() {
             return Ok(waiting);
         }
-        let events = self.outbox.pending(self.batch_limit, None)?;
+        let events = self.batch()?;
         if events.is_empty() {
             return Ok(SendOutcome::Idle);
         }
@@ -431,16 +462,15 @@ impl Sender {
         self.exchange(&[])
     }
 
-    /// A heartbeat only if one is due, and no events: while the agent cannot trust its clock it keeps the service
-    /// informed (and takes a new reading) without delivering.
-    pub fn heartbeat_if_due(&mut self) -> Result<SendOutcome, SenderError> {
-        if let Some(waiting) = self.gate() {
-            return Ok(waiting);
+    /// What waits, up to the batch limit, and only as far as it shares the first event's schema version: one request
+    /// carries one `schemaVersion`.
+    fn batch(&self) -> Result<Vec<StoredEvent>, SenderError> {
+        let mut events = self.outbox.pending(self.batch_limit, None)?;
+        if let Some(first) = events.first().map(|event| event.schema_version) {
+            let same = events.iter().take_while(|event| event.schema_version == first).count();
+            events.truncate(same);
         }
-        if !self.heartbeat_due() {
-            return Ok(SendOutcome::Idle);
-        }
-        self.exchange(&[])
+        Ok(events)
     }
 
     /// The outcome without a request: halted, or waiting until the monotonic `not_before`.
@@ -461,6 +491,11 @@ impl Sender {
             Ok(answer) => answer,
             Err(trouble) => {
                 self.trouble = Some(trouble);
+                if trouble == ServiceTrouble::Timeout && count > 1 {
+                    // A batch the service could not answer for in time may be too much for the link or for it: the
+                    // next attempt carries half, as after a `413`. A confirmed request lets it grow back.
+                    self.batch_limit = (count / 2).max(1);
+                }
                 return Ok(self.back_off());
             }
         };
@@ -534,7 +569,7 @@ impl Sender {
             .header("X-VT-Timestamp", &timestamp)
             .header("X-VT-Signature", &signature)
             .send(body)
-            .map_err(|_| ServiceTrouble::NoConnection)?;
+            .map_err(|error| ServiceTrouble::of_request_error(&error))?;
         let status = response.status().as_u16();
         let single = |name: &str| {
             let mut values = response.headers().get_all(name).iter();
@@ -603,7 +638,12 @@ impl Sender {
         match self.outbox.ack(last_seq) {
             Ok(()) => {}
             Err(OutboxError::AckAhead) => return Ok(self.halt(HaltReason::Ahead)),
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                // The service confirmed, the hub could not record it (a full disk, a read-only file system, a held
+                // lock): a failure like any other. Sending the same batch again at once only meets the same disk.
+                self.back_off();
+                return Err(error.into());
+            }
         }
         if sent > 0 && self.outbox.last_acked()? <= before {
             // Events went and the service confirmed none of them: whatever it is, sending the same batch again at
@@ -624,11 +664,9 @@ impl Sender {
         SendOutcome::RetryLater(seconds)
     }
 
-    /// 5 s, doubling with each failure in a row, at most `BACKOFF_MAX_SECONDS`.
+    /// The back-off after one more failure in a row (`backoff_seconds`).
     fn back_off(&mut self) -> SendOutcome {
-        let seconds = BACKOFF_FIRST_SECONDS
-            .saturating_mul(1u64 << self.failures.min(16))
-            .min(BACKOFF_MAX_SECONDS);
+        let seconds = backoff_seconds(self.failures);
         self.failures = self.failures.saturating_add(1);
         self.wait(seconds)
     }
@@ -647,9 +685,11 @@ impl fmt::Debug for Sender {
     }
 }
 
-/// `{"events":[...],"schemaVersion":1}` with the stored texts spliced in as they are. It is the canonical JSON of
-/// that object (keys sorted, no whitespace) because each stored text is canonical itself.
+/// `{"events":[...],"schemaVersion":N}` with the stored texts spliced in as they are, N the events' own schema version
+/// (`SCHEMA_VERSION` for a heartbeat). It is the canonical JSON of that object (keys sorted, no whitespace) because
+/// each stored text is canonical itself.
 fn request_body(events: &[StoredEvent]) -> String {
+    let schema_version = events.first().map_or(SCHEMA_VERSION, |event| event.schema_version);
     let length = events.iter().map(|event| event.json.len() + 1).sum::<usize>();
     let mut body = String::with_capacity(length + 32);
     body.push_str("{\"events\":[");
@@ -659,7 +699,9 @@ fn request_body(events: &[StoredEvent]) -> String {
         }
         body.push_str(&event.json);
     }
-    body.push_str("],\"schemaVersion\":1}");
+    body.push_str("],\"schemaVersion\":");
+    body.push_str(&schema_version.to_string());
+    body.push('}');
     body
 }
 
@@ -675,6 +717,14 @@ fn json_object(raw: &[u8]) -> Map<String, Value> {
         Ok(Value::Object(map)) => map,
         _ => Map::new(),
     }
+}
+
+/// The wait after `failures` failures in a row before this one: 5 s, doubling with each, at most
+/// `BACKOFF_MAX_SECONDS`. The one rule for every back-off: the sender's, and the run loop's after a tick that failed.
+pub fn backoff_seconds(failures: u32) -> u64 {
+    BACKOFF_FIRST_SECONDS
+        .saturating_mul(1u64 << failures.min(16))
+        .min(BACKOFF_MAX_SECONDS)
 }
 
 /// Whole seconds, rounded up.
@@ -700,9 +750,10 @@ fn retry_after(value: Option<&str>, now: i64) -> u64 {
 
 /// `scheme://host[:port]` of the hub service, or the reason it is not one.
 ///
-/// `https` only; plain `http` is for a service on this very machine (development, tests) and nothing else. No path
+/// `https` only; plain `http` is for a service on this very machine (development, tests), named by `127.0.0.1` or
+/// `[::1]`, and nothing else. No path
 /// (beyond a single `/`), query, fragment or credentials: the request path is part of what is signed, and a prefix
-/// check on the text would accept `http://localhost.evil.example`. The scheme and the host are compared and returned
+/// check on the text would accept `http://127.0.0.1.evil.example`. The scheme and the host are compared and returned
 /// in lowercase.
 pub fn service_origin(base_url: &str) -> Result<String, OriginError> {
     let (scheme, rest) = base_url.split_once("://").ok_or(OriginError("not a URL"))?;
@@ -721,7 +772,7 @@ pub fn service_origin(base_url: &str) -> Result<String, OriginError> {
     let (host, port) = split_host_port(authority)?;
     let host = host.to_ascii_lowercase();
     if scheme == "http" && !LOCAL_HOSTS.contains(&host.as_str()) {
-        return Err(OriginError("must be https (http only for this machine)"));
+        return Err(OriginError("must be https (http only for 127.0.0.1 or [::1])"));
     }
     let name = if host.contains(':') { format!("[{host}]") } else { host };
     Ok(match port {
@@ -766,4 +817,50 @@ fn split_host_port(authority: &str) -> Result<(&str, Option<u16>), OriginError> 
         }
     };
     Ok((host, port))
+}
+
+/// The HTTP client: one origin, no redirects, no proxy from the environment, `timeout` for the whole request.
+fn http_agent(timeout: Duration) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        // An answer that points elsewhere is an answer, not an instruction. With 0 the 3xx itself is returned.
+        .max_redirects(0)
+        // Config::default() reads HTTP(S)_PROXY and ALL_PROXY from the environment; this hub talks to one origin.
+        .proxy(None)
+        // 4xx and 5xx are answers the protocol defines, read like any other.
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout))
+        .timeout_connect(Some(Duration::from_secs(CONNECT_TIMEOUT_SECONDS)))
+        // One request every few minutes: a kept connection would only go stale and fail the next request.
+        .max_idle_connections(0)
+        .max_idle_connections_per_host(0)
+        .user_agent(concat!("spacegoat-hub/", env!("CARGO_PKG_VERSION")))
+        // rustls (ring) with Mozilla's roots compiled in: a device image without a CA bundle still verifies the
+        // service, and nothing on the device's disk decides whom the hub trusts.
+        .tls_config(
+            TlsConfig::builder()
+                .provider(TlsProvider::Rustls)
+                .root_certs(RootCerts::WebPki)
+                .build(),
+        )
+        .build();
+    ureq::Agent::with_parts(config, DefaultConnector::new(), NameResolver::default())
+}
+
+/// ureq's own resolver, with every failure to resolve said the same way (`HostNotFound`): a name that does not
+/// resolve otherwise arrives as an `Io` error indistinguishable by kind from a socket's (std reports `getaddrinfo`
+/// failures with an uncategorised kind). It resolves in a short-lived thread of ureq's, one per request.
+#[derive(Debug, Default)]
+struct NameResolver(DefaultResolver);
+
+impl Resolver for NameResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        config: &ureq::config::Config,
+        timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        self.0
+            .resolve(uri, config, timeout)
+            .map_err(|_| ureq::Error::HostNotFound)
+    }
 }

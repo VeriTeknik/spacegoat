@@ -93,18 +93,6 @@ pub fn non_file_kind(path: &Path) -> io::Result<Option<&'static str>> {
     }
 }
 
-/// The user this process creates files as (std cannot ask for the effective uid): the owner of a temporary file made
-/// for a moment in the system's temporary directory, and removed again. Nothing in the state directory is touched.
-pub fn current_uid() -> io::Result<u32> {
-    let (file, path) = create_temporary(&std::env::temp_dir(), ".spacegoat-hub-uid.")?;
-    let uid = file.metadata().map(|meta| meta.uid());
-    drop(file);
-    let removed = std::fs::remove_file(&path);
-    let uid = uid?;
-    removed?;
-    Ok(uid)
-}
-
 /// Create `path` for its owner only, or, if it exists, make sure it still is: the hub's state files hold personal
 /// data (queued events, what was last seen of each device). A file of the hub's own that has become readable by
 /// others is closed again, not trusted as it is. A symbolic link or anything but a regular file is refused.
@@ -154,7 +142,20 @@ fn not_a_regular_file(path: &Path) -> io::Error {
     )
 }
 
-/// The directory `path` is in and the prefix of its temporary files (`.<name>.`).
+/// The prefix of the temporary files `write_atomic` makes for a file named `name`: `.<name>.` (followed by
+/// `NAME_RANDOM_BYTES` as lowercase hex). The sweeper recognises leftovers by it (`is_temporary_of`).
+pub fn temporary_prefix(name: &str) -> String {
+    format!(".{name}.")
+}
+
+/// Whether `candidate` is a temporary file name of `name`: its prefix and exactly the random hex, nothing else.
+pub fn is_temporary_of(name: &str, candidate: &str) -> bool {
+    candidate.strip_prefix(&temporary_prefix(name)).is_some_and(|rest| {
+        rest.len() == NAME_RANDOM_BYTES * 2 && rest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// The directory `path` is in and the prefix of its temporary files (`temporary_prefix`).
 fn parts(path: &Path) -> io::Result<(&Path, String)> {
     let name = path
         .file_name()
@@ -163,5 +164,5 @@ fn parts(path: &Path) -> io::Result<(&Path, String)> {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
-    Ok((directory, format!(".{}.", name.to_string_lossy())))
+    Ok((directory, temporary_prefix(&name.to_string_lossy())))
 }

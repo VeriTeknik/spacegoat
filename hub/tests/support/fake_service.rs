@@ -155,7 +155,7 @@ pub enum Step {
     /// Process the batch for real, then drop the connection before answering.
     LoseAnswer,
     /// Process the batch for real, then wait this long before answering (a request still in flight, e.g. while the
-    /// hub is killed). The service answers nothing else meanwhile.
+    /// hub is killed, or one the hub gives up on). Later requests are served meanwhile.
     Delay(Duration),
     /// Answer 413 above this many events (for this one request).
     MaxEvents(usize),
@@ -494,8 +494,14 @@ fn serve(state: &Arc<Mutex<State>>, mut stream: TcpStream) {
             let _ = stream.write_all(&bytes);
         }
         Outcome::Late(pause, body) => {
-            std::thread::sleep(pause);
-            write_answer(&mut stream, now, 200, &body, &[], true);
+            // Answered from a thread of its own, so the service takes the next request meanwhile (a client that gave
+            // up on this answer sends again at once).
+            std::thread::spawn(move || {
+                std::thread::sleep(pause);
+                write_answer(&mut stream, now, 200, &body, &[], true);
+                let _ = stream.shutdown(Shutdown::Both);
+            });
+            return;
         }
         Outcome::Drop => {}
     }

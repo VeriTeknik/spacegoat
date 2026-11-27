@@ -545,6 +545,14 @@ fn the_file_is_private_and_durable() {
     assert_eq!(journal, "wal");
     // FULL = 2: a committed event survives a power cut. (A per-connection setting: asked of the outbox itself.)
     assert_eq!(outbox.synchronous().unwrap(), 2);
+    // ON = 1: a confirmed event's personal data is overwritten when it is deleted, not left in a free page.
+    assert_eq!(outbox.secure_delete().unwrap(), 1);
+    let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    assert_eq!(version, 1);
+    let schema: i64 = db
+        .query_row("SELECT schema_version FROM events WHERE seq = 1", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(schema, 1, "the protocol schemaVersion the event was built for");
 }
 
 #[test]

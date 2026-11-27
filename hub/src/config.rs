@@ -47,7 +47,7 @@ impl fmt::Display for ConfigError {
             Self::Missing(key) => write!(f, "configuration key {key} is missing"),
             Self::BaseUrl(error) => error.fmt(f),
             Self::SourceId => f.write_str("source_id must be the UUID the service assigned at registration"),
-            Self::KeyId => f.write_str("key_id must be 3 to 63 characters of a-z, 0-9 and -"),
+            Self::KeyId => write!(f, "key_id: {}", signing::KEY_ID_RULE),
             Self::StateDir => f.write_str("state_dir must be an absolute path"),
         }
     }

@@ -17,6 +17,13 @@
 //!
 //! A file that is not a database, or fails SQLite's own `quick_check`, is recognised as such (`database_is_damaged`)
 //! so the agent can set it aside and treat the queue as lost, rather than not start at all.
+//!
+//! The file records its format (`PRAGMA user_version`, `FORMAT_VERSION`), set when it is created: a file a newer build
+//! wrote is refused rather than written into, and so is a database of no known format. Each event records the
+//! protocol `schemaVersion` it was built for, so a request never mixes two (`sender`).
+//!
+//! Several events can be appended in one transaction (`append_all`): what one round of capture produces is stored
+//! whole or not at all, with one synchronous commit instead of one per event.
 
 use std::fmt;
 use std::io;
@@ -32,9 +39,14 @@ use crate::canonical::canonical_json;
 use crate::clock;
 use crate::fsutil::private_file;
 use crate::signing::{self, EventFields, SigningError};
+use crate::storage::Cause;
 
 /// How long a write waits for another connection's lock.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// The format of the files this code writes (`PRAGMA user_version`), the outbox's and the pseudonym store's.
+pub const FORMAT_VERSION: i64 = 1;
+/// The protocol's `schemaVersion` of the events this code builds.
+pub const SCHEMA_VERSION: u64 = 1;
 
 /// Why a queue was started again from the service's count (spec/protocol.md, `site_source.reset`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,11 +66,64 @@ impl ResetReason {
     }
 }
 
-/// An event as it was stored: its sequence number and the exact JSON text that is sent, every time.
+/// An event as it was stored: its sequence number, the protocol `schemaVersion` it was built for, and the exact JSON
+/// text that is sent, every time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredEvent {
     pub seq: u64,
+    pub schema_version: u64,
     pub json: String,
+}
+
+/// An observation to be appended (`Outbox::append_all`).
+#[derive(Debug, Clone, Copy)]
+pub struct NewEvent<'a> {
+    pub kind: &'a str,
+    pub observed_at: &'a str,
+    pub attributes: &'a Map<String, Value>,
+    pub pii: Option<&'a Map<String, Value>>,
+}
+
+/// A database file whose format this code does not write: what was found, and where.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatError {
+    /// A newer build wrote it (`user_version` above `FORMAT_VERSION`).
+    Newer { file: &'static str, found: i64 },
+    /// It holds tables but records no format (`user_version` 0), or a negative one: nothing this code wrote.
+    Unknown { file: &'static str },
+}
+
+impl fmt::Display for FormatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Newer { file, found } => write!(
+                f,
+                "{file} was written by a newer version of spacegoat-hub (format {found}; this one writes format \
+                 {FORMAT_VERSION}) and is not written into: run that version again, or a person must look at it"
+            ),
+            Self::Unknown { file } => write!(
+                f,
+                "{file} is a database of no format this program knows (it records none): a person must look at it"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FormatError {}
+
+/// Why `open_durable` refused a database.
+#[derive(Debug)]
+pub(crate) enum DurableError {
+    Sqlite(rusqlite::Error),
+    /// The journal mode could not be set to WAL; the mode that stayed.
+    NoWal(String),
+    Format(FormatError),
+}
+
+impl From<rusqlite::Error> for DurableError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(error)
+    }
 }
 
 #[derive(Debug)]
@@ -72,6 +137,34 @@ pub enum OutboxError {
     ResetOnNonEmpty,
     /// The file holds something this code never writes.
     Damaged(&'static str),
+    /// Write-ahead logging could not be enabled; the journal mode that stayed.
+    NoWal(String),
+    /// A newer build wrote the file, or it is of no known format.
+    Format(FormatError),
+}
+
+impl From<DurableError> for OutboxError {
+    fn from(error: DurableError) -> Self {
+        match error {
+            DurableError::Sqlite(error) => Self::Sqlite(error),
+            DurableError::NoWal(mode) => Self::NoWal(mode),
+            DurableError::Format(error) => Self::Format(error),
+        }
+    }
+}
+
+impl OutboxError {
+    /// What kind of storage failure this is (`storage::Cause`).
+    pub fn cause(&self) -> Cause {
+        match self {
+            Self::Sqlite(error) => Cause::of_sqlite(error),
+            Self::Io(error) => Cause::of_io(error),
+            Self::Damaged(_) | Self::AckAhead => Cause::Damaged,
+            Self::Signing(_) | Self::AnotherSource | Self::ResetOnNonEmpty | Self::NoWal(_) | Self::Format(_) => {
+                Cause::Other
+            }
+        }
+    }
 }
 
 impl fmt::Display for OutboxError {
@@ -87,6 +180,12 @@ impl fmt::Display for OutboxError {
             Self::AckAhead => f.write_str("the service confirmed a sequence ahead of anything this hub assigned"),
             Self::ResetOnNonEmpty => f.write_str("a reset is declared on an empty outbox only"),
             Self::Damaged(what) => write!(f, "the outbox is damaged: {what}"),
+            Self::NoWal(mode) => write!(
+                f,
+                "outbox.sqlite: write-ahead logging cannot be enabled (the journal mode stays {mode}); the file \
+                 system may not support it, and without it a committed event is not safe from a power cut"
+            ),
+            Self::Format(error) => error.fmt(f),
         }
     }
 }
@@ -97,6 +196,7 @@ impl std::error::Error for OutboxError {
             Self::Sqlite(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::Signing(error) => Some(error),
+            Self::Format(error) => Some(error),
             _ => None,
         }
     }
@@ -137,10 +237,12 @@ impl Outbox {
             std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
         }
         private_file(path)?;
-        let db = open_durable(path)?;
-        db.execute_batch(
+        let db = open_durable(
+            path,
+            "outbox.sqlite",
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
-             CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, body TEXT NOT NULL);",
+             CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL,
+             body TEXT NOT NULL);",
         )?;
         let mut outbox = Self {
             db,
@@ -184,9 +286,19 @@ impl Outbox {
             [],
             |row| row.get(0),
         )?;
+        let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > FORMAT_VERSION {
+            return Err(OutboxError::Format(FormatError::Newer {
+                file: "outbox.sqlite",
+                found: version,
+            }));
+        }
         if !has_meta {
             // Created (private) but never given its tables: a process that died at its very first start.
             return Ok((0, 0));
+        }
+        if version != FORMAT_VERSION {
+            return Err(OutboxError::Format(FormatError::Unknown { file: "outbox.sqlite" }));
         }
         Ok((counter(&db, "last_assigned")?, counter(&db, "last_acked")?))
     }
@@ -220,6 +332,11 @@ impl Outbox {
         Ok(self.db.query_row("PRAGMA synchronous", [], |row| row.get(0))?)
     }
 
+    /// This connection's `PRAGMA secure_delete` (1 = ON); for tests and diagnostics.
+    pub fn secure_delete(&self) -> Result<i64, OutboxError> {
+        Ok(self.db.query_row("PRAGMA secure_delete", [], |row| row.get(0))?)
+    }
+
     /// Give an observation its place in the sequence and its signature. Returns the sequence number.
     pub fn append(
         &mut self,
@@ -228,18 +345,39 @@ impl Outbox {
         attributes: &Map<String, Value>,
         pii: Option<&Map<String, Value>>,
     ) -> Result<u64, OutboxError> {
+        let event = NewEvent {
+            kind,
+            observed_at,
+            attributes,
+            pii,
+        };
+        let numbers = self.append_all(&[event])?;
+        numbers
+            .last()
+            .copied()
+            .ok_or(OutboxError::Damaged("an append that assigned no number"))
+    }
+
+    /// Give several observations their places in the sequence, in order, in ONE transaction: all of them are stored,
+    /// or none is and no number is used. Returns their sequence numbers.
+    pub fn append_all(&mut self, events: &[NewEvent<'_>]) -> Result<Vec<u64>, OutboxError> {
         let signer = Signer {
             source_id: &self.source_id,
             key_id: &self.key_id,
             key: &self.key,
         };
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let seq = counter(&tx, "last_assigned")?
-            .checked_add(1)
-            .ok_or(OutboxError::Damaged("the sequence is exhausted"))?;
-        signer.store(&tx, seq, kind, observed_at, attributes, pii)?;
+        let mut numbers = Vec::with_capacity(events.len());
+        let mut seq = counter(&tx, "last_assigned")?;
+        for event in events {
+            seq = seq
+                .checked_add(1)
+                .ok_or(OutboxError::Damaged("the sequence is exhausted"))?;
+            signer.store(&tx, seq, event.kind, event.observed_at, event.attributes, event.pii)?;
+            numbers.push(seq);
+        }
         tx.commit()?;
-        Ok(seq)
+        Ok(numbers)
     }
 
     /// Start an empty outbox after a loss: the next event is `site_source.reset`, numbered right after the last
@@ -336,15 +474,21 @@ impl Outbox {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut statement = self
             .db
-            .prepare("SELECT seq, body FROM events WHERE seq >= ?1 ORDER BY seq LIMIT ?2")?;
+            .prepare("SELECT seq, schema_version, body FROM events WHERE seq >= ?1 ORDER BY seq LIMIT ?2")?;
         let rows = statement.query_map(params![start, limit], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
         })?;
         let mut events = Vec::new();
         for row in rows {
-            let (seq, json) = row?;
+            let (seq, schema_version, json) = row?;
             let seq = u64::try_from(seq).map_err(|_| OutboxError::Damaged("a negative sequence number"))?;
-            events.push(StoredEvent { seq, json });
+            let schema_version =
+                u64::try_from(schema_version).map_err(|_| OutboxError::Damaged("a negative schema version"))?;
+            events.push(StoredEvent {
+                seq,
+                schema_version,
+                json,
+            });
         }
         Ok(events)
     }
@@ -423,30 +567,54 @@ impl Signer<'_> {
         event.insert("signature".into(), Value::from(signature));
         let body = canonical_json(&Value::Object(event)).map_err(SigningError::from)?;
         let row = i64::try_from(seq).map_err(|_| OutboxError::Damaged("a sequence beyond i64"))?;
-        db.execute("INSERT INTO events (seq, body) VALUES (?1, ?2)", params![row, body])?;
+        let schema = i64::try_from(SCHEMA_VERSION).map_err(|_| OutboxError::Damaged("a schema version beyond i64"))?;
+        db.execute(
+            "INSERT INTO events (seq, schema_version, body) VALUES (?1, ?2, ?3)",
+            params![row, schema, body],
+        )?;
         set_meta(db, "last_assigned", &seq.to_string())?;
         Ok(())
     }
 }
 
-/// A connection in WAL mode with `synchronous=FULL`: a committed event survives power loss, which is the whole
-/// point of the file. Shared with the pseudonym store.
-pub(crate) fn open_durable(path: &Path) -> Result<Connection, rusqlite::Error> {
-    let db = Connection::open(path)?;
+/// A connection in WAL mode with `synchronous=FULL` and `secure_delete=ON`, on a database of this code's format
+/// (`FORMAT_VERSION`). Shared with the pseudonym store; `file` names it in an error.
+///
+/// - `synchronous=FULL`: a committed event survives power loss, which is the whole point of the file.
+/// - `secure_delete=ON`: what is deleted (a confirmed event, forgotten facts: personal data) is overwritten, not left in
+///   a free page. A copy can still sit in the write-ahead log until SQLite reuses that part of it.
+/// - the format: a new database (no tables) gets `schema` and `user_version = FORMAT_VERSION` in one transaction; one
+///   a newer build wrote, or one that has tables and no format, is refused.
+pub(crate) fn open_durable(path: &Path, file: &'static str, schema: &str) -> Result<Connection, DurableError> {
+    let mut db = Connection::open(path)?;
     // SQLite opens a file it may not write read-only and says so only at the first write: a store that cannot keep
     // what it is given is refused here, at the start.
     if db.is_readonly(rusqlite::MAIN_DB)? {
-        return Err(rusqlite::Error::SqliteFailure(
+        return Err(DurableError::Sqlite(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY),
             Some("the database file cannot be written".to_owned()),
-        ));
+        )));
     }
     db.busy_timeout(BUSY_TIMEOUT)?;
     let mode: String = db.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(DurableError::NoWal(mode));
     }
-    db.execute_batch("PRAGMA synchronous=FULL")?;
+    db.execute_batch("PRAGMA synchronous=FULL; PRAGMA secure_delete=ON")?;
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let empty: bool = tx.query_row("SELECT NOT EXISTS (SELECT 1 FROM sqlite_schema)", [], |row| row.get(0))?;
+    if version > FORMAT_VERSION {
+        return Err(DurableError::Format(FormatError::Newer { file, found: version }));
+    }
+    if version != FORMAT_VERSION && !empty {
+        return Err(DurableError::Format(FormatError::Unknown { file }));
+    }
+    tx.execute_batch(schema)?;
+    if version != FORMAT_VERSION {
+        tx.execute_batch(&format!("PRAGMA user_version = {FORMAT_VERSION}"))?;
+    }
+    tx.commit()?;
     Ok(db)
 }
 

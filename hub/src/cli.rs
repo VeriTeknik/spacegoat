@@ -5,37 +5,43 @@
 //! counts and state only, never a device, a name or an address; an error is printed as a short reason, never a file's
 //! contents or key material. A usage error (an unknown command or option, a missing value) prints the usage text.
 //!
-//! Exit codes, the same in every command: 0 success; 1 the command ran and failed (a runtime error, nothing to
-//! resume, a halt not cleared, a key that already exists); 2 it could not start (usage, configuration, the state
-//! directory or a file of the hub's own in it, the key, another agent holding the lock).
+//! Exit codes, the same in every command, decided in one place (`could_not_start`, `failed`): 0 success; 1 the
+//! command ran and failed (a runtime error, nothing to resume, a halt not cleared, a key that already exists, a queue
+//! `status` cannot read); 2 it could not start (usage, configuration, the state directory or a file of the hub's own
+//! in it, one a newer version wrote, the key, another agent holding the lock).
 //!
-//! `status` does not change what the hub keeps: it creates no outbox, takes no lock, does not open the key, writes
-//! nothing in the state directory, and opens the outbox read-only. Reading a database in write-ahead-log mode can make
-//! SQLite create its `-wal` and `-shm` side files next to it when they are missing (it needs them to read a log a
-//! crash left behind, and an `immutable` read that would avoid them would also miss what that log holds); nothing else
-//! is written. It refuses what `run` refuses about the state directory, rather than print a status of nothing.
+//! `status` does not change what the hub keeps: it creates no outbox, takes no lock, does not open the key, and opens
+//! the outbox read-only. To learn which user it runs as it creates a file in the state directory for a moment and
+//! removes it again (`statedir`); on a state directory it cannot write it compares with the key file's owner instead.
+//! Reading a database in write-ahead-log mode can make SQLite create its `-wal` and `-shm` side files next to it when
+//! they are missing (it needs them to read a log a crash left behind, and an `immutable` read that would avoid them
+//! would also miss what that log holds); nothing else is written. It refuses what `run` refuses about the state
+//! directory, rather than print a status of nothing.
 //!
 //! `run` stops on SIGTERM or SIGINT: the tick in progress is finished, the agent is closed and the exit status is 0.
 //! Once the agent is open, a failure while running does not end it (`agent::run_reporting`); each change of what the
 //! status says is one line on stderr.
 //!
 //! `resume` clears a recorded halt, after a person has fixed the fault, and says what clearing it means for that
-//! reason; `--from-service` also sets the confirmed mark to 0, the way out of a `gap` halt.
+//! reason; `--from-service` also records that the hub takes the service's state as its starting point (a
+//! `site_source.reset`, `queue_lost`, at the service's number at its next greeting), the way out of a `gap` halt.
 
 use std::ffi::OsString;
+use std::fmt::Display;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use crate::agent::{self, Agent, AgentError, HALT_FILE, KEY_FILE, OUTBOX_FILE, ResumeOptions};
+use crate::agent::{self, Agent, AgentError, CONFIRMED_FILE, HALT_FILE, KEY_FILE, OUTBOX_FILE, ResumeOptions};
 use crate::clock::SystemClock;
-use crate::config::{self, Config};
+use crate::config;
 use crate::keystore::{FileKeyStore, KeyStoreError};
-use crate::outbox::Outbox;
+use crate::outbox::{Outbox, OutboxError};
 use crate::sender::HaltReason;
-use crate::signing;
+use crate::signing::{self, KEY_ID_RULE};
 use crate::simulate::SimulatedObserver;
+use crate::statedir::Access;
 
 pub const USAGE: &str = "usage: spacegoat-hub [-h] [--version] {keygen,public-key,run,status,resume} ...
 
@@ -57,6 +63,24 @@ pub const EXIT_FAILED: u8 = 1;
 pub const EXIT_USAGE: u8 = 2;
 
 const NO_OBSERVER: &str = "this version has no network observer yet; run with --simulate";
+
+/// The exit code of a command that did not succeed. The one place it is decided: `EXIT_USAGE` when it could not
+/// start, `EXIT_FAILED` when it ran and failed.
+fn exit_code(could_not_start: bool) -> u8 {
+    if could_not_start { EXIT_USAGE } else { EXIT_FAILED }
+}
+
+/// Say why the command could not start; its exit code.
+fn could_not_start(stderr: &mut dyn Write, reason: impl Display) -> u8 {
+    let _ = writeln!(stderr, "{reason}");
+    exit_code(true)
+}
+
+/// Say why the command, once started, failed; its exit code.
+fn failed(stderr: &mut dyn Write, reason: impl Display) -> u8 {
+    let _ = writeln!(stderr, "{reason}");
+    exit_code(false)
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -93,10 +117,7 @@ fn execute(
 ) -> u8 {
     let command = match parse(args) {
         Ok(command) => command,
-        Err(reason) => {
-            let _ = writeln!(stderr, "{USAGE}spacegoat-hub: error: {reason}");
-            return EXIT_USAGE;
-        }
+        Err(reason) => return could_not_start(stderr, format!("{USAGE}spacegoat-hub: error: {reason}")),
     };
     match command {
         Command::Help => {
@@ -208,70 +229,61 @@ fn shown(arg: &str) -> String {
     }
 }
 
-const KEY_ID_RULE: &str = "key id must be 3 to 63 characters of a-z, 0-9 and -";
-
 fn keygen(state_dir: &Path, key_id: &str, stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     if !signing::is_key_id(key_id) {
-        let _ = writeln!(stderr, "{KEY_ID_RULE}");
-        return EXIT_USAGE;
+        return could_not_start(stderr, KEY_ID_RULE);
     }
     let store = FileKeyStore::new(state_dir.join(KEY_FILE));
     if let Err(error) = store.create() {
-        let _ = match &error {
+        return match &error {
+            KeyStoreError::StateDirectory(_) => could_not_start(stderr, &error),
             // The way out that does not orphan a registered hub: the public half can always be printed again.
-            KeyStoreError::AlreadyExists(_) => writeln!(
+            KeyStoreError::AlreadyExists(_) => failed(
                 stderr,
-                "{error}; to see its public key: spacegoat-hub public-key --state-dir {}",
-                state_dir.display()
+                format!(
+                    "{error}; to see its public key: spacegoat-hub public-key --state-dir {}",
+                    state_dir.display()
+                ),
             ),
-            _ => writeln!(stderr, "{error}"),
+            _ => failed(stderr, &error),
         };
-        return if error.is_directory() { EXIT_USAGE } else { EXIT_FAILED };
     }
     let key = match store.write_key_id(key_id).and_then(|()| store.load()) {
         Ok(key) => key,
-        Err(error) => {
-            let _ = writeln!(stderr, "{error}");
-            return EXIT_FAILED;
-        }
+        Err(error) => return failed(stderr, error),
     };
     print_public(&key, key_id, stdout);
     EXIT_OK
 }
 
 /// The public half of the key that exists, for a `keygen` whose output was lost: nothing is created or changed. The
-/// key id is the one recorded beside the key; `--key-id` is needed only where none is recorded (a state directory
-/// made by an earlier build), and one that differs from the recorded id is refused.
+/// key id is the one recorded beside the key; `--key-id` is needed only where none is recorded (a `keygen` that
+/// stopped between writing the key and its id), and one that differs from the recorded id is refused.
 fn public_key(state_dir: &Path, given: Option<&str>, stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     if given.is_some_and(|id| !signing::is_key_id(id)) {
-        let _ = writeln!(stderr, "{KEY_ID_RULE}");
-        return EXIT_USAGE;
+        return could_not_start(stderr, KEY_ID_RULE);
     }
     let store = FileKeyStore::new(state_dir.join(KEY_FILE));
     let found = store.load().and_then(|key| Ok((key, store.read_key_id()?)));
     let (key, stored) = match found {
         Ok(found) => found,
-        Err(error) => {
-            let _ = writeln!(stderr, "{error}");
-            return EXIT_USAGE;
-        }
+        Err(error) => return could_not_start(stderr, error),
     };
     let key_id = match (stored, given) {
         (Some(stored), Some(given)) if stored != given => {
-            let _ = writeln!(
+            return could_not_start(
                 stderr,
-                "the key id given is {given}, but this key was generated as {stored}"
+                format!("the key id given is {given}, but this key was generated as {stored}"),
             );
-            return EXIT_USAGE;
         }
         (Some(stored), _) => stored,
         (None, Some(given)) => given.to_owned(),
         (None, None) => {
-            let _ = writeln!(
+            return could_not_start(
                 stderr,
-                "this state directory does not record its key id (an earlier build made it): give it with --key-id"
+                "this state directory does not record its key id (keygen stopped before it wrote it): give it \
+                 with --key-id",
             );
-            return EXIT_USAGE;
         }
     };
     print_public(&key, &key_id, stdout);
@@ -291,23 +303,21 @@ fn resume_command(path: &Path) -> String {
 }
 
 fn run_agent(path: &Path, simulate: bool, stderr: &mut dyn Write, stop: Arc<AtomicBool>, signals: bool) -> u8 {
-    let Some(config) = load_config(path, stderr) else {
-        return EXIT_USAGE;
+    let config = match config::load(path) {
+        Ok(config) => config,
+        Err(error) => return could_not_start(stderr, error),
     };
     if !simulate {
-        let _ = writeln!(stderr, "{NO_OBSERVER}");
-        return EXIT_USAGE;
+        return could_not_start(stderr, NO_OBSERVER);
     }
+    // Whatever keeps the agent from opening, it did not start.
     let mut agent = match Agent::open(
         &config,
         Box::new(SimulatedObserver::new()),
         Arc::new(SystemClock::new()),
     ) {
         Ok(agent) => agent,
-        Err(error) => {
-            let _ = writeln!(stderr, "{error}");
-            return EXIT_USAGE;
-        }
+        Err(error) => return could_not_start(stderr, error),
     };
     agent.set_resume_command(resume_command(path));
     for notice in agent.notices() {
@@ -316,9 +326,8 @@ fn run_agent(path: &Path, simulate: bool, stderr: &mut dyn Write, stop: Arc<Atom
     if signals {
         for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
             if let Err(error) = signal_hook::flag::register(signal, Arc::clone(&stop)) {
-                let _ = writeln!(stderr, "cannot handle signals: {error}");
                 let _ = agent.close();
-                return EXIT_FAILED;
+                return failed(stderr, format!("cannot handle signals: {error}"));
             }
         }
     }
@@ -327,45 +336,38 @@ fn run_agent(path: &Path, simulate: bool, stderr: &mut dyn Write, stop: Arc<Atom
     });
     match ran {
         Ok(()) => EXIT_OK,
-        Err(error) => {
-            let _ = writeln!(stderr, "{error}");
-            EXIT_FAILED
-        }
-    }
-}
-
-fn load_config(path: &Path, stderr: &mut dyn Write) -> Option<Config> {
-    match config::load(path) {
-        Ok(config) => Some(config),
-        Err(error) => {
-            let _ = writeln!(stderr, "{error}");
-            None
-        }
+        Err(error) => failed(stderr, error),
     }
 }
 
 fn status(path: &Path, stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
-    let Some(config) = load_config(path, stderr) else {
-        return EXIT_USAGE;
+    let config = match config::load(path) {
+        Ok(config) => config,
+        Err(error) => return could_not_start(stderr, error),
     };
     // What `run` would refuse to start on, `status` refuses too: an all-zero status of a directory nobody can run on
-    // would say "healthy, nothing yet" about it. Nothing is written in the directory.
+    // would say "healthy, nothing yet" about it.
     let state_dir = &config.state_dir;
-    if let Err(error) = agent::check_state_dir(state_dir, None, false).and_then(|()| agent::check_own_files(state_dir))
+    if let Err(error) =
+        agent::check_state_dir(state_dir, Access::Read, None).and_then(|()| agent::check_own_files(state_dir))
     {
-        let _ = writeln!(stderr, "{error}");
-        return EXIT_USAGE;
+        return could_not_start(stderr, error);
     }
     // Read-only: asking where the hub stands must not create a queue, take a lock from the agent or open the key.
-    let saved = agent::read_saved_status(state_dir).map_err(|error| format!("{}: {error}", agent::STATUS_FILE));
-    let halt = agent::read_halt(state_dir).map_err(|error| format!("{HALT_FILE}: {error}"));
-    let counters = Outbox::read_counters(&state_dir.join(OUTBOX_FILE)).map_err(|error| error.to_string());
-    let (saved, halt, counters) = match (saved, halt, counters) {
-        (Ok(saved), Ok(halt), Ok(counters)) => (saved, halt, counters),
-        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-            let _ = writeln!(stderr, "{error}");
-            return EXIT_FAILED;
-        }
+    let halt = match agent::read_halt(state_dir) {
+        Ok(halt) => halt,
+        Err(error) if error.could_not_start() => return could_not_start(stderr, error),
+        Err(error) => return failed(stderr, error),
+    };
+    let counters = match Outbox::read_counters(&state_dir.join(OUTBOX_FILE)) {
+        Ok(counters) => counters,
+        // A queue a newer version wrote, or of no known format: as `run` refuses it.
+        Err(error @ OutboxError::Format(_)) => return could_not_start(stderr, error),
+        Err(error) => return failed(stderr, error),
+    };
+    let saved = match agent::read_saved_status(state_dir) {
+        Ok(saved) => saved,
+        Err(error) => return failed(stderr, format!("{}: {error}", agent::STATUS_FILE)),
     };
     let status = agent::read_status(&config, counters, halt, saved, &resume_command(path));
     let _ = writeln!(stdout, "{}", status.to_json_text());
@@ -404,8 +406,9 @@ fn after_resume(reason: HaltReason) -> &'static str {
 }
 
 fn resume(path: &Path, from_service: bool, stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
-    let Some(config) = load_config(path, stderr) else {
-        return EXIT_USAGE;
+    let config = match config::load(path) {
+        Ok(config) => config,
+        Err(error) => return could_not_start(stderr, error),
     };
     let options = ResumeOptions {
         expected_owner: None,
@@ -417,9 +420,8 @@ fn resume(path: &Path, from_service: bool, stdout: &mut dyn Write, stderr: &mut 
             let _ = if from_service {
                 writeln!(
                     stdout,
-                    "cleared the halt: {}{since}, and set the confirmed mark to 0: at its next start the hub takes \
-                     the service's number as its starting point (a site_source.reset there, when the service holds \
-                     any)",
+                    "cleared the halt: {}{since}. At its next start the hub takes the service's number as its \
+                     starting point: a site_source.reset (queue_lost) there, also when the service holds nothing",
                     halt.reason
                 )
             } else {
@@ -432,26 +434,20 @@ fn resume(path: &Path, from_service: bool, stdout: &mut dyn Write, stderr: &mut 
             };
             EXIT_OK
         }
-        Ok(None) => {
-            let _ = writeln!(stderr, "nothing to resume: the agent is not halted");
-            EXIT_FAILED
-        }
+        Ok(None) => failed(stderr, "nothing to resume: the agent is not halted"),
         Err(error @ AgentError::AlreadyRunning(_)) => {
-            let _ = writeln!(stderr, "{error}; stop it before resuming");
-            EXIT_USAGE
+            could_not_start(stderr, format!("{error}; stop it before resuming"))
         }
-        Err(error) if error.is_start_refusal() => {
-            let _ = writeln!(stderr, "{error}");
-            EXIT_USAGE
-        }
-        Err(error @ AgentError::Io(HALT_FILE, _)) => {
-            let _ = writeln!(stderr, "{error}; the hub is still halted");
-            EXIT_FAILED
-        }
-        Err(error) => {
-            let _ = writeln!(stderr, "{error}");
-            EXIT_FAILED
-        }
+        Err(error) if error.could_not_start() => could_not_start(stderr, error),
+        Err(error @ AgentError::Io(HALT_FILE, _)) => failed(stderr, format!("{error}; the hub is still halted")),
+        Err(error @ AgentError::Io(CONFIRMED_FILE, _)) => failed(
+            stderr,
+            format!(
+                "{error}; the halt is cleared but the decision to take the service's state was not recorded: the \
+                 hub halts again with gap at its next start, and resume --from-service can be run again then"
+            ),
+        ),
+        Err(error) => failed(stderr, error),
     }
 }
 

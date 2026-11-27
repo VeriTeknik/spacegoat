@@ -255,7 +255,7 @@ fn test_nothing_is_produced_while_the_clock_is_not_set() {
     let saved = std::fs::read_to_string(hub.state.join("agent.json")).unwrap();
     assert_eq!(
         saved,
-        r#"{"halted": null, "waitingFor": "clock", "service": null, "problem": null}"#
+        r#"{"version": 1, "waitingFor": "clock", "service": null, "problem": null, "cause": null}"#
     );
 }
 
@@ -293,7 +293,7 @@ fn test_a_halted_agent_says_why_makes_no_request_and_produces_nothing_more() {
     let saved = std::fs::read_to_string(hub.state.join("agent.json")).unwrap();
     assert_eq!(
         saved,
-        r#"{"halted": "schema", "waitingFor": null, "service": "http_400", "problem": null}"#
+        r#"{"version": 1, "waitingFor": null, "service": "http_400", "problem": null, "cause": null}"#
     );
 }
 
@@ -385,7 +385,14 @@ fn test_the_reset_uses_the_number_the_service_holds_not_the_hubs_own_memory() {
     // The last answer was lost: the service is ahead of what the hub believes was confirmed.
     let hub = Hub::new();
     hub.run(3).close().unwrap();
-    std::fs::write(hub.state.join("confirmed.json"), r#"{"lastAckedSeq": 1}"#).unwrap();
+    std::fs::write(
+        hub.state.join("confirmed.json"),
+        format!(
+            r#"{{"version": 1, "lastAckedSeq": 1, "sourceId": "{}"}}"#,
+            hub.config.source_id
+        ),
+    )
+    .unwrap();
     hub.lose_outbox();
     let held = hub.service.last_seq();
     assert!(held > 1);
@@ -795,7 +802,14 @@ fn the_first_request_of_a_run_is_an_empty_heartbeat_even_when_events_wait() {
 fn a_service_that_holds_less_than_this_hub_had_confirmed_halts_with_gap() {
     for held in [0, 3] {
         let hub = Hub::new();
-        std::fs::write(hub.state.join("confirmed.json"), r#"{"lastAckedSeq": 10}"#).unwrap();
+        std::fs::write(
+            hub.state.join("confirmed.json"),
+            format!(
+                r#"{{"version": 1, "lastAckedSeq": 10, "sourceId": "{}"}}"#,
+                hub.config.source_id
+            ),
+        )
+        .unwrap();
         hub.service.set_last_seq(held);
         let mut agent = hub.run(3);
         let status = agent.status().unwrap();
@@ -895,7 +909,7 @@ fn a_crash_after_the_reset_was_declared_delivers_that_reset_and_declares_no_seco
         serde_json::from_str(&std::fs::read_to_string(hub.state.join("confirmed.json")).unwrap()).unwrap();
     assert_eq!(
         written,
-        json!({"lastAckedSeq": status.last_acked_seq, "sourceId": hub.config.source_id})
+        json!({"version": 1, "lastAckedSeq": status.last_acked_seq, "sourceId": hub.config.source_id})
     );
 }
 
@@ -1681,7 +1695,7 @@ fn an_unreadable_confirmed_mark_beside_a_queue_that_assigned_numbers_is_rewritte
         serde_json::from_str(&std::fs::read_to_string(hub.state.join("confirmed.json")).unwrap()).unwrap();
     assert_eq!(
         written,
-        json!({"lastAckedSeq": acked, "sourceId": hub.config.source_id})
+        json!({"version": 1, "lastAckedSeq": acked, "sourceId": hub.config.source_id})
     );
 }
 
@@ -1726,7 +1740,7 @@ fn a_confirmed_mark_of_another_source_counts_as_none() {
     let hub = Hub::new();
     std::fs::write(
         hub.state.join("confirmed.json"),
-        r#"{"lastAckedSeq": 10, "sourceId": "fedcba98-7654-4321-8fed-cba987654321"}"#,
+        r#"{"version": 1, "lastAckedSeq": 10, "sourceId": "fedcba98-7654-4321-8fed-cba987654321"}"#,
     )
     .unwrap();
     hub.service.set_last_seq(3);
@@ -1740,15 +1754,6 @@ fn a_confirmed_mark_of_another_source_counts_as_none() {
         reset_of(&hub)["attributes"],
         json!({"trustOrigin": "hub", "lastAckedSeq": 3, "reason": "reinstall"})
     );
-}
-
-#[test]
-fn a_confirmed_mark_in_the_earlier_form_is_this_sources() {
-    let hub = Hub::new();
-    std::fs::write(hub.state.join("confirmed.json"), r#"{"lastAckedSeq": 10}"#).unwrap();
-    hub.service.set_last_seq(3);
-    let agent = hub.run(2);
-    assert_eq!(agent.status().unwrap().halted.as_deref(), Some("gap"));
 }
 
 // ---- Files of the hub's own that are not files ----
@@ -1783,26 +1788,29 @@ fn a_status_halt_or_confirmed_file_that_is_a_link_or_a_directory_is_refused_by_n
 // ---- Resume ----
 
 #[test]
-fn resume_rewrites_the_status_file_before_it_removes_the_halt_and_says_when_removing_fails() {
+fn resume_that_cannot_remove_the_halt_says_so_and_the_hub_stays_halted() {
     let hub = Hub::new();
     let mut agent = hub.run(2);
     hub.service.push(Step::status(400, json!({"error": "schema"})));
     hub.clock.advance_seconds(3600);
     agent.tick().unwrap();
     agent.close().unwrap();
+    let saved_before = std::fs::read_to_string(hub.state.join("agent.json")).unwrap();
     let failed = agent::resume_with(&hub.config, agent::ResumeOptions::default(), &|_: &std::path::Path| {
         Err(std::io::Error::other("the disk said no"))
     })
     .unwrap_err();
     assert!(failed.to_string().contains("halt.json"), "{failed}");
-    let saved = std::fs::read_to_string(hub.state.join("agent.json")).unwrap();
-    assert!(saved.contains("\"halted\": null"), "{saved}");
     assert!(hub.state.join("halt.json").exists(), "still halted");
     assert_eq!(
         agent::read_halt(&hub.state).unwrap().unwrap().reason,
         "schema",
         "and the status still says so"
     );
+    // `agent.json` carries no copy of the halt, so resuming has nothing to rewrite there.
+    let saved = std::fs::read_to_string(hub.state.join("agent.json")).unwrap();
+    assert_eq!(saved, saved_before);
+    assert!(!saved.contains("halted"), "{saved}");
 }
 
 // ---- A healthy queue is never set aside ----
@@ -1847,4 +1855,546 @@ fn a_read_only_outbox_is_an_error_and_is_not_set_aside() {
         }
     }
     assert!(hub.agent().status().unwrap().last_assigned_seq > 0);
+}
+
+// ---- Third review round ----
+
+/// A trigger, from another connection, that makes every removal of a confirmed event fail: the queue can be read and
+/// appended to, but a confirmation cannot be recorded.
+fn break_confirmations(hub: &Hub, broken: bool) {
+    let db = rusqlite::Connection::open(hub.state.join("outbox.sqlite")).unwrap();
+    if broken {
+        db.execute_batch("CREATE TRIGGER unforgettable BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'no'); END")
+            .unwrap();
+    } else {
+        db.execute_batch("DROP TRIGGER unforgettable").unwrap();
+    }
+}
+
+/// `agent.json` as JSON.
+fn saved_json(hub: &Hub) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(hub.state.join("agent.json")).unwrap()).unwrap()
+}
+
+/// Run the agent for `minutes` of test time (no real sleeping), returning each reported line with the monotonic
+/// moment it was reported at.
+fn run_for(hub: &Hub, agent: Agent, minutes: i64, mut each: impl FnMut(i64)) -> Vec<(i64, String)> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let mut elapsed = 0i64;
+    let (clock, seen) = (hub.clock.clone(), Arc::clone(&lines));
+    agent::run_reporting(
+        agent,
+        Arc::clone(&stop),
+        |pause| {
+            elapsed += pause.as_millis() as i64;
+            hub.clock.advance_millis(pause.as_millis() as i64);
+            each(elapsed);
+            if elapsed >= minutes * 60_000 {
+                stop.store(true, Ordering::SeqCst);
+            }
+        },
+        move |line| seen.lock().unwrap().push((clock.mono(), line.to_owned())),
+    )
+    .unwrap();
+    lines.lock().unwrap().clone()
+}
+
+#[test]
+fn a_confirmation_the_hub_cannot_record_is_a_failure_with_a_back_off() {
+    let hub = Hub::new();
+    let agent = hub.agent();
+    break_confirmations(&hub, true);
+    let mut problems = Vec::new();
+    run_for(&hub, agent, 30, |elapsed| {
+        if elapsed % 60_000 == 0 {
+            problems.push(saved_json(&hub)["problem"].clone());
+        }
+    });
+    let times = request_times(&hub);
+    let carrying: Vec<i64> = hub
+        .service
+        .requests()
+        .iter()
+        .zip(&times)
+        .filter(|(record, _)| record.events.as_ref().is_some_and(|events| !events.is_empty()))
+        .map(|(_, time)| *time)
+        .collect();
+    // The same batch goes again only as the back-off allows: 5 s, doubling, at most 240 s.
+    for (index, pair) in carrying.windows(2).enumerate() {
+        let allowed = (5i64 << index.min(16)).min(240);
+        assert!(pair[1] - pair[0] >= allowed, "request {index}: {carrying:?}");
+    }
+    assert!(
+        (10..=14).contains(&carrying.len()),
+        "{} requests: {carrying:?}",
+        carrying.len()
+    );
+    assert!(
+        problems.iter().all(|problem| *problem == "outbox_failed"),
+        "{problems:?}"
+    );
+    // Repaired: the confirmation is recorded and the queue empties.
+    break_confirmations(&hub, false);
+    hub.clock.advance_seconds(300);
+    let mut agent = hub.agent();
+    agent.tick().unwrap();
+    agent.tick().unwrap();
+    assert_eq!(agent.status().unwrap().pending, 0);
+}
+
+/// An observer whose one device changes its name at every poll: every tick has an event to deliver.
+struct Flipping(usize);
+
+impl Observer for Flipping {
+    fn poll(&mut self) -> Vec<Sighting> {
+        self.0 += 1;
+        let name = if self.0.is_multiple_of(2) {
+            "even.example"
+        } else {
+            "odd.example"
+        };
+        vec![sighting("flip:1", "printer", None, Some(name), None)]
+    }
+}
+
+#[test]
+fn a_storage_failure_names_its_cause_in_the_status_and_in_the_reported_line() {
+    let hub = Hub::new();
+    let agent = hub.agent();
+    let mut broken = false;
+    let lines = run_for(&hub, agent, 3, |elapsed| {
+        if !broken && elapsed >= 60_000 {
+            // Something this code never writes, where a counter belongs.
+            let db = rusqlite::Connection::open(hub.state.join("outbox.sqlite")).unwrap();
+            db.execute("UPDATE meta SET value = 'seven' WHERE key = 'last_acked'", [])
+                .unwrap();
+            broken = true;
+        }
+    });
+    let saved = saved_json(&hub);
+    assert_eq!(
+        (saved["problem"].as_str(), saved["cause"].as_str()),
+        (Some("outbox_failed"), Some("damaged")),
+        "{saved}"
+    );
+    let said: Vec<&String> = lines.iter().map(|(_, line)| line).collect();
+    assert!(
+        said.iter()
+            .any(|line| line.contains("problem: outbox_failed (damaged)")),
+        "{said:?}"
+    );
+}
+
+#[test]
+fn the_cause_of_a_storage_error_comes_from_its_code_never_its_text() {
+    use rusqlite::ffi;
+    use spacegoat_hub::storage::Cause;
+    let sqlite = |code| rusqlite::Error::SqliteFailure(ffi::Error::new(code), Some("disk full of lies".to_owned()));
+    for (code, cause) in [
+        (ffi::SQLITE_FULL, Cause::DiskFull),
+        (ffi::SQLITE_READONLY, Cause::ReadOnly),
+        (ffi::SQLITE_PERM, Cause::ReadOnly),
+        (ffi::SQLITE_IOERR, Cause::Io),
+        (ffi::SQLITE_CANTOPEN, Cause::Io),
+        (ffi::SQLITE_BUSY, Cause::Locked),
+        (ffi::SQLITE_LOCKED, Cause::Locked),
+        (ffi::SQLITE_CORRUPT, Cause::Damaged),
+        (ffi::SQLITE_NOTADB, Cause::Damaged),
+        (ffi::SQLITE_CONSTRAINT, Cause::Other),
+    ] {
+        assert_eq!(Cause::of_sqlite(&sqlite(code)), cause, "{code}");
+    }
+    let io = |kind| std::io::Error::new(kind, "read only, says the text");
+    for (kind, cause) in [
+        (std::io::ErrorKind::StorageFull, Cause::DiskFull),
+        (std::io::ErrorKind::QuotaExceeded, Cause::DiskFull),
+        (std::io::ErrorKind::ReadOnlyFilesystem, Cause::ReadOnly),
+        (std::io::ErrorKind::PermissionDenied, Cause::ReadOnly),
+        (std::io::ErrorKind::WouldBlock, Cause::Locked),
+        (std::io::ErrorKind::InvalidData, Cause::Damaged),
+        (std::io::ErrorKind::UnexpectedEof, Cause::Io),
+        (std::io::ErrorKind::NotFound, Cause::Io),
+    ] {
+        assert_eq!(Cause::of_io(&io(kind)), cause, "{kind:?}");
+    }
+    let names: Vec<&str> = [
+        Cause::DiskFull,
+        Cause::ReadOnly,
+        Cause::Io,
+        Cause::Locked,
+        Cause::Damaged,
+        Cause::Other,
+    ]
+    .map(Cause::as_str)
+    .to_vec();
+    assert_eq!(names, ["disk_full", "read_only", "io", "locked", "damaged", "other"]);
+}
+
+#[test]
+fn a_state_that_flaps_is_reported_at_most_once_per_five_minutes_per_kind() {
+    let hub = Hub::new();
+    let agent = Agent::open(&hub.config, Box::new(Flipping(0)), hub.clock.as_clock()).unwrap();
+    hub.service.push(Step::Pass);
+    for _ in 0..400 {
+        hub.service.push(Step::status(503, json!({"error": "unavailable"})));
+        hub.service.push(Step::Pass);
+    }
+    let lines = run_for(&hub, agent, 30, |_| {});
+    assert!(lines.len() >= 2, "{lines:?}");
+    for (index, (at, line)) in lines.iter().enumerate() {
+        if let Some((before, _)) = lines[..index].iter().rev().find(|(_, earlier)| earlier == line) {
+            assert!(
+                at - before >= 300_000,
+                "{line:?} again after {} ms: {lines:?}",
+                at - before
+            );
+        }
+    }
+    assert!(lines.len() <= 14, "{} lines: {lines:?}", lines.len());
+}
+
+#[test]
+fn a_halt_is_reported_at_once_even_right_after_another_line() {
+    let hub = Hub::new();
+    let agent = Agent::open(&hub.config, Box::new(Flipping(0)), hub.clock.as_clock()).unwrap();
+    hub.service.push(Step::Pass);
+    hub.service.push(Step::status(503, json!({"error": "unavailable"})));
+    hub.service.push(Step::Pass);
+    hub.service.push(Step::status(503, json!({"error": "unavailable"})));
+    hub.service.push(Step::status(400, json!({"error": "schema"})));
+    let lines = run_for(&hub, agent, 3, |_| {});
+    let halted = lines.iter().find(|(_, line)| line.contains("halted: schema"));
+    assert!(halted.is_some(), "{lines:?}");
+}
+
+/// Keeps a file from being replaced (macOS: the owner's immutable flag) until dropped.
+struct Immutable(std::path::PathBuf);
+
+impl Drop for Immutable {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("chflags")
+            .arg("nouchg")
+            .arg(&self.0)
+            .status();
+    }
+}
+
+#[test]
+fn a_confirmed_mark_that_can_be_read_but_not_replaced_is_a_problem_until_it_is_written() {
+    if !cfg!(target_os = "macos") {
+        eprintln!("skipped: needs a file its owner cannot replace without root (chflags uchg, macOS only)");
+        return;
+    }
+    let hub = Hub::new();
+    let agent = Agent::open(&hub.config, Box::new(Flipping(0)), hub.clock.as_clock()).unwrap();
+    let mut agent = agent;
+    agent.tick().unwrap();
+    let path = hub.state.join("confirmed.json");
+    assert!(
+        std::process::Command::new("chflags")
+            .arg("uchg")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let _guard = Immutable(path.clone());
+    let mut problems = Vec::new();
+    for round in 0..12 {
+        // Every other tick moves the confirmed mark; the others deliver nothing.
+        hub.clock.advance_seconds(if round % 2 == 0 { 15 } else { 1 });
+        let _ = agent.tick();
+        problems.push(agent.status().unwrap().problem);
+    }
+    assert!(
+        problems
+            .iter()
+            .all(|problem| problem.as_deref() == Some("confirmed_failed")),
+        "{problems:?}"
+    );
+}
+
+// ---- resume --from-service leaves the confirmed mark alone when it cannot clear the halt ----
+
+fn gap_halted(hub: &Hub, held: u64) {
+    std::fs::write(
+        hub.state.join("confirmed.json"),
+        format!(
+            r#"{{"version": 1, "lastAckedSeq": 10, "sourceId": "{}"}}"#,
+            hub.config.source_id
+        ),
+    )
+    .unwrap();
+    hub.service.set_last_seq(held);
+    let agent = hub.run(2);
+    assert_eq!(agent.status().unwrap().halted.as_deref(), Some("gap"));
+    agent.close().unwrap();
+}
+
+#[test]
+fn resume_from_service_that_cannot_remove_the_halt_leaves_the_confirmed_mark_as_it_was() {
+    let hub = Hub::new();
+    gap_halted(&hub, 3);
+    let before = std::fs::read_to_string(hub.state.join("confirmed.json")).unwrap();
+    let options = agent::ResumeOptions {
+        from_service: true,
+        ..agent::ResumeOptions::default()
+    };
+    let failed = agent::resume_with(&hub.config, options, &|_: &std::path::Path| {
+        Err(std::io::Error::other("the disk said no"))
+    })
+    .unwrap_err();
+    assert!(failed.to_string().contains("halt.json"), "{failed}");
+    assert_eq!(
+        std::fs::read_to_string(hub.state.join("confirmed.json")).unwrap(),
+        before
+    );
+    assert!(hub.state.join("halt.json").exists());
+}
+
+// ---- A confirmed mark without a source id ----
+
+#[test]
+fn a_confirmed_mark_without_a_source_id_is_not_understood() {
+    let hub = Hub::new();
+    std::fs::write(
+        hub.state.join("confirmed.json"),
+        r#"{"version": 1, "lastAckedSeq": 10}"#,
+    )
+    .unwrap();
+    hub.service.set_last_seq(3);
+    let agent = hub.run(2);
+    assert_eq!(
+        agent.status().unwrap().halted,
+        None,
+        "not this source's mark: not a gap"
+    );
+    assert_eq!(
+        reset_of(&hub)["attributes"],
+        json!({"trustOrigin": "hub", "lastAckedSeq": 3, "reason": "queue_lost"})
+    );
+}
+
+// ---- The capture-stop mark ----
+
+#[test]
+fn a_short_halt_across_a_restart_is_not_declared() {
+    let hub = Hub::new();
+    let mut agent = hub.run(2);
+    hub.service.push(Step::status(400, json!({"error": "schema"})));
+    hub.clock.advance_seconds(3600);
+    agent.tick().unwrap();
+    assert_eq!(agent.status().unwrap().halted.as_deref(), Some("schema"));
+    agent.close().unwrap();
+    agent::resume(&hub.config, None).unwrap().unwrap();
+    hub.clock.advance_seconds(60);
+    hub.run(2).close().unwrap();
+    let lost = of_kind(&hub.service.accepted(), "site_source.input_lost");
+    assert!(lost.is_empty(), "a minute without capture: {lost:?}");
+    assert_gapless(&hub);
+}
+
+#[test]
+fn a_backlog_below_its_cap_at_open_does_not_stop_capture() {
+    let hub = Hub::new();
+    let open = |cap| {
+        let settings = agent::AgentSettings {
+            backlog_cap: cap,
+            ..agent::AgentSettings::default()
+        };
+        Agent::open_with(
+            &hub.config,
+            Box::new(SimulatedObserver::new()),
+            hub.clock.as_clock(),
+            settings,
+        )
+        .unwrap()
+    };
+    hub.service.push(Step::Pass);
+    for _ in 0..40 {
+        hub.service.push(Step::status(503, json!({"error": "unavailable"})));
+    }
+    let mut agent = open(4);
+    for _ in 0..6 {
+        agent.tick().unwrap();
+        hub.clock.advance_seconds(3600);
+    }
+    let full = agent.status().unwrap();
+    assert_eq!(full.pending, 4);
+    agent.close().unwrap();
+    // A larger cap: four waiting is more than half of it, but it is not full.
+    hub.service.clear_script();
+    hub.service.push(Step::Pass);
+    for _ in 0..40 {
+        hub.service.push(Step::status(503, json!({"error": "unavailable"})));
+    }
+    let mut agent = open(6);
+    agent.tick().unwrap();
+    let status = agent.status().unwrap();
+    assert!(
+        status.last_assigned_seq > full.last_assigned_seq,
+        "it captured: {status:?}"
+    );
+    assert_ne!(status.waiting_for.as_deref(), Some("backlog"));
+}
+
+// ---- Storage format versions ----
+
+fn user_version(path: &std::path::Path) -> i64 {
+    let db = rusqlite::Connection::open(path).unwrap();
+    db.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap()
+}
+
+#[test]
+fn both_databases_record_their_format_version_and_the_small_files_theirs() {
+    let hub = Hub::new();
+    let mut agent = hub.run(2);
+    hub.service.push(Step::status(400, json!({"error": "schema"})));
+    hub.clock.advance_seconds(3600);
+    agent.tick().unwrap();
+    agent.close().unwrap();
+    assert_eq!(user_version(&hub.state.join("outbox.sqlite")), 1);
+    assert_eq!(user_version(&hub.state.join("pseudonyms.sqlite")), 1);
+    for name in ["confirmed.json", "halt.json", "agent.json"] {
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(hub.state.join(name)).unwrap()).unwrap();
+        assert_eq!(saved["version"], 1, "{name}: {saved}");
+    }
+}
+
+#[test]
+fn a_database_a_newer_version_wrote_or_one_of_no_known_format_is_refused() {
+    for (name, version, said) in [
+        ("outbox.sqlite", 2, "newer"),
+        ("pseudonyms.sqlite", 2, "newer"),
+        ("outbox.sqlite", 0, "format"),
+    ] {
+        let hub = Hub::new();
+        hub.run(1).close().unwrap();
+        let db = rusqlite::Connection::open(hub.state.join(name)).unwrap();
+        db.execute_batch(&format!("PRAGMA user_version = {version}")).unwrap();
+        drop(db);
+        let refused = Agent::open(&hub.config, Box::new(SimulatedObserver::new()), hub.clock.as_clock())
+            .map(|_| ())
+            .unwrap_err();
+        let text = refused.to_string();
+        assert!(text.contains(name) && text.contains(said), "{name} {version}: {text}");
+        assert!(refused.could_not_start(), "{name} {version}");
+        assert!(!hub.state.join(format!("{name}.damaged")).exists(), "not damage");
+    }
+}
+
+#[test]
+fn a_halt_or_confirmed_mark_a_newer_version_wrote_is_refused_and_agent_json_is_rewritten() {
+    for name in ["halt.json", "confirmed.json"] {
+        let hub = Hub::new();
+        std::fs::write(
+            hub.state.join(name),
+            format!(
+                r#"{{"version": 2, "reason": "gap", "at": null, "lastAckedSeq": 1, "sourceId": "{}"}}"#,
+                hub.config.source_id
+            ),
+        )
+        .unwrap();
+        let refused = Agent::open(&hub.config, Box::new(SimulatedObserver::new()), hub.clock.as_clock())
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains(name) && refused.to_string().contains("newer"),
+            "{refused}"
+        );
+        assert!(hub.service.requests().is_empty());
+    }
+    let hub = Hub::new();
+    std::fs::write(hub.state.join("agent.json"), r#"{"version": 2, "whatever": true}"#).unwrap();
+    hub.run(1).close().unwrap();
+    assert_eq!(saved_json(&hub)["version"], 1);
+}
+
+// ---- Nothing personal lingers in free pages ----
+
+#[test]
+fn a_confirmed_event_leaves_no_personal_data_in_the_queue_file() {
+    let hub = Hub::new();
+    hub.run(5).close().unwrap();
+    assert_eq!(hub.service.last_seq(), {
+        let status: Vec<u64> = hub.service.accepted_seqs();
+        *status.last().unwrap()
+    });
+    let raw = std::fs::read(hub.state.join("outbox.sqlite")).unwrap();
+    let text = String::from_utf8_lossy(&raw);
+    assert_no_personal_data(&text, "outbox.sqlite after every event was confirmed");
+}
+
+// ---- One unreadable record of facts ----
+
+#[test]
+fn a_record_of_facts_that_cannot_be_read_is_reported_again_and_said_once() {
+    let hub = Hub::new();
+    hub.run(4).close().unwrap();
+    let db = rusqlite::Connection::open(hub.state.join("pseudonyms.sqlite")).unwrap();
+    db.execute(
+        "UPDATE refs SET facts = 'not an object' WHERE scope = 'device' AND identity = 'sim:printer'",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let printer = of_kind(&hub.service.accepted(), "site.device_appeared")[0]["attributes"]["deviceRef"].clone();
+    let lines = run_for(&hub, hub.agent(), 2, |_| {});
+    let again: Vec<Value> = of_kind(&hub.service.accepted(), "site.device_appeared")
+        .into_iter()
+        .filter(|event| event["attributes"]["deviceRef"] == printer)
+        .collect();
+    assert_eq!(again.len(), 2, "announced again, under the same reference");
+    let said: Vec<&(i64, String)> = lines
+        .iter()
+        .filter(|(_, line)| line.contains("pseudonyms.sqlite"))
+        .collect();
+    assert_eq!(said.len(), 1, "{lines:?}");
+    assert_no_personal_data(&said[0].1, "the line");
+    assert_eq!(saved_json(&hub)["problem"], Value::Null);
+}
+
+// ---- One transaction per tick ----
+
+#[test]
+fn what_one_tick_captures_is_stored_whole_or_not_at_all() {
+    let hub = Hub::new();
+    let mut agent = hub.agent();
+    agent.tick().unwrap();
+    let before = agent.status().unwrap().last_assigned_seq;
+    let db = rusqlite::Connection::open(hub.state.join("outbox.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER no_snapshots BEFORE INSERT ON events WHEN NEW.body LIKE '%inventory_snapshot%' \
+         BEGIN SELECT RAISE(ABORT, 'no'); END",
+    )
+    .unwrap();
+    hub.clock.advance_seconds(3600);
+    assert!(agent.tick().is_err());
+    assert_eq!(
+        agent.status().unwrap().last_assigned_seq,
+        before,
+        "the device events of the tick went with the snapshot that failed"
+    );
+    db.execute_batch("DROP TRIGGER no_snapshots").unwrap();
+    hub.clock.advance_seconds(1);
+    agent.tick().unwrap();
+    let accepted = hub.service.accepted();
+    let appeared = of_kind(&accepted, "site.device_appeared");
+    let refs: HashSet<&Value> = appeared.iter().map(|event| &event["attributes"]["deviceRef"]).collect();
+    assert_eq!((appeared.len(), refs.len()), (3, 3), "each once");
+    assert_gapless(&hub);
+}
+
+// ---- What the Debug form of a sighting shows ----
+
+#[test]
+fn a_sighting_debug_form_shows_nothing_personal() {
+    for sighting in spacegoat_hub::simulate::devices() {
+        let shown = format!("{sighting:?}");
+        assert_no_personal_data(&shown, "Debug of a sighting");
+        assert!(shown.contains(&sighting.device_class), "{shown}");
+        let pretty = format!("{sighting:#?}");
+        assert_no_personal_data(&pretty, "Debug of a sighting");
+    }
 }

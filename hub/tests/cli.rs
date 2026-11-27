@@ -124,6 +124,7 @@ fn test_status_prints_counts_and_no_device() {
         "waitingFor",
         "service",
         "problem",
+        "cause",
         "resume",
     ];
     // The order, as printed (serde_json's map sorts, so check the text).
@@ -534,8 +535,6 @@ fn status_shows_a_halt_with_its_time_and_names_resume_which_clears_it() {
         (after["halted"].clone(), after["resume"].clone()),
         (Value::Null, Value::Null)
     );
-    let saved = std::fs::read_to_string(hub.state.join("agent.json")).unwrap();
-    assert!(saved.contains("\"halted\": null"), "{saved}");
     // Nothing left to clear.
     let nothing = cli(&["resume", "--config", path(&hub.config_path)]);
     assert_eq!(nothing.code, 1);
@@ -579,9 +578,7 @@ fn run_says_once_on_stderr_that_it_halted_and_how_to_resume() {
         .push(Step::status(400, serde_json::json!({"error": "schema"})));
     let mut child = spawn_run(&hub);
     wait_until("the halt", || hub.state.join("halt.json").exists());
-    wait_until("agent.json to say so", || {
-        std::fs::read_to_string(hub.state.join("agent.json")).is_ok_and(|text| text.contains("\"halted\": \"schema\""))
-    });
+    wait_until("the halt to be reported", || status_of(&hub)["halted"] == "schema");
     signal(&child, "TERM");
     assert_eq!(exit_of(&mut child).code(), Some(0));
     let (out, err) = output_of(child);
@@ -597,7 +594,7 @@ fn run_says_once_on_stderr_that_it_halted_and_how_to_resume() {
 fn halted_with(hub: &Hub, reason: &str) {
     std::fs::write(
         hub.state.join("halt.json"),
-        format!("{{\"reason\": \"{reason}\", \"at\": null}}"),
+        format!("{{\"version\": 1, \"reason\": \"{reason}\", \"at\": null}}"),
     )
     .unwrap();
 }
@@ -624,33 +621,42 @@ fn resume_says_per_reason_what_clearing_it_means() {
 }
 
 #[test]
-fn resume_from_service_is_the_way_out_of_a_gap() {
-    let hub = Hub::new();
-    std::fs::write(hub.state.join("confirmed.json"), r#"{"lastAckedSeq": 10}"#).unwrap();
-    hub.service.set_last_seq(3);
-    hub.run(2).close().unwrap();
-    assert_eq!(status_of(&hub)["halted"], "gap");
-    // Plain resume clears it, and it comes back: the cause is still there.
-    let plain = cli(&["resume", "--config", path(&hub.config_path)]);
-    assert_eq!(plain.code, 0, "{}", plain.err);
-    hub.run(2).close().unwrap();
-    assert_eq!(status_of(&hub)["halted"], "gap");
-    let ran = cli(&["resume", "--config", path(&hub.config_path), "--from-service"]);
-    assert_eq!(ran.code, 0, "{}", ran.err);
-    assert!(ran.out.contains("service"), "{}", ran.out);
-    let mark: Value =
-        serde_json::from_str(&std::fs::read_to_string(hub.state.join("confirmed.json")).unwrap()).unwrap();
-    assert_eq!(mark["lastAckedSeq"], 0);
-    let agent = hub.run(3);
-    assert_eq!(agent.status().unwrap().halted, None);
-    let reset = hub
-        .service
-        .accepted()
-        .into_iter()
-        .find(|event| event["kind"] == "site_source.reset")
+fn resume_from_service_is_the_way_out_of_a_gap_also_when_the_service_holds_nothing() {
+    for held in [3u64, 0] {
+        let hub = Hub::new();
+        std::fs::write(
+            hub.state.join("confirmed.json"),
+            format!(
+                r#"{{"version": 1, "lastAckedSeq": 10, "sourceId": "{}"}}"#,
+                support::hub::SOURCE
+            ),
+        )
         .unwrap();
-    assert_eq!(reset["sourceSeq"], 4);
-    assert_eq!(reset["attributes"]["lastAckedSeq"], 3);
+        hub.service.set_last_seq(held);
+        hub.run(2).close().unwrap();
+        assert_eq!(status_of(&hub)["halted"], "gap", "{held}");
+        // Plain resume clears it, and it comes back: the cause is still there.
+        let plain = cli(&["resume", "--config", path(&hub.config_path)]);
+        assert_eq!(plain.code, 0, "{}", plain.err);
+        hub.run(2).close().unwrap();
+        assert_eq!(status_of(&hub)["halted"], "gap", "{held}");
+        let ran = cli(&["resume", "--config", path(&hub.config_path), "--from-service"]);
+        assert_eq!(ran.code, 0, "{}", ran.err);
+        assert!(ran.out.contains("queue_lost"), "{}", ran.out);
+        let agent = hub.run(3);
+        assert_eq!(agent.status().unwrap().halted, None, "{held}");
+        let accepted = hub.service.accepted();
+        let reset = accepted
+            .iter()
+            .find(|event| event["kind"] == "site_source.reset")
+            .unwrap_or_else(|| panic!("{held}: no reset in {accepted:?}"));
+        assert_eq!(reset["sourceSeq"], held + 1, "{held}");
+        assert_eq!(
+            reset["attributes"],
+            serde_json::json!({"trustOrigin": "hub", "lastAckedSeq": held, "reason": "queue_lost"}),
+            "{held}"
+        );
+    }
 }
 
 #[test]
@@ -742,8 +748,8 @@ fn run_refuses_a_configuration_whose_key_id_is_not_the_one_the_key_was_made_with
 }
 
 #[test]
-fn a_state_directory_from_an_earlier_build_without_the_key_id_works_as_before() {
-    // The fixture makes its key without the id file, as an earlier build did.
+fn a_key_whose_id_was_never_written_still_works_and_public_key_asks_for_the_id() {
+    // The fixture makes its key without the id file, as a keygen does that stops between the two writes.
     let hub = Hub::new();
     assert!(!hub.state.join("hub.key.id").exists());
     hub.run(1).close().unwrap();
@@ -799,6 +805,10 @@ fn keygen_and_run_on_a_path_that_is_a_file_say_not_a_directory() {
 
 #[test]
 fn a_directory_the_user_owns_but_cannot_write_is_said_so() {
+    if running_as_root() {
+        eprintln!("skipped: root writes a directory whatever its mode says, so there is no unwritable one to meet");
+        return;
+    }
     let tmp = TempDir::new();
     let state = tmp.join("state");
     std::fs::create_dir(&state).unwrap();
@@ -862,32 +872,169 @@ fn the_resume_command_status_names_has_an_absolute_path() {
     assert_eq!(std::fs::canonicalize(named_path).unwrap(), absolute);
 }
 
+/// Whether this process runs as root (the owner of a file it creates): root writes where the mode says it may not.
+fn running_as_root() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = TempDir::new();
+    let probe = tmp.join("probe");
+    std::fs::write(&probe, "").unwrap();
+    std::fs::metadata(&probe).unwrap().uid() == 0
+}
+
 #[test]
 fn exit_codes_are_the_same_in_every_command() {
-    // 2: it could not start.
-    let hub = Hub::new();
-    let holding = hub.agent();
-    halted_with(&hub, "schema");
-    assert_eq!(cli(&["resume", "--config", path(&hub.config_path)]).code, 2, "the lock");
-    holding.close().unwrap();
-    let tmp = TempDir::new();
+    let code = |args: &[&str]| cli(args).code;
+    let (tmp, hub) = (TempDir::new(), Hub::new());
+    let config = path(&hub.config_path);
     let open = tmp.join("open");
     std::fs::create_dir(&open).unwrap();
     std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(
-        cli(&["keygen", "--state-dir", path(&open), "--key-id", "hub-key-1"]).code,
-        2
-    );
-    // 1: it ran and failed.
-    let hub = Hub::new();
-    assert_eq!(
-        cli(&["resume", "--config", path(&hub.config_path)]).code,
-        1,
-        "nothing to resume"
-    );
-    // 0: success.
+    // A configuration whose state directory others can enter.
+    let open_config = tmp.join("open.toml");
+    std::fs::write(
+        &open_config,
+        std::fs::read_to_string(&hub.config_path)
+            .unwrap()
+            .replace(path(&hub.state), path(&open)),
+    )
+    .unwrap();
+    let open_config = path(&open_config);
+    let fresh = tmp.join("fresh");
+
+    // 2: it could not start. A usage error, the state directory, the key, the lock: in every command.
+    for args in [
+        &["keygen", "--state-dir", path(&fresh)][..],
+        &["keygen", "--state-dir", path(&fresh), "--key-id", "Bad Id"],
+        &["keygen", "--state-dir", path(&open), "--key-id", "hub-key-1"],
+        &["public-key"],
+        &["public-key", "--state-dir", path(&open)],
+        &["public-key", "--state-dir", path(&fresh), "--key-id", "hub-key-1"],
+        &["run", "--simulate"],
+        &["run", "--config", config],
+        &["status"],
+        &["status", "--config", open_config],
+        &["status", "--config", path(&tmp.join("absent.toml"))],
+        &["resume"],
+        &["resume", "--config", open_config],
+        &["resume", "--config", path(&tmp.join("absent.toml"))],
+    ] {
+        assert_eq!(code(args), 2, "{args:?}");
+    }
+    assert_eq!(run_refused(Path::new(open_config)).code, 2, "run on an open directory");
+    let holding = hub.agent();
     halted_with(&hub, "schema");
-    assert_eq!(cli(&["resume", "--config", path(&hub.config_path)]).code, 0);
+    assert_eq!(
+        code(&["resume", "--config", config]),
+        2,
+        "resume while the lock is held"
+    );
+    assert_eq!(run_refused(&hub.config_path).code, 2, "run while the lock is held");
+    holding.close().unwrap();
+
+    // 1: it ran and failed.
+    assert_eq!(
+        code(&["keygen", "--state-dir", path(&hub.state), "--key-id", "hub-key-1"]),
+        1,
+        "a key exists"
+    );
+    std::fs::remove_file(hub.state.join("halt.json")).unwrap();
+    assert_eq!(code(&["resume", "--config", config]), 1, "nothing to resume");
+    let broken = Hub::new();
+    std::fs::write(broken.state.join("outbox.sqlite"), "not a database").unwrap();
+    assert_eq!(
+        code(&["status", "--config", path(&broken.config_path)]),
+        1,
+        "an outbox that cannot be read"
+    );
+    // `public-key` and `run` have no way to fail once started that a test can bring about: `run` fails only when
+    // the agent cannot be closed or the signal handlers cannot be installed.
+
+    // 0: success.
+    assert_eq!(
+        code(&["keygen", "--state-dir", path(&fresh), "--key-id", "hub-key-1"]),
+        0
+    );
+    assert_eq!(code(&["public-key", "--state-dir", path(&fresh)]), 0);
+    assert_eq!(code(&["status", "--config", config]), 0);
+    assert_eq!(run_refused(&hub.config_path).code, 0, "run, stopped at once");
+    halted_with(&hub, "schema");
+    assert_eq!(code(&["resume", "--config", config]), 0);
+}
+
+#[test]
+fn every_command_works_without_a_usable_temporary_directory() {
+    let hub = Hub::new();
+    let nowhere = hub.tmp.join("no-such-directory");
+    let binary = |args: &[&str]| {
+        Command::new(BINARY)
+            .args(args)
+            .env("TMPDIR", &nowhere)
+            .output()
+            .unwrap()
+    };
+    let config = path(&hub.config_path);
+    let state = hub.tmp.join("made-here");
+    let made = binary(&["keygen", "--state-dir", path(&state), "--key-id", "hub-key-1"]);
+    assert_eq!(made.status.code(), Some(0), "{}", String::from_utf8_lossy(&made.stderr));
+    let shown = binary(&["public-key", "--state-dir", path(&state)]);
+    assert_eq!(
+        shown.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let status = binary(&["status", "--config", config]);
+    assert_eq!(
+        status.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    halted_with(&hub, "schema");
+    let resumed = binary(&["resume", "--config", config]);
+    assert_eq!(
+        resumed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let mut child = Command::new(BINARY)
+        .args(["run", "--config", config, "--simulate"])
+        .env("TMPDIR", &nowhere)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until("the first batch", || hub.service.last_seq() >= 2);
+    signal(&child, "TERM");
+    assert_eq!(exit_of(&mut child).code(), Some(0));
+    let (_, err) = output_of(child);
+    assert_eq!(err, "");
+    assert!(!nowhere.exists());
+}
+
+#[test]
+fn a_store_a_newer_version_wrote_is_refused_by_run_and_status_with_exit_2() {
+    for name in ["outbox.sqlite", "pseudonyms.sqlite"] {
+        let hub = Hub::new();
+        hub.run(1).close().unwrap();
+        let db = rusqlite::Connection::open(hub.state.join(name)).unwrap();
+        db.execute_batch("PRAGMA user_version = 7").unwrap();
+        drop(db);
+        let ran = run_refused(&hub.config_path);
+        assert_eq!(ran.code, 2, "{name}: {}", ran.err);
+        assert!(ran.err.contains(name) && ran.err.contains("newer"), "{}", ran.err);
+        if name == "outbox.sqlite" {
+            let status = cli(&["status", "--config", path(&hub.config_path)]);
+            assert_eq!(status.code, 2, "{}", status.err);
+            assert!(
+                status.err.contains(name) && status.err.contains("newer"),
+                "{}",
+                status.err
+            );
+        }
+    }
 }
 
 // ---- A healthy queue is never set aside: a hot write-ahead log after a kill ----

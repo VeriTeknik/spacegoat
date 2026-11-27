@@ -207,22 +207,52 @@ fn confirmed_names_its_source_and_is_private() {
     Confirmed::new(&path, SOURCE).write(41).unwrap();
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
-        format!("{{\"lastAckedSeq\": 41, \"sourceId\": \"{SOURCE}\"}}")
+        format!("{{\"version\": 1, \"lastAckedSeq\": 41, \"sourceId\": \"{SOURCE}\"}}")
     );
     assert_eq!(mode(&path), 0o600);
 }
 
 #[test]
-fn a_mark_of_another_source_is_no_mark_and_the_earlier_form_is_this_sources() {
+fn a_mark_of_another_source_is_no_mark() {
     let tmp = TempDir::new();
     let path = tmp.join("confirmed.json");
-    std::fs::write(&path, format!("{{\"lastAckedSeq\": 41, \"sourceId\": \"{OTHER}\"}}")).unwrap();
+    std::fs::write(
+        &path,
+        format!("{{\"version\": 1, \"lastAckedSeq\": 41, \"sourceId\": \"{OTHER}\"}}"),
+    )
+    .unwrap();
     assert_eq!(Confirmed::new(&path, SOURCE).read().unwrap(), Mark::Nothing);
     // And this source's first mark replaces it, however small.
     Confirmed::new(&path, SOURCE).write(3).unwrap();
     assert_eq!(Confirmed::new(&path, SOURCE).read().unwrap(), Mark::Confirmed(3));
-    std::fs::write(&path, r#"{"lastAckedSeq": 41}"#).unwrap();
-    assert_eq!(Confirmed::new(&path, SOURCE).read().unwrap(), Mark::Confirmed(41));
+}
+
+#[test]
+fn a_mark_a_newer_version_wrote_is_said_so_and_never_written_over() {
+    let tmp = TempDir::new();
+    let path = tmp.join("confirmed.json");
+    let newer = format!("{{\"version\": 2, \"lastAckedSeq\": 41, \"sourceId\": \"{SOURCE}\"}}");
+    std::fs::write(&path, &newer).unwrap();
+    let confirmed = Confirmed::new(&path, SOURCE);
+    assert_eq!(confirmed.read().unwrap(), Mark::Newer(2));
+    confirmed.write(50).unwrap_err();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+}
+
+#[test]
+fn accepting_the_services_state_is_a_mark_of_its_own_until_a_number_replaces_it() {
+    let tmp = TempDir::new();
+    let path = tmp.join("confirmed.json");
+    let confirmed = Confirmed::new(&path, SOURCE);
+    confirmed.write(41).unwrap();
+    confirmed.accept_service().unwrap();
+    assert_eq!(confirmed.read().unwrap(), Mark::AcceptService);
+    assert_eq!(mode(&path), 0o600);
+    // 0 says nothing (every answer before the reset is delivered says it); the first number confirmed replaces it.
+    confirmed.write(0).unwrap();
+    assert_eq!(confirmed.read().unwrap(), Mark::AcceptService);
+    confirmed.write(1).unwrap();
+    assert_eq!(confirmed.read().unwrap(), Mark::Confirmed(1));
 }
 
 #[test]
@@ -242,6 +272,13 @@ fn a_confirmed_file_that_cannot_be_understood_is_not_a_zero() {
         r#"{"lastAckedSeq": null}"#.to_owned(),
         r#"{"lastAckedSeq": 41, "sourceId": 7}"#.to_owned(),
         "\u{feff}{\"lastAckedSeq\": 41}".to_owned(),
+        // No source: not this source's mark, and not "nothing" either.
+        r#"{"version": 1, "lastAckedSeq": 41}"#.to_owned(),
+        // No version, or one that is not a number.
+        format!("{{\"lastAckedSeq\": 41, \"sourceId\": \"{SOURCE}\"}}"),
+        format!("{{\"version\": \"1\", \"lastAckedSeq\": 41, \"sourceId\": \"{SOURCE}\"}}"),
+        format!("{{\"version\": 0, \"lastAckedSeq\": 41, \"sourceId\": \"{SOURCE}\"}}"),
+        format!("{{\"version\": 1, \"acceptService\": false, \"sourceId\": \"{SOURCE}\"}}"),
         format!("{{\"lastAckedSeq\": 41, \"pad\": \"{}\"}}", "x".repeat(70_000)),
     ] {
         std::fs::write(&path, &damaged).unwrap();
@@ -402,6 +439,7 @@ fn the_pseudonym_file_is_private_and_durable() {
     let journal: String = db.query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
     assert_eq!(journal, "wal");
     assert_eq!(pseudonyms.synchronous().unwrap(), 2);
+    assert_eq!(pseudonyms.secure_delete().unwrap(), 1);
 }
 
 #[test]
@@ -411,4 +449,33 @@ fn a_pseudonym_file_reached_through_a_link_is_refused() {
     Pseudonyms::open(&real).unwrap().close().unwrap();
     std::os::unix::fs::symlink(&real, tmp.join("pseudonyms.sqlite")).unwrap();
     assert!(Pseudonyms::open(&tmp.join("pseudonyms.sqlite")).is_err());
+}
+
+#[test]
+fn forgotten_facts_leave_no_trace_in_the_pseudonym_file() {
+    let tmp = TempDir::new();
+    let path = tmp.join("pseudonyms.sqlite");
+    let mut pseudonyms = Pseudonyms::open(&path).unwrap();
+    pseudonyms
+        .remember(
+            "device",
+            "printer",
+            // Long enough to need pages of its own: freed, not rewritten in place, when it is forgotten.
+            &object(json!({"name": "forget-me.example", "address": "192.0.2.77", "pad": "x".repeat(9000)})),
+        )
+        .unwrap();
+    pseudonyms.forget_facts().unwrap();
+    pseudonyms.close().unwrap();
+    let raw = std::fs::read(&path).unwrap();
+    let text = String::from_utf8_lossy(&raw);
+    assert!(
+        !text.contains("forget-me.example") && !text.contains("192.0.2.77"),
+        "a remnant in a free page"
+    );
+    assert_eq!(user_version(&path), 1);
+}
+
+fn user_version(path: &std::path::Path) -> i64 {
+    let db = rusqlite::Connection::open(path).unwrap();
+    db.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap()
 }

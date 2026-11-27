@@ -36,7 +36,7 @@ impl std::fmt::Display for SigningError {
         match self {
             Self::ObservedAt => f.write_str("observedAt must be a real UTC time with millisecond precision"),
             Self::Nonce => f.write_str("nonce must be 64 lowercase hex characters"),
-            Self::KeyId => f.write_str("key id must be 3 to 63 characters of a-z, 0-9 and -"),
+            Self::KeyId => f.write_str(KEY_ID_RULE),
             Self::Canonical(error) => error.fmt(f),
         }
     }
@@ -109,6 +109,9 @@ pub fn is_observed_at(text: &str) -> bool {
     };
     (1..=days).contains(&day) && hour < 24 && minute < 60 && second < 60
 }
+
+/// The rule `is_key_id` checks, as every refusal of a key id says it.
+pub const KEY_ID_RULE: &str = "a key id is 3 to 63 characters of a-z, 0-9 and -, starting with a letter or digit";
 
 /// 3 to 63 characters of a-z, 0-9 and `-`, starting with a letter or digit.
 pub fn is_key_id(text: &str) -> bool {

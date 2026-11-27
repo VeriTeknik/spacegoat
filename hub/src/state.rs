@@ -3,8 +3,8 @@
 //!
 //! Two things, kept apart from the outbox on purpose, so that losing the queue does not lose them:
 //!
-//! - `Confirmed`: the last sequence number the service confirmed, and to which source. With it, a hub whose outbox is gone can still say
-//!   truthfully where it stood (`site_source.reset`), instead of guessing or starting over.
+//! - `Confirmed`: the last sequence number the service confirmed, and to which source. With it, a hub whose outbox is
+//!   gone can still say truthfully where it stood (`site_source.reset`), instead of guessing or starting over.
 //! - `Pseudonyms`: which random `deviceRef` stands for which device, and what was last reported about it. They are
 //!   what lets the service see "the same device" tomorrow. They are random (UUID v4), never derived from the device,
 //!   and they stay on the hub.
@@ -18,7 +18,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value};
 
 use crate::fsutil::{open_regular, private_file, write_own_file};
-use crate::outbox::open_durable;
+use crate::outbox::{DurableError, FormatError, open_durable};
+use crate::storage::Cause;
 
 #[derive(Debug)]
 pub enum StateError {
@@ -26,6 +27,32 @@ pub enum StateError {
     Io(io::Error),
     /// The file holds something this code never writes.
     Damaged(&'static str),
+    /// Write-ahead logging could not be enabled; the journal mode that stayed.
+    NoWal(String),
+    /// A newer build wrote the file, or it is of no known format.
+    Format(FormatError),
+}
+
+impl StateError {
+    /// What kind of storage failure this is (`storage::Cause`).
+    pub fn cause(&self) -> Cause {
+        match self {
+            Self::Sqlite(error) => Cause::of_sqlite(error),
+            Self::Io(error) => Cause::of_io(error),
+            Self::Damaged(_) => Cause::Damaged,
+            Self::NoWal(_) | Self::Format(_) => Cause::Other,
+        }
+    }
+}
+
+impl From<DurableError> for StateError {
+    fn from(error: DurableError) -> Self {
+        match error {
+            DurableError::Sqlite(error) => Self::Sqlite(error),
+            DurableError::NoWal(mode) => Self::NoWal(mode),
+            DurableError::Format(error) => Self::Format(error),
+        }
+    }
 }
 
 impl fmt::Display for StateError {
@@ -34,6 +61,12 @@ impl fmt::Display for StateError {
             Self::Sqlite(error) => write!(f, "pseudonym database: {error}"),
             Self::Io(error) => write!(f, "pseudonym file: {error}"),
             Self::Damaged(what) => write!(f, "the pseudonym store is damaged: {what}"),
+            Self::NoWal(mode) => write!(
+                f,
+                "pseudonyms.sqlite: write-ahead logging cannot be enabled (the journal mode stays {mode}); the file \
+                 system may not support it"
+            ),
+            Self::Format(error) => error.fmt(f),
         }
     }
 }
@@ -43,7 +76,8 @@ impl std::error::Error for StateError {
         match self {
             Self::Sqlite(error) => Some(error),
             Self::Io(error) => Some(error),
-            Self::Damaged(_) => None,
+            Self::Format(error) => Some(error),
+            Self::Damaged(_) | Self::NoWal(_) => None,
         }
     }
 }
@@ -84,22 +118,29 @@ pub fn uuid_v4() -> io::Result<String> {
 
 /// `confirmed.json` holds a few short fields; anything larger is not one, and is not read whole.
 const MAX_CONFIRMED_FILE: u64 = 64 * 1024;
+/// The format of `confirmed.json` this code writes (its `version` field).
+pub const CONFIRMED_VERSION: u64 = 1;
 
 /// What `confirmed.json` says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mark {
     /// There is no mark, or it was written for another source: nothing was confirmed to this one.
     Nothing,
-    /// The service confirmed everything up to this number. A mark without a source id (the earlier form) is this
-    /// source's.
+    /// The service confirmed everything up to this number.
     Confirmed(u64),
-    /// The file is there but does not say anything this code writes. It is not 0: it says that something was
-    /// confirmed once, and not how much.
+    /// A person decided (`resume --from-service`) that the hub takes the service's state as its starting point: at the
+    /// next greeting the hub declares a lost queue at the service's number, whatever that number is.
+    AcceptService,
+    /// The file is there but does not say anything this code writes (no source id, no version, a field that is not
+    /// one). It is not 0: it says that something was confirmed once, and not how much.
     NotUnderstood,
+    /// A newer build wrote it (this `version`): it is refused, never read as anything or written over.
+    Newer(u64),
 }
 
 /// The last sequence number the service confirmed to one source, in a small JSON file of its own:
-/// `{"lastAckedSeq": 41, "sourceId": "<uuid>"}`.
+/// `{"version": 1, "lastAckedSeq": 41, "sourceId": "<uuid>"}`, or `{"version": 1, "acceptService": true, "sourceId":
+/// "<uuid>"}` after `resume --from-service`.
 #[derive(Debug)]
 pub struct Confirmed {
     path: PathBuf,
@@ -130,23 +171,40 @@ impl Confirmed {
         let Ok(Value::Object(mark)) = serde_json::from_slice::<Value>(&text) else {
             return Ok(Mark::NotUnderstood);
         };
-        let Some(number) = mark.get("lastAckedSeq").and_then(Value::as_u64) else {
-            return Ok(Mark::NotUnderstood);
-        };
-        Ok(match mark.get("sourceId") {
-            None => Mark::Confirmed(number),
-            Some(Value::String(source)) if *source == self.source_id => Mark::Confirmed(number),
-            Some(Value::String(_)) => Mark::Nothing,
-            Some(_) => Mark::NotUnderstood,
+        match mark.get("version").and_then(Value::as_u64) {
+            Some(CONFIRMED_VERSION) => {}
+            Some(newer) if newer > CONFIRMED_VERSION => return Ok(Mark::Newer(newer)),
+            _ => return Ok(Mark::NotUnderstood),
+        }
+        match mark.get("sourceId") {
+            Some(Value::String(source)) if *source == self.source_id => {}
+            Some(Value::String(_)) => return Ok(Mark::Nothing),
+            _ => return Ok(Mark::NotUnderstood),
+        }
+        if mark.get("acceptService") == Some(&Value::Bool(true)) {
+            return Ok(Mark::AcceptService);
+        }
+        Ok(match mark.get("lastAckedSeq").and_then(Value::as_u64) {
+            Some(number) => Mark::Confirmed(number),
+            None => Mark::NotUnderstood,
         })
     }
 
     /// Record `last_acked_seq` if it is ahead of what is recorded; never moves back. Over a mark that is another
-    /// source's or cannot be understood it is written whatever its value (except 0, which says nothing).
+    /// source's, cannot be understood or accepts the service's state it is written whatever its value, except 0:
+    /// that says nothing, and a person's decision stays until the service has confirmed something after it (the
+    /// queue's own count replaces it at the next start, too). Over a mark a newer build wrote, never: that is an
+    /// error.
     pub fn write(&self, last_acked_seq: u64) -> io::Result<()> {
         let ahead = match self.read()? {
             Mark::Confirmed(recorded) => last_acked_seq > recorded,
-            Mark::Nothing | Mark::NotUnderstood => last_acked_seq > 0,
+            Mark::Nothing | Mark::NotUnderstood | Mark::AcceptService => last_acked_seq > 0,
+            Mark::Newer(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "confirmed.json was written by a newer version",
+                ));
+            }
         };
         if ahead {
             self.replace(last_acked_seq)?;
@@ -154,11 +212,20 @@ impl Confirmed {
         Ok(())
     }
 
-    /// Record `last_acked_seq` whatever is recorded (a person's decision, or the queue's own count).
+    /// Record `last_acked_seq` whatever is recorded (the queue's own count).
     pub fn replace(&self, last_acked_seq: u64) -> io::Result<()> {
         // `json.dumps` form, a space after each separator.
         let text = format!(
-            "{{\"lastAckedSeq\": {last_acked_seq}, \"sourceId\": {}}}",
+            "{{\"version\": {CONFIRMED_VERSION}, \"lastAckedSeq\": {last_acked_seq}, \"sourceId\": {}}}",
+            Value::from(self.source_id.as_str())
+        );
+        write_own_file(&self.path, text.as_bytes())
+    }
+
+    /// Record a person's decision to take the service's state as the starting point (`Mark::AcceptService`).
+    pub fn accept_service(&self) -> io::Result<()> {
+        let text = format!(
+            "{{\"version\": {CONFIRMED_VERSION}, \"acceptService\": true, \"sourceId\": {}}}",
             Value::from(self.source_id.as_str())
         );
         write_own_file(&self.path, text.as_bytes())
@@ -174,8 +241,9 @@ pub struct Pseudonyms {
 impl Pseudonyms {
     pub fn open(path: &Path) -> Result<Self, StateError> {
         private_file(path)?;
-        let db = open_durable(path)?;
-        db.execute_batch(
+        let db = open_durable(
+            path,
+            "pseudonyms.sqlite",
             "CREATE TABLE IF NOT EXISTS refs (scope TEXT NOT NULL, identity TEXT NOT NULL, ref TEXT NOT NULL,
              facts TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (scope, identity)) WITHOUT ROWID",
         )?;
@@ -189,6 +257,11 @@ impl Pseudonyms {
     /// This connection's `PRAGMA synchronous` (2 = FULL); for tests and diagnostics.
     pub fn synchronous(&self) -> Result<i64, StateError> {
         Ok(self.db.query_row("PRAGMA synchronous", [], |row| row.get(0))?)
+    }
+
+    /// This connection's `PRAGMA secure_delete` (1 = ON); for tests and diagnostics.
+    pub fn secure_delete(&self) -> Result<i64, StateError> {
+        Ok(self.db.query_row("PRAGMA secure_delete", [], |row| row.get(0))?)
     }
 
     /// The reference of `identity`, created on first use: a fresh random UUID v4, never a function of it.
@@ -266,13 +339,53 @@ impl Pseudonyms {
     }
 
     pub fn remember(&mut self, scope: &str, identity: &str, facts: &Map<String, Value>) -> Result<(), StateError> {
-        self.reference(scope, identity)?;
-        // serde_json's map is ordered by key: the stored facts are a JSON object with its keys sorted.
-        let text = serde_json::to_string(facts).map_err(io::Error::other)?;
-        self.db.execute(
-            "UPDATE refs SET facts = ?1 WHERE scope = ?2 AND identity = ?3",
-            params![text, scope, identity],
-        )?;
+        self.remember_all(&[(scope, identity, facts)])
+    }
+
+    /// The references of several identities, creating those that have none, in one transaction that writes only when
+    /// one is missing (a round where every device is known commits nothing).
+    pub fn references(&mut self, subjects: &[(&str, &str)]) -> Result<Vec<String>, StateError> {
+        let missing: Vec<&(&str, &str)> = subjects
+            .iter()
+            .filter(|(scope, identity)| matches!(self.stored_reference(scope, identity), Ok(None)))
+            .collect();
+        if !missing.is_empty() {
+            let tx = self.db.transaction()?;
+            for (scope, identity) in missing {
+                // Insert-if-absent: whoever inserted first, the stored reference is the one returned.
+                tx.execute(
+                    "INSERT INTO refs (scope, identity, ref) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT (scope, identity) DO NOTHING",
+                    params![scope, identity, uuid_v4()?],
+                )?;
+            }
+            tx.commit()?;
+        }
+        subjects
+            .iter()
+            .map(|(scope, identity)| {
+                self.stored_reference(scope, identity)?
+                    .ok_or(StateError::Damaged("a reference vanished as it was written"))
+            })
+            .collect()
+    }
+
+    /// What was reported about several subjects, in one transaction: all of it is kept, or none.
+    pub fn remember_all(&mut self, reports: &[(&str, &str, &Map<String, Value>)]) -> Result<(), StateError> {
+        let tx = self.db.transaction()?;
+        for (scope, identity, facts) in reports {
+            tx.execute(
+                "INSERT INTO refs (scope, identity, ref) VALUES (?1, ?2, ?3) ON CONFLICT (scope, identity) DO NOTHING",
+                params![scope, identity, uuid_v4()?],
+            )?;
+            // serde_json's map is ordered by key: the stored facts are a JSON object with its keys sorted.
+            let text = serde_json::to_string(facts).map_err(io::Error::other)?;
+            tx.execute(
+                "UPDATE refs SET facts = ?1 WHERE scope = ?2 AND identity = ?3",
+                params![text, scope, identity],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 }
