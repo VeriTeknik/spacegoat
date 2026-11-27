@@ -3167,3 +3167,40 @@ fn a_backlog_of_held_events_stops_capture_at_the_cap_and_capture_resumes_once_th
     );
     agent.close().unwrap();
 }
+
+#[test]
+fn a_release_whose_removal_fails_is_retried_while_capture_is_stopped() {
+    // An event is held (the store did not take its report) after the service confirmed it, and it fills the backlog,
+    // so capture stops. The store recovers, but removing the confirmed event fails once. Capture, stopped by the full
+    // backlog, gives no later occasion: the removal must still be retried, and the queue drain.
+    let hub = Hub::new();
+    let settings = agent::AgentSettings {
+        backlog_cap: 1,
+        ..agent::AgentSettings::default()
+    };
+    let observer = Steered::default();
+    let named = |name: &str| sighting("odd:printer", "printer", None, Some(name), None);
+    observer.set(vec![named("printer-a")]);
+    let mut agent = Agent::open_with(&hub.config, Box::new(observer.clone()), hub.clock.as_clock(), settings).unwrap();
+    agent.tick().unwrap();
+    observer.set(vec![named("printer-b")]);
+    break_updates(&hub, true);
+    hub.clock.advance_seconds(10);
+    assert!(agent.tick().is_err());
+    assert_eq!(agent.status().unwrap().pending, 1, "held");
+    break_updates(&hub, false);
+    break_confirmations(&hub, true);
+    hub.clock.advance_seconds(10);
+    assert!(agent.tick().is_err(), "the release cannot remove the event");
+    assert_eq!(agent.status().unwrap().problem.as_deref(), Some("outbox_failed"));
+    assert_eq!(agent.status().unwrap().pending, 1);
+    break_confirmations(&hub, false);
+    for _ in 0..3 {
+        hub.clock.advance_seconds(10);
+        let _ = agent.tick();
+    }
+    let status = agent.status().unwrap();
+    assert_eq!(status.pending, 0, "drained without a new confirmed batch");
+    assert_eq!(status.problem, None);
+    agent.close().unwrap();
+}

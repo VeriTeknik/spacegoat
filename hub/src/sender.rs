@@ -497,6 +497,15 @@ impl Sender {
         self.remove_confirmed()
     }
 
+    /// Before any step: what is confirmed and no longer held, and was not removed because the write failed (at a
+    /// release, `hold_acks_from`), is removed now. Nothing while halted.
+    fn catch_up_removal(&mut self) -> Result<(), SenderError> {
+        if self.halted.is_none() {
+            self.remove_confirmed()?;
+        }
+        Ok(())
+    }
+
     /// Remove from the queue what the service confirmed (`confirmed_through`), short of the first held event.
     fn remove_confirmed(&mut self) -> Result<(), OutboxError> {
         let through = self.hold_from.map_or(self.confirmed_through, |from| {
@@ -523,6 +532,7 @@ impl Sender {
     /// At most one request: the events that wait, or a heartbeat when one is due. Never sleeps, never loops. An `Err`
     /// is the hub's own storage failing, never the service.
     pub fn step(&mut self) -> Result<SendOutcome, SenderError> {
+        self.catch_up_removal()?;
         if let Some(waiting) = self.gate() {
             return Ok(waiting);
         }
@@ -536,6 +546,7 @@ impl Sender {
     /// At most one request, and only one that carries events: never a heartbeat. For a hub that cannot say "alive,
     /// nothing to report" truthfully (its capture is failing) but still delivers what it has signed.
     pub fn step_events(&mut self) -> Result<SendOutcome, SenderError> {
+        self.catch_up_removal()?;
         if let Some(waiting) = self.gate() {
             return Ok(waiting);
         }
@@ -550,6 +561,7 @@ impl Sender {
     /// service where it stands before anything is sent (protocol §11). Still none while halted or waiting out a
     /// back-off.
     pub fn heartbeat(&mut self) -> Result<SendOutcome, SenderError> {
+        self.catch_up_removal()?;
         if let Some(waiting) = self.gate() {
             return Ok(waiting);
         }
