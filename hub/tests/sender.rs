@@ -1007,13 +1007,19 @@ fn the_skew_now_follows_a_jump_of_the_wall_clock_after_the_reading() {
         vector_key(),
     );
     assert_eq!(sender.heartbeat().unwrap(), SendOutcome::Sent(0));
-    assert!(sender.clock_skew_millis().unwrap().abs() <= 1_000);
+    // The test wall clock runs with real time while its monotonic clock stands still, and the service's `Date` has
+    // whole seconds: the margin covers both on a loaded machine. The jump below is an hour.
+    let margin = 10_000;
+    let before = sender.clock_skew_millis().unwrap();
+    assert!(before.abs() <= margin, "{before}");
     hub_clock.step_wall_seconds(3600);
+    let jumped = 3_600_000 - margin..=3_600_000 + margin;
     let skew = sender.clock_skew_millis().unwrap();
-    assert!((3_599_000..=3_601_000).contains(&skew), "{skew}");
+    assert!(jumped.contains(&skew), "{skew}");
     // Time passing on both clocks is no jump.
     hub_clock.advance_seconds(600);
-    assert!((3_599_000..=3_601_000).contains(&sender.clock_skew_millis().unwrap()));
+    let skew = sender.clock_skew_millis().unwrap();
+    assert!(jumped.contains(&skew), "{skew}");
 }
 
 #[test]
