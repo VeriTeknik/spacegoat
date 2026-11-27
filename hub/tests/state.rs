@@ -479,3 +479,21 @@ fn user_version(path: &std::path::Path) -> i64 {
     let db = rusqlite::Connection::open(path).unwrap();
     db.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap()
 }
+
+#[test]
+fn a_mark_a_newer_version_wrote_is_not_replaced_or_overwritten_with_a_decision_either() {
+    let tmp = TempDir::new();
+    let path = tmp.join("confirmed.json");
+    let newer = r#"{"version": 2, "lastAckedSeq": 9, "sourceId": "src-1", "more": true}"#;
+    std::fs::write(&path, newer).unwrap();
+    let confirmed = Confirmed::new(&path, "src-1");
+    assert!(confirmed.replace(3).is_err(), "replace");
+    assert!(confirmed.accept_service().is_err(), "accept_service");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+    // A mark of this version is still replaced, and the service's state can still be taken over it.
+    std::fs::write(&path, r#"{"version": 1, "lastAckedSeq": 9, "sourceId": "src-1"}"#).unwrap();
+    confirmed.replace(3).unwrap();
+    assert_eq!(confirmed.read().unwrap(), Mark::Confirmed(3));
+    confirmed.accept_service().unwrap();
+    assert_eq!(confirmed.read().unwrap(), Mark::AcceptService);
+}

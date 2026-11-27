@@ -428,7 +428,7 @@ fn a_hub_killed_mid_run_starts_again_and_the_service_takes_each_number_once() {
     );
     assert_eq!(killed["lastAckedSeq"], 0, "the hub never heard the answer");
 
-    // Started again: the first request is a heartbeat, and its answer confirms what the service already took.
+    // Started again: the first request is a heartbeat; its answer confirms nothing, so the queue is sent again.
     let mut second = spawn_run(&hub);
     wait_until("the replay to be confirmed", || status_of(&hub)["lastAckedSeq"] == held);
     second.kill().unwrap();
@@ -453,9 +453,9 @@ fn a_hub_killed_mid_run_starts_again_and_the_service_takes_each_number_once() {
         .iter()
         .filter(|record| record.events.as_ref().is_some_and(|events| events.contains(&1)))
         .count();
-    // Sent once: the second run opened with a heartbeat, whose `lastSeq` confirmed the batch the first run never
-    // heard back about. Nothing is sent again that the service already says it holds.
-    assert_eq!(sent_first, 1, "sent once, confirmed by the next run's heartbeat");
+    // Sent twice: the second run opened with a heartbeat, which confirms nothing queued; the batch the first run
+    // never heard back about went again and the service counted it as a duplicate (each number recorded once, above).
+    assert_eq!(sent_first, 2, "sent again, counted as a duplicate");
     let status = status_of(&hub);
     assert_eq!(status["lastAckedSeq"], status["lastAssignedSeq"]);
     assert_eq!(status["lastAckedSeq"], hub.service.last_seq());
@@ -1193,4 +1193,64 @@ fn public_key_checks_the_state_directory_as_every_other_command_does() {
     let not_dir = cli(&["public-key", "--state-dir", path(&file), "--key-id", "hub-key-1"]);
     assert_eq!(not_dir.code, 2);
     assert!(not_dir.err.contains("not a directory"), "{}", not_dir.err);
+}
+
+/// Standard output that takes nothing: a closed pipe, a full disk.
+struct Refusing;
+
+impl std::io::Write for Refusing {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+    }
+}
+
+fn cli_refusing_stdout(args: &[&str]) -> (u8, String) {
+    let mut err = Vec::new();
+    let code = cli::run(args.iter().map(OsString::from), &mut Refusing, &mut err);
+    (code, String::from_utf8(err).unwrap())
+}
+
+#[test]
+fn a_command_whose_output_cannot_be_written_fails_and_says_what_it_did_all_the_same() {
+    let hub = Hub::new();
+    hub.run(1).close().unwrap();
+    // Output only: nothing was done.
+    let (code, err) = cli_refusing_stdout(&["status", "--config", path(&hub.config_path)]);
+    assert_eq!(code, 1, "status: {err}");
+    assert!(err.contains("could not be written"), "{err}");
+    for args in [&["--version"][..], &["--help"]] {
+        let (code, err) = cli_refusing_stdout(args);
+        assert_eq!(code, 1, "{args:?}: {err}");
+    }
+    let (code, err) = cli_refusing_stdout(&["public-key", "--state-dir", path(&hub.state), "--key-id", "hub-key-1"]);
+    assert_eq!(code, 1, "public-key: {err}");
+    // A change that was made: the output that says so is lost, so stderr says it.
+    let tmp = TempDir::new();
+    let state = tmp.join("state");
+    let (code, err) = cli_refusing_stdout(&["keygen", "--state-dir", path(&state), "--key-id", "hub-key-1"]);
+    assert_eq!(code, 1, "keygen: {err}");
+    assert!(state.join("hub.key").exists(), "the key was made");
+    assert!(err.contains("public-key"), "how to see it again: {err}");
+    halted_with(&hub, "schema");
+    let (code, err) = cli_refusing_stdout(&["resume", "--config", path(&hub.config_path)]);
+    assert_eq!(code, 1, "resume: {err}");
+    assert!(!hub.state.join("halt.json").exists(), "the halt was cleared");
+    assert!(err.contains("cleared"), "{err}");
+    // The way out of a gap also records a decision: stderr says that too.
+    let gap = Hub::new();
+    halted_with(&gap, "gap");
+    let (code, err) = cli_refusing_stdout(&["resume", "--config", path(&gap.config_path), "--from-service"]);
+    assert_eq!(code, 1, "resume --from-service: {err}");
+    assert!(!gap.state.join("halt.json").exists(), "the halt was cleared");
+    assert!(
+        std::fs::read_to_string(gap.state.join("confirmed.json"))
+            .unwrap()
+            .contains("acceptService")
+    );
+    assert!(err.contains("cleared"), "{err}");
+    assert!(err.contains("service's state") && err.contains("recorded"), "{err}");
 }

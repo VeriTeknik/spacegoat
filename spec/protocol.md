@@ -212,6 +212,7 @@ A device with such an address starts as ephemeral; when the same address is seen
 | 429 | `{ "error": "rate_limited" }` with `Retry-After` | Waits what `Retry-After` says, but never longer than its liveness interval (section 11) allows |
 | 503 | `{ "error": "unavailable" }` | Backs off and tries again |
 
+An answer to an empty request confirms no queued event: a hub removes an event from its queue only after an answer to a request that carried it.
 An event the service has already accepted is counted in `duplicates` and changes nothing, so sending a batch again after a lost answer is always safe.
 The service compares a repeated event with the one it has on record; a different event under a number already used is a `replay_conflict`.
 

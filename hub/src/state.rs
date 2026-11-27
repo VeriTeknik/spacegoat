@@ -9,6 +9,7 @@
 //!   what lets the service see "the same device" tomorrow. They are random (UUID v4), never derived from the device,
 //!   and they stay on the hub.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{self, Read};
@@ -200,21 +201,40 @@ impl Confirmed {
         let ahead = match self.read()? {
             Mark::Confirmed(recorded) => last_acked_seq > recorded,
             Mark::Nothing | Mark::NotUnderstood | Mark::AcceptService => last_acked_seq > 0,
-            Mark::Newer(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "confirmed.json was written by a newer version",
-                ));
-            }
+            Mark::Newer(_) => return Err(newer_version()),
         };
         if ahead {
-            self.replace(last_acked_seq)?;
+            self.store_number(last_acked_seq)?;
         }
         Ok(())
     }
 
-    /// Record `last_acked_seq` whatever is recorded (the queue's own count).
+    /// Record `last_acked_seq` whatever is recorded (the queue's own count), except over a mark a newer build wrote:
+    /// that is an error, and the file is left as it is.
     pub fn replace(&self, last_acked_seq: u64) -> io::Result<()> {
+        self.refuse_newer()?;
+        self.store_number(last_acked_seq)
+    }
+
+    /// Record a person's decision to take the service's state as the starting point (`Mark::AcceptService`), except
+    /// over a mark a newer build wrote: that is an error, and the file is left as it is.
+    pub fn accept_service(&self) -> io::Result<()> {
+        self.refuse_newer()?;
+        let text = format!(
+            "{{\"version\": {CONFIRMED_VERSION}, \"acceptService\": true, \"sourceId\": {}}}",
+            Value::from(self.source_id.as_str())
+        );
+        write_own_file(&self.path, text.as_bytes())
+    }
+
+    fn refuse_newer(&self) -> io::Result<()> {
+        match self.read()? {
+            Mark::Newer(_) => Err(newer_version()),
+            _ => Ok(()),
+        }
+    }
+
+    fn store_number(&self, last_acked_seq: u64) -> io::Result<()> {
         // `json.dumps` form, a space after each separator.
         let text = format!(
             "{{\"version\": {CONFIRMED_VERSION}, \"lastAckedSeq\": {last_acked_seq}, \"sourceId\": {}}}",
@@ -222,15 +242,14 @@ impl Confirmed {
         );
         write_own_file(&self.path, text.as_bytes())
     }
+}
 
-    /// Record a person's decision to take the service's state as the starting point (`Mark::AcceptService`).
-    pub fn accept_service(&self) -> io::Result<()> {
-        let text = format!(
-            "{{\"version\": {CONFIRMED_VERSION}, \"acceptService\": true, \"sourceId\": {}}}",
-            Value::from(self.source_id.as_str())
-        );
-        write_own_file(&self.path, text.as_bytes())
-    }
+/// The error for a `confirmed.json` a newer build wrote: it is never written over.
+fn newer_version() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "confirmed.json was written by a newer version",
+    )
 }
 
 /// identity (how the hub recognises a device or a segment locally) -> the random reference it reports.
@@ -324,6 +343,35 @@ impl Pseudonyms {
             found.push(row?);
         }
         Ok(found)
+    }
+
+    /// Every reference with what it stands for: (scope, reference) -> identity.
+    pub fn identities_by_reference(&self) -> Result<HashMap<(String, String), String>, StateError> {
+        let mut statement = self.db.prepare("SELECT scope, ref, identity FROM refs")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut found = HashMap::new();
+        for row in rows {
+            let (scope, reference, identity) = row?;
+            found.insert((scope, reference), identity);
+        }
+        Ok(found)
+    }
+
+    /// A write that changes nothing (one record rewritten as it is), to learn whether the store takes writes now.
+    pub fn probe_write(&mut self) -> Result<(), StateError> {
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "UPDATE refs SET facts = facts WHERE (scope, identity) IN (SELECT scope, identity FROM refs LIMIT 1)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Whether the store holds no reference at all (new, or emptied).

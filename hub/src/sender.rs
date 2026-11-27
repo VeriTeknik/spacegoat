@@ -8,9 +8,15 @@
 //!
 //! What it guarantees:
 //! - an event is forgotten only after the service confirmed it (`200` with `accepted`, `duplicates` and `lastSeq`,
-//!   all integers from 0 to 2^53 - 1); any other `200` (a proxy page, a captive portal) confirms nothing. A `200` to
-//!   a batch that moves the confirmed mark nowhere is a failure: it backs off rather than send the batch again at once.
-//!   So is a confirmation the hub cannot record (its storage fails): it backs off, and the `Err` says why;
+//!   all integers from 0 to 2^53 - 1, `accepted` and `duplicates` adding up to the events sent); any other `200` (a
+//!   proxy page, a captive portal) confirms nothing. Only an answer to a request that carried events confirms them:
+//!   a heartbeat's `lastSeq` says where the service stands, and the events queued here go in the next request, where
+//!   the service compares each with its record. A `200` to a batch that moves the confirmed mark nowhere is a
+//!   failure: it backs off rather than send the batch again at once. So is a confirmation the hub cannot record (its
+//!   storage fails): it backs off, and the `Err` says why;
+//! - a `lastSeq` below what the service once confirmed, to a heartbeat or a batch, confirms nothing and backs off
+//!   (`not_confirming`); the next such answer, with none at or above the mark between, means the service lost
+//!   events: it HALTS (`gap`), as `seq_gap` does;
 //! - a request that carried more than one event and timed out once its body had started to go out (or while the
 //!   answer was awaited or read) halves the batch for the next attempt, as a `413` does; a timeout while resolving or
 //!   connecting sent nothing, and halves nothing. A confirmed request lets the batch grow back by a quarter (at least
@@ -345,6 +351,9 @@ pub struct Sender {
     trouble: Option<ServiceTrouble>,
     reading: Option<ClockReading>,
     service_last_seq: Option<u64>,
+    /// The last confirming answer said the service holds less than it once confirmed: one more such answer, with
+    /// none at or above the mark between, is a `gap`.
+    lower_once: bool,
 }
 
 impl Sender {
@@ -379,6 +388,7 @@ impl Sender {
             trouble: None,
             reading: None,
             service_last_seq: None,
+            lower_once: false,
         })
     }
 
@@ -458,6 +468,11 @@ impl Sender {
     /// The last sequence number the service said it holds; `None` before any confirmed answer.
     pub fn service_last_seq(&self) -> Option<u64> {
         self.service_last_seq
+    }
+
+    /// Forget where the service said it stands: an answer older than a failure the agent must not act on.
+    pub fn forget_service_position(&mut self) {
+        self.service_last_seq = None;
     }
 
     /// Whether a heartbeat is due: no answer yet in this run, or none for `HEARTBEAT_SECONDS` of monotonic time.
@@ -665,11 +680,22 @@ impl Sender {
                 .and_then(Value::as_u64)
                 .filter(|n| i64::try_from(*n).is_ok_and(|n| n <= MAX_SAFE_INTEGER))
         };
-        let (Some(_), Some(_), Some(last_seq)) = (field("accepted"), field("duplicates"), field("lastSeq")) else {
+        // The service counts every event of a request once, as accepted or as a duplicate (protocol §8, §10): counts
+        // that do not add up to what was sent are not its answer about this request.
+        let counted = |accepted: u64, duplicates: u64| {
+            usize::try_from(accepted.saturating_add(duplicates)).is_ok_and(|total| total == sent)
+        };
+        let (Some(accepted), Some(duplicates), Some(last_seq)) =
+            (field("accepted"), field("duplicates"), field("lastSeq"))
+        else {
             // A 200 that is not the service's answer (a proxy, a portal page): nothing was confirmed.
             self.trouble = Some(ServiceTrouble::NotConfirming);
             return Ok(self.back_off());
         };
+        if !counted(accepted, duplicates) {
+            self.trouble = Some(ServiceTrouble::NotConfirming);
+            return Ok(self.back_off());
+        }
         self.service_last_seq = Some(last_seq);
         self.problem = None;
         // The service's own answer: it is there and speaking for itself, whatever it says next.
@@ -688,6 +714,29 @@ impl Sender {
             return Ok(self.halt(HaltReason::Ahead));
         }
         let before = self.or_back_off(self.outbox.last_acked())?;
+        if last_seq < before {
+            // The service once confirmed `before` and now says it holds less. An answer lost on the way back leaves
+            // the hub's mark behind the service, never ahead, so this is a loss or something in between answering
+            // for the service. Once is a suspicion: nothing is confirmed and it is asked again after the back-off.
+            // The next answer lower again is a loss: the hub cannot send what it no longer has, and it does not
+            // re-number what it still holds.
+            if self.lower_once {
+                return Ok(self.halt(HaltReason::Gap));
+            }
+            self.lower_once = true;
+            self.trouble = Some(ServiceTrouble::NotConfirming);
+            return Ok(self.back_off());
+        }
+        self.lower_once = false;
+        if sent == 0 {
+            // An answer to an empty request says where the service stands, not that it holds the events queued
+            // here: those go in the next request, where the service compares each with its record (a duplicate,
+            // or a conflict). Nothing is forgotten here.
+            self.failures = 0;
+            self.batch_limit = grown(self.batch_limit);
+            self.last_success = Some(self.clock.wall_millis());
+            return Ok(SendOutcome::Sent(0));
+        }
         match self.outbox.ack(last_seq) {
             Ok(()) => {}
             Err(OutboxError::AckAhead) => return Ok(self.halt(HaltReason::Ahead)),
@@ -699,7 +748,7 @@ impl Sender {
             }
         }
         let after = self.or_back_off(self.outbox.last_acked())?;
-        if sent > 0 && after <= before {
+        if after <= before {
             // Events went and the service confirmed none of them: whatever it is, sending the same batch again at
             // once will not change it.
             self.trouble = Some(ServiceTrouble::NotConfirming);

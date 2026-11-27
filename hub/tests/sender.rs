@@ -882,28 +882,53 @@ fn a_reset_at_the_number_the_service_holds_is_accepted_and_at_another_is_refused
     }
 }
 
+/// A peer that takes one connection and reads its first `bytes` bytes, then answers in plain HTTP. It waits at most
+/// ten seconds for the connection and as long for the bytes: a sender that never connects, or never says a word,
+/// fails the test with a reason instead of leaving it waiting in `accept` for ever.
+fn plain_peer(listener: TcpListener, bytes: usize) -> std::thread::JoinHandle<Result<Vec<u8>, String>> {
+    use std::io::{ErrorKind, Read, Write};
+    use std::time::{Duration, Instant};
+    const PATIENCE: Duration = Duration::from_secs(10);
+    std::thread::spawn(move || {
+        listener.set_nonblocking(true).map_err(|error| error.to_string())?;
+        let deadline = Instant::now() + PATIENCE;
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(format!("no connection within {PATIENCE:?}: {error}")),
+            }
+        };
+        stream.set_nonblocking(false).map_err(|error| error.to_string())?;
+        stream
+            .set_read_timeout(Some(PATIENCE))
+            .map_err(|error| error.to_string())?;
+        let mut first = vec![0u8; bytes];
+        stream
+            .read_exact(&mut first)
+            .map_err(|error| format!("no ClientHello: {error}"))?;
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        Ok(first)
+    })
+}
+
 /// The tests run the service over plain http on loopback, so the TLS path is exercised here only as far as it goes
 /// without a certificate: an `https` origin really starts a TLS handshake (a ClientHello goes out), and a peer that
 /// does not speak TLS is a retry, not a crash and not a confirmation.
 #[test]
 fn an_https_origin_speaks_tls_and_a_peer_that_does_not_is_a_retry() {
-    use std::io::{Read, Write};
     let (tmp, clock) = (TempDir::new(), TestClock::new());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let peer = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut first = [0u8; 3];
-        stream.read_exact(&mut first).unwrap();
-        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
-        first
-    });
+    let peer = plain_peer(listener, 3);
     let mut outbox = open_outbox(&tmp, "outbox.sqlite");
     fill(&mut outbox, &clock, 1);
     let mut sender = sender_with_key(&format!("https://127.0.0.1:{port}"), outbox, &clock, vector_key());
     assert!(matches!(step(&mut sender), SendOutcome::RetryLater(_)));
     // A TLS record: handshake (22), protocol version 3.x.
-    let first = peer.join().unwrap();
+    let first = peer.join().unwrap().unwrap();
     assert_eq!(first[..2], [22, 3]);
     assert_eq!(sender.outbox().last_acked().unwrap(), 0);
 }
@@ -1294,7 +1319,6 @@ fn a_confirmation_whose_counters_cannot_be_read_backs_off_like_one_that_cannot_b
 
 #[test]
 fn a_connection_refused_a_timeout_and_a_tls_failure_are_told_apart() {
-    use std::io::{Read, Write};
     use std::time::Duration;
     // Refused: a port that was free a moment ago and has no listener now.
     let (tmp, clock) = (TempDir::new(), TestClock::new());
@@ -1323,12 +1347,7 @@ fn a_connection_refused_a_timeout_and_a_tls_failure_are_told_apart() {
     // TLS: an https origin on loopback whose peer answers in plain HTTP.
     let plain = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = plain.local_addr().unwrap().port();
-    let peer = std::thread::spawn(move || {
-        let (mut stream, _) = plain.accept().unwrap();
-        let mut first = [0u8; 16];
-        let _ = stream.read(&mut first);
-        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
-    });
+    let peer = plain_peer(plain, 3);
     let mut sender = sender_with_key(
         &format!("https://127.0.0.1:{port}"),
         open_outbox(&tmp, "tls.sqlite"),
@@ -1336,7 +1355,7 @@ fn a_connection_refused_a_timeout_and_a_tls_failure_are_told_apart() {
         vector_key(),
     );
     assert!(matches!(sender.heartbeat().unwrap(), SendOutcome::RetryLater(_)));
-    peer.join().unwrap();
+    peer.join().unwrap().unwrap();
     assert_eq!(sender.trouble().map(|t| t.as_text()).as_deref(), Some("tls"));
 }
 
@@ -1379,4 +1398,158 @@ fn a_request_carries_events_of_one_schema_version_only() {
         (body(0)["schemaVersion"].clone(), body(1)["schemaVersion"].clone()),
         (json!(1), json!(2))
     );
+}
+
+// ---- What a confirming answer may mean ----
+
+#[test]
+fn a_service_that_holds_less_than_it_confirmed_halts_with_gap_also_on_a_heartbeat() {
+    // Ten events delivered and confirmed; then the service holds only three. A site with nothing new to report sends
+    // only heartbeats: the loss is still found, at the first answer that shows it.
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 10);
+    let mut sender = make_sender(&service, outbox, &clock);
+    drain(&mut sender);
+    assert_eq!(sender.outbox().last_acked().unwrap(), 10);
+    service.set_last_seq(3);
+    // The first lower answer is a suspicion: it confirms nothing and is asked again after the back-off.
+    assert_eq!(
+        sender.heartbeat().unwrap(),
+        SendOutcome::RetryLater(BACKOFF_FIRST_SECONDS)
+    );
+    assert_eq!(sender.halted(), None);
+    assert_eq!(sender.trouble().map(|t| t.as_text()).as_deref(), Some("not_confirming"));
+    clock.advance_seconds(BACKOFF_FIRST_SECONDS as i64);
+    // The next answer is lower again: the service lost events.
+    assert_eq!(sender.heartbeat().unwrap(), SendOutcome::Halted(HaltReason::Gap));
+    assert_eq!(sender.halted(), Some(HaltReason::Gap));
+    assert_eq!(sender.outbox().last_acked().unwrap(), 10, "nothing re-declared");
+    assert_eq!(sender.outbox().last_assigned().unwrap(), 10, "nothing numbered again");
+}
+
+#[test]
+fn one_lower_answer_followed_by_a_good_one_halts_nothing_and_loses_nothing() {
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 10);
+    let mut sender = make_sender(&service, outbox, &clock);
+    drain(&mut sender);
+    // Something in between answers once with a lower number (a stale replica, a proxy's cached page).
+    service.push(Step::status(200, json!({"accepted": 0, "duplicates": 0, "lastSeq": 3})));
+    assert_eq!(
+        sender.heartbeat().unwrap(),
+        SendOutcome::RetryLater(BACKOFF_FIRST_SECONDS)
+    );
+    clock.advance_seconds(BACKOFF_FIRST_SECONDS as i64);
+    assert_eq!(
+        sender.heartbeat().unwrap(),
+        SendOutcome::Sent(0),
+        "the service's own answer"
+    );
+    assert_eq!(sender.trouble(), None);
+    // The suspicion is gone: one more lower answer is again only a suspicion.
+    clock.advance_seconds(HEARTBEAT_SECONDS);
+    service.push(Step::status(200, json!({"accepted": 0, "duplicates": 0, "lastSeq": 3})));
+    assert_eq!(
+        sender.heartbeat().unwrap(),
+        SendOutcome::RetryLater(BACKOFF_FIRST_SECONDS)
+    );
+    assert_eq!(sender.halted(), None);
+    assert_eq!(sender.outbox().last_acked().unwrap(), 10);
+    fill(sender.outbox_mut(), &clock, 1);
+    clock.advance_seconds(BACKOFF_FIRST_SECONDS as i64);
+    assert_eq!(step(&mut sender), SendOutcome::Sent(1));
+    assert_eq!(service.accepted_seqs(), (1..=11).collect::<Vec<u64>>());
+}
+
+#[test]
+fn a_confirmation_at_or_ahead_of_the_hubs_mark_is_no_gap() {
+    // An answer lost on the way back leaves the hub's mark BEHIND the service, never ahead: that is no gap.
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 3);
+    let mut sender = make_sender(&service, outbox, &clock);
+    service.push(Step::LoseAnswer);
+    assert!(matches!(step(&mut sender), SendOutcome::RetryLater(_)));
+    clock.advance_seconds(BACKOFF_FIRST_SECONDS as i64);
+    assert_eq!(sender.heartbeat().unwrap(), SendOutcome::Sent(0));
+    assert_eq!(sender.halted(), None);
+}
+
+#[test]
+fn a_200_whose_counts_do_not_account_for_the_events_sent_confirms_nothing() {
+    for body in [
+        json!({"accepted": 0, "duplicates": 0, "lastSeq": 2}),
+        json!({"accepted": 1, "duplicates": 0, "lastSeq": 2}),
+        json!({"accepted": 2, "duplicates": 1, "lastSeq": 2}),
+    ] {
+        let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+        let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+        fill(&mut outbox, &clock, 2);
+        let mut sender = make_sender(&service, outbox, &clock);
+        service.push(Step::status(200, body.clone()));
+        assert!(matches!(step(&mut sender), SendOutcome::RetryLater(_)), "{body}");
+        assert_eq!(sender.outbox().last_acked().unwrap(), 0, "{body}");
+        assert_eq!(
+            sender.trouble().map(|t| t.as_text()).as_deref(),
+            Some("not_confirming"),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn a_smaller_retry_answered_with_the_whole_earlier_attempt_confirms_it() {
+    // Four events went and the answer was lost; the retry carries two. The service counts the two as duplicates and
+    // says it holds four: `lastSeq` is cumulative, and all four are confirmed.
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 4);
+    let mut sender = make_sender(&service, outbox, &clock);
+    service.push(Step::LoseAnswer);
+    assert!(matches!(step(&mut sender), SendOutcome::RetryLater(_)));
+    assert_eq!(service.last_seq(), 4);
+    clock.advance_seconds(BACKOFF_FIRST_SECONDS as i64);
+    service.push(Step::MaxEvents(2));
+    assert_eq!(step(&mut sender), SendOutcome::RetryNow, "413: the batch is halved");
+    assert_eq!(step(&mut sender), SendOutcome::Sent(2));
+    assert_eq!(sender.outbox().last_acked().unwrap(), 4);
+    assert!(sender.outbox().pending(10, None).unwrap().is_empty());
+}
+
+#[test]
+fn a_heartbeat_does_not_confirm_queued_events_the_service_never_compared() {
+    // A queue restored from an older copy holds an event 1 the service does not have; the service holds another
+    // event 1. The heartbeat's `lastSeq` says where the service stands, not that it holds THESE events: sending them
+    // lets the service tell a duplicate from a conflict.
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 1);
+    service.set_last_seq(1);
+    let mut sender = make_sender(&service, outbox, &clock);
+    assert_eq!(sender.heartbeat().unwrap(), SendOutcome::Sent(0));
+    assert_eq!(sender.service_last_seq(), Some(1));
+    assert_eq!(sender.outbox().pending(10, None).unwrap().len(), 1, "still queued");
+    assert_eq!(step(&mut sender), SendOutcome::Halted(HaltReason::ReplayConflict));
+}
+
+#[test]
+fn a_queue_whose_answer_was_lost_still_drains_after_a_restart_without_a_halt() {
+    // The service holds the very events queued here (their answer was lost): after the greeting they go again, are
+    // counted as duplicates byte for byte, and are confirmed.
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 3);
+    let mut sender = make_sender(&service, outbox, &clock);
+    service.push(Step::LoseAnswer);
+    assert!(matches!(step(&mut sender), SendOutcome::RetryLater(_)));
+    let outbox = sender.into_outbox();
+    let mut restarted = make_sender(&service, outbox, &clock);
+    assert_eq!(restarted.heartbeat().unwrap(), SendOutcome::Sent(0));
+    assert_eq!(step(&mut restarted), SendOutcome::Sent(3));
+    assert_eq!(restarted.halted(), None);
+    assert_eq!(restarted.outbox().last_acked().unwrap(), 3);
+    assert_eq!(service.accepted_seqs(), [1, 2, 3], "each once");
+    assert_eq!(events_per_request(&service).last().unwrap(), &Some(vec![1, 2, 3]));
 }

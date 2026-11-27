@@ -564,3 +564,35 @@ fn a_loose_outbox_file_is_closed_again() {
     open_outbox(&tmp, vector_key()).close().unwrap();
     assert_eq!(mode(&path), 0o600);
 }
+
+/// What an unclean exit leaves of an outbox holding three events: the write-ahead log and shared-memory file as
+/// they were while the connection was open (the events live in the log), with the main file moved away.
+fn orphan_sidecars(path: &Path, key: SigningKey, source: &str, key_id: &str) -> (Vec<u8>, Vec<u8>) {
+    let mut outbox = Outbox::open(path, source, key_id, key).unwrap();
+    let attributes = object(json!({"trustOrigin": "hub", "deviceRef": DEVICE, "segmentRef": SEGMENT}));
+    let at = clock::observed_at_text(clock::now().unwrap()).unwrap();
+    for _ in 0..3 {
+        outbox.append("site.device_seen", &at, &attributes, None).unwrap();
+    }
+    let sidecar = |suffix: &str| PathBuf::from(format!("{}{suffix}", path.display()));
+    let wal = std::fs::read(sidecar("-wal")).unwrap();
+    let shm = std::fs::read(sidecar("-shm")).unwrap();
+    outbox.close().unwrap();
+    std::fs::remove_file(path).unwrap();
+    std::fs::write(sidecar("-wal"), &wal).unwrap();
+    std::fs::write(sidecar("-shm"), &shm).unwrap();
+    (wal, shm)
+}
+
+#[test]
+fn a_write_ahead_log_left_beside_a_missing_outbox_is_not_replayed_into_a_new_empty_one() {
+    // SQLite's own rule, measured: a log beside a database of no pages is discarded, never replayed. The agent does
+    // not rely on it (it sets such sidecars aside before it opens), but it is what a bare open does.
+    let tmp = TempDir::new();
+    let path = outbox_path(&tmp);
+    let (wal, _) = orphan_sidecars(&path, vector_key(), SOURCE, KEY_ID);
+    assert!(wal.len() > 4096, "the events are in the log");
+    let reopened = Outbox::open(&path, SOURCE, KEY_ID, vector_key()).unwrap();
+    assert_eq!(reopened.last_assigned().unwrap(), 0);
+    assert!(reopened.pending(10, None).unwrap().is_empty());
+}

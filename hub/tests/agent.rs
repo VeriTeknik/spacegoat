@@ -172,9 +172,9 @@ fn test_stopping_mid_run_and_starting_again_loses_and_repeats_nothing() {
     let after = second.status().unwrap();
     assert!(after.last_assigned_seq > before.last_assigned_seq);
     assert_eq!(after.last_acked_seq, after.last_assigned_seq);
-    // The first event went once: the restart's first request is an empty heartbeat, and its `lastSeq` told the hub
-    // the service had taken the batch whose answer was lost. Nothing was sent twice, nothing accepted twice.
-    assert_eq!(times_sent(&hub, 1), 1);
+    // The first event went twice: the restart's first request is an empty heartbeat, which confirms nothing queued;
+    // the batch whose answer was lost went again, and the service counted it as a duplicate. Nothing accepted twice.
+    assert_eq!(times_sent(&hub, 1), 2);
     assert!(
         hub.service.requests()[before_requests].events == Some(vec![]),
         "the restart opened with a heartbeat"
@@ -2543,4 +2543,322 @@ fn a_lock_a_child_process_holds_for_a_moment_does_not_make_a_second_agent() {
         Err(AgentError::AlreadyRunning(_))
     ));
     drop(held);
+}
+
+// ---- Review round: settlement, capture stops, clock trust, what was reported ----
+
+#[test]
+fn a_settlement_that_failed_asks_the_service_again_before_it_tries_again() {
+    // A lost queue; forgetting what was reported fails, so nothing is declared yet. Meanwhile the service comes to
+    // hold more than it said at the greeting. The next attempt must not settle against the old answer.
+    let hub = Hub::new();
+    hub.run(4).close().unwrap();
+    let confirmed = hub.service.last_seq();
+    hub.lose_outbox();
+    break_updates(&hub, true);
+    let mut agent = hub.agent();
+    assert!(agent.tick().is_err(), "forgetting what was reported fails");
+    assert_eq!(agent.status().unwrap().last_assigned_seq, 0, "nothing declared yet");
+    hub.service.set_last_seq(confirmed + 5);
+    break_updates(&hub, false);
+    hub.clock.advance_seconds(sender::BACKOFF_FIRST_SECONDS as i64);
+    agent.tick().unwrap();
+    agent.tick().unwrap();
+    let status = agent.status().unwrap();
+    assert_eq!(status.halted, None);
+    let reset = reset_of(&hub);
+    assert_eq!(
+        reset["attributes"]["lastAckedSeq"],
+        json!(confirmed + 5),
+        "the number the service holds now"
+    );
+    assert_eq!(reset["sourceSeq"], json!(confirmed + 6));
+}
+
+#[test]
+fn a_stop_is_declared_once_when_the_first_capture_after_it_fails() {
+    // A halt stops capture at a trusted time. After `resume`, the first captures fail (a new device's reference
+    // cannot be made) for longer than five minutes. It is one interruption, declared once, from the halt on.
+    let hub = Hub::new();
+    let observer = Steered::default();
+    let printer = sighting(
+        "odd:printer",
+        "printer",
+        Some("00005e005301"),
+        Some("printer-a"),
+        Some("192.0.2.10"),
+    );
+    observer.set(vec![printer.clone()]);
+    let open = |hub: &Hub| Agent::open(&hub.config, Box::new(observer.clone()), hub.clock.as_clock()).unwrap();
+    let mut agent = open(&hub);
+    agent.tick().unwrap();
+    hub.service.push(Step::status(400, json!({"error": "schema"})));
+    hub.clock.advance_seconds(3600);
+    let halted_at = hub.clock.now();
+    agent.tick().unwrap();
+    assert_eq!(agent.status().unwrap().halted.as_deref(), Some("schema"));
+    agent.close().unwrap();
+    hub.clock.advance_seconds(3600);
+    agent::resume(&hub.config, None).unwrap().unwrap();
+    observer.set(vec![printer, sighting("odd:laptop", "user_device", None, None, None)]);
+    break_new_references(&hub, true);
+    let mut agent = open(&hub);
+    for _ in 0..4 {
+        assert!(agent.tick().is_err(), "the first captures fail");
+        hub.clock.advance_seconds(120);
+    }
+    break_new_references(&hub, false);
+    let resumed_at = hub.clock.now();
+    agent.tick().unwrap();
+    agent.tick().unwrap();
+    let lost = of_kind(&hub.service.accepted(), "site_source.input_lost");
+    assert_eq!(lost.len(), 1, "{lost:?}");
+    let attributes = &lost[0]["attributes"];
+    let from = clock::observed_at_millis(attributes["fromTime"].as_str().unwrap()).unwrap();
+    let to = clock::observed_at_millis(attributes["toTime"].as_str().unwrap()).unwrap();
+    assert!(from >= halted_at && from - halted_at < 5_000, "from the halt");
+    assert!(to >= resumed_at, "to when capture really resumed");
+    assert_gapless(&hub);
+}
+
+#[test]
+fn a_reset_is_not_signed_with_a_wall_clock_that_jumped_during_the_request_that_called_for_it() {
+    // Nothing to report, so the outbox has assigned nothing. The answer that says the service moved ahead is also
+    // the one during which the hub's wall clock jumps an hour: the reset waits until the clock is trusted again.
+    let hub = Hub::new();
+    let hub_clock = TestClock::new();
+    let armed = Arc::new(AtomicBool::new(false));
+    {
+        let (service_clock, hub_clock, armed) = (hub.clock.clone(), hub_clock.clone(), Arc::clone(&armed));
+        hub.service.set_now(Arc::new(move || {
+            if armed.swap(false, Ordering::SeqCst) {
+                hub_clock.step_wall_seconds(3600);
+            }
+            service_clock.now()
+        }));
+    }
+    let mut agent = Agent::open(&hub.config, Box::new(Steered::default()), hub_clock.as_clock()).unwrap();
+    agent.tick().unwrap();
+    assert_eq!(agent.status().unwrap().last_assigned_seq, 0);
+    hub.service.set_last_seq(5);
+    pass(&[&hub_clock, &hub.clock], sender::HEARTBEAT_SECONDS);
+    armed.store(true, Ordering::SeqCst);
+    agent.tick().unwrap();
+    assert_eq!(
+        agent.status().unwrap().last_assigned_seq,
+        0,
+        "nothing signed with the jumped clock"
+    );
+    assert_eq!(
+        agent.status().unwrap().waiting_for.as_deref(),
+        Some("clock"),
+        "and the status says why"
+    );
+    // The clock is put right: the reset is declared then, with a time the service takes.
+    hub_clock.step_wall_seconds(-3600);
+    agent.tick().unwrap();
+    let reset = reset_of(&hub);
+    assert_eq!(reset["attributes"]["lastAckedSeq"], 5);
+    let observed = clock::observed_at_millis(reset["observedAt"].as_str().unwrap()).unwrap();
+    assert!((observed - hub.clock.now()).abs() < 5_000, "{reset}");
+}
+
+#[test]
+fn what_a_queued_event_reported_is_known_after_a_crash_before_the_store_took_it() {
+    // A name changes: the event is queued (the service is down), the pseudonym store does not take the new name, and
+    // the process dies. After the restart the device has its old name again: the service, which is about to receive
+    // the new name, must also be told the old one came back.
+    let hub = Hub::new();
+    let observer = Steered::default();
+    let named = |name: &str| {
+        sighting(
+            "odd:printer",
+            "printer",
+            Some("00005e005301"),
+            Some(name),
+            Some("192.0.2.10"),
+        )
+    };
+    observer.set(vec![named("printer-a")]);
+    let open = || Agent::open(&hub.config, Box::new(observer.clone()), hub.clock.as_clock()).unwrap();
+    let mut agent = open();
+    agent.tick().unwrap();
+    observer.set(vec![named("printer-b")]);
+    break_updates(&hub, true);
+    hub.service.push(Step::status(503, json!({"error": "unavailable"})));
+    hub.clock.advance_seconds(10);
+    assert!(agent.tick().is_err(), "the store does not take the new name");
+    assert_eq!(agent.status().unwrap().pending, 1, "the change is queued");
+    // The process dies here: nothing closes it, nothing retries the store.
+    drop(agent);
+    break_updates(&hub, false);
+    observer.set(vec![named("printer-a")]);
+    hub.clock.advance_seconds(10);
+    let mut agent = open();
+    agent.tick().unwrap();
+    agent.tick().unwrap();
+    let names: Vec<Value> = of_kind(&hub.service.accepted(), "site.device_changed")
+        .iter()
+        .map(|event| event["pii"]["hostname"].clone())
+        .collect();
+    assert_eq!(names, [json!("printer-b"), json!("printer-a")]);
+    agent.close().unwrap();
+}
+
+#[test]
+fn a_queue_whose_events_differ_from_what_the_service_holds_halts_with_replay_conflict_at_start() {
+    // Two hubs with one identity (a copied state directory): the first queues its events but the service is down for
+    // its batch; the second delivers its own events under the same numbers. When the first starts again, the
+    // greeting's `lastSeq` covers its queue, but that does not make its events the service's: they are sent, and the
+    // service refuses them as a conflict instead of the hub forgetting them unseen.
+    let hub = Hub::new();
+    let twin = hub.tmp.join("twin");
+    std::fs::create_dir(&twin).unwrap();
+    std::fs::set_permissions(&twin, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for name in ["hub.key", "hub.key.id"] {
+        if hub.state.join(name).exists() {
+            std::fs::copy(hub.state.join(name), twin.join(name)).unwrap();
+        }
+    }
+    hub.service.push(Step::Pass);
+    hub.service.push(Step::status(503, json!({"error": "unavailable"})));
+    let first = hub.run(1);
+    let queued = first.status().unwrap();
+    assert!(queued.pending > 0);
+    first.close().unwrap();
+    let mut config = hub.config.clone();
+    config.state_dir = twin.clone();
+    let mut second = Agent::open(&config, Box::new(SimulatedObserver::new()), hub.clock.as_clock()).unwrap();
+    second.tick().unwrap();
+    assert_eq!(
+        hub.service.last_seq(),
+        queued.last_assigned_seq,
+        "the same numbers, other events"
+    );
+    second.close().unwrap();
+    let mut first = hub.agent();
+    first.tick().unwrap();
+    let status = first.status().unwrap();
+    assert_eq!(status.halted.as_deref(), Some("replay_conflict"));
+    assert_eq!(status.pending, queued.pending, "nothing forgotten unseen");
+}
+
+#[test]
+fn a_hub_that_cannot_settle_on_its_own_storage_sends_nothing_until_the_storage_works() {
+    // A lost queue; forgetting what was reported fails. A heartbeat would say "alive, nothing to report", which a hub
+    // that cannot settle cannot say: nothing goes out until its storage works, and then one fresh greeting comes
+    // first, whose number the settlement uses.
+    let hub = Hub::new();
+    hub.run(4).close().unwrap();
+    let confirmed = hub.service.last_seq();
+    hub.lose_outbox();
+    break_updates(&hub, true);
+    let mut agent = hub.agent();
+    assert!(agent.tick().is_err());
+    let after_first = hub.service.requests().len();
+    for _ in 0..5 {
+        hub.clock.advance_seconds(60);
+        assert!(agent.tick().is_err(), "the storage still fails");
+    }
+    assert_eq!(
+        hub.service.requests().len(),
+        after_first,
+        "no request while it cannot settle"
+    );
+    hub.service.set_last_seq(confirmed + 5);
+    break_updates(&hub, false);
+    hub.clock.advance_seconds(60);
+    agent.tick().unwrap();
+    let requests = hub.service.requests();
+    assert_eq!(requests[after_first].events, Some(vec![]), "one fresh greeting first");
+    assert_eq!(requests[after_first + 1].events.as_ref().unwrap()[0], confirmed + 6);
+    assert_eq!(reset_of(&hub)["attributes"]["lastAckedSeq"], json!(confirmed + 5));
+    assert_eq!(agent.status().unwrap().halted, None);
+}
+
+#[test]
+fn a_heartbeat_only_site_halts_with_gap_when_the_service_says_twice_it_holds_less() {
+    // Nothing new to report, so only heartbeats go. The service loses what it had confirmed: the first answer that
+    // shows it is a suspicion, the next one a halt, kept on disk and shown in the status.
+    let hub = Hub::new();
+    let observer = Steered::default();
+    observer.set(vec![sighting("odd:printer", "printer", None, None, None)]);
+    let open = || Agent::open(&hub.config, Box::new(observer.clone()), hub.clock.as_clock()).unwrap();
+    let mut agent = open();
+    agent.tick().unwrap();
+    let confirmed = agent.status().unwrap().last_acked_seq;
+    assert!(confirmed >= 2);
+    hub.service.set_last_seq(1);
+    hub.clock.advance_seconds(sender::HEARTBEAT_SECONDS);
+    agent.tick().unwrap();
+    let status = agent.status().unwrap();
+    assert_eq!(status.halted, None, "once is a suspicion");
+    assert_eq!(status.service.as_deref(), Some("not_confirming"));
+    hub.clock.advance_seconds(sender::HEARTBEAT_SECONDS);
+    agent.tick().unwrap();
+    let status = agent.status().unwrap();
+    assert_eq!(status.halted.as_deref(), Some("gap"));
+    assert_eq!(status.last_acked_seq, confirmed, "nothing re-declared");
+    assert!(
+        std::fs::read_to_string(hub.state.join("halt.json"))
+            .unwrap()
+            .contains("\"gap\"")
+    );
+    agent.close().unwrap();
+    let requests = hub.service.requests().len();
+    let mut again = open();
+    again.tick().unwrap();
+    assert_eq!(
+        again.status().unwrap().halted.as_deref(),
+        Some("gap"),
+        "after a restart too"
+    );
+    assert_eq!(hub.service.requests().len(), requests, "a halted hub asks nothing");
+    again.close().unwrap();
+}
+
+#[test]
+fn sidecars_left_beside_a_missing_outbox_are_set_aside_before_a_new_queue_is_started() {
+    // `outbox.sqlite` moved aside without its log (a person recovering from a gap, or a set-aside of a damaged file
+    // that stopped half way): the log, which holds events and personal data, is kept under the set-aside name, never
+    // read into the new queue nor deleted, and it is said.
+    let hub = Hub::new();
+    hub.run(4).close().unwrap();
+    let held = hub.service.last_seq();
+    let path = hub.state.join("outbox.sqlite");
+    std::fs::remove_file(&path).unwrap();
+    let key = spacegoat_hub::keystore::FileKeyStore::new(hub.state.join("hub.key"))
+        .load()
+        .unwrap();
+    let mut outbox =
+        spacegoat_hub::outbox::Outbox::open(&path, &hub.config.source_id, &hub.config.key_id, key).unwrap();
+    outbox
+        .declare_reset(held, spacegoat_hub::outbox::ResetReason::QueueLost, hub.clock.now())
+        .unwrap();
+    let wal = std::fs::read(hub.state.join("outbox.sqlite-wal")).unwrap();
+    let shm = std::fs::read(hub.state.join("outbox.sqlite-shm")).unwrap();
+    outbox.close().unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(hub.state.join("outbox.sqlite-wal"), &wal).unwrap();
+    std::fs::write(hub.state.join("outbox.sqlite-shm"), &shm).unwrap();
+    let mut agent = hub.agent();
+    assert_eq!(agent.status().unwrap().last_assigned_seq, 0, "a new queue");
+    assert_eq!(
+        std::fs::read(hub.state.join("outbox.sqlite.damaged-wal")).unwrap(),
+        wal,
+        "the old log, kept"
+    );
+    assert_eq!(mode(&hub.state.join("outbox.sqlite.damaged-wal")), 0o600);
+    assert!(
+        agent
+            .notices()
+            .iter()
+            .any(|notice| notice.contains("outbox.sqlite.damaged-wal")),
+        "{:?}",
+        agent.notices()
+    );
+    agent.tick().unwrap();
+    assert_eq!(agent.status().unwrap().problem.as_deref(), Some("outbox_replaced"));
+    assert_eq!(reset_of(&hub)["attributes"]["lastAckedSeq"], held);
+    agent.close().unwrap();
 }

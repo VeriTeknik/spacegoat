@@ -22,8 +22,10 @@
 //!   each: an event is either stored with its chunk or not at all. When a chunk fails, the chunks before it stay
 //!   stored and are delivered, and it and the ones after it are captured at the next tick; an event whose record could
 //!   not be stored is not appended again (what was reported is kept in memory for the run, and the store write is
-//!   retried). A failure to capture or to store never keeps what is queued from being delivered. A stored record that
-//!   cannot be read, in any way, counts as none: that device or segment is reported again, and it is said once a run;
+//!   retried). At open, what the events still queued reported counts as what was last reported (`queued_reports`):
+//!   a process that ended between the queue and the store leaves the store behind. A failure to capture or to store
+//!   never keeps what is queued from being delivered. A stored record that cannot be read, in any way, counts as
+//!   none: that device or segment is reported again, and it is said once a run;
 //! - the first request of a run is an empty heartbeat, even when events wait (protocol §11). Its answer gives the
 //!   service's clock and where the service stands in the sequence. The tick's clocks are read after it;
 //! - nothing is signed unless the hub's clock is trusted, and it is trusted only while there is a reading of the
@@ -47,10 +49,11 @@
 //!   delivering, until fewer than half wait. After a restart it is full only if that many wait;
 //! - whenever the running hub could not capture for more than `STOP_DECLARED_AFTER_SECONDS` (its clock not trusted,
 //!   its storage failing, halted, its backlog full), it says so once capture resumes, with one
-//!   `site_source.input_lost` (`capture_stopped`, `fromTime` only when the stop began at a trusted time). The mark
-//!   lives in the outbox and survives a restart; a stop that spans a restart is judged long by trusted wall time from
-//!   its start (the restart's own downtime included), and a shorter stop is not declared. Time the hub was simply not
-//!   running is not declared;
+//!   `site_source.input_lost` (`capture_stopped`, `fromTime` only when the stop began at a trusted time), in the
+//!   transaction that stores the first events captured after it: a capture that fails first leaves the stop running.
+//!   The mark lives in the outbox and survives a restart; a stop that spans a restart is judged long by trusted wall
+//!   time from its start (the restart's own downtime included), and a shorter stop is not declared. Time the hub was
+//!   simply not running is not declared;
 //! - while the last tick failed with a storage error, no keep-alive heartbeat goes out (it would say "alive, nothing
 //!   to report", which is not true then; the service's silence alert is the signal). Events already queued are
 //!   still delivered when the queue can be read;
@@ -335,8 +338,8 @@ impl fmt::Display for AgentError {
             ),
             Self::QueueHoldsNumbers => f.write_str(
                 "--from-service cannot help while outbox.sqlite holds numbered events the service does not have: \
-                 they cannot be numbered again. Move outbox.sqlite aside (its events will not be delivered), then \
-                 run resume --from-service again",
+                 they cannot be numbered again. Move outbox.sqlite, outbox.sqlite-wal and outbox.sqlite-shm aside \
+                 together (their events will not be delivered), then run resume --from-service again",
             ),
             Self::Key(error) => error.fmt(f),
             Self::Origin(error) => error.fmt(f),
@@ -699,6 +702,12 @@ struct CaptureStop {
 /// A reference's scope and local identity: the key of what was last reported about it.
 type Subject = (String, String);
 
+/// How a stop in capture ends when capture resumes (`Agent::stop_ending`): the attributes of the
+/// `site_source.input_lost` that declares it, or `None` for a stop too short to declare (its mark is only cleared).
+struct StopEnding {
+    declaration: Option<Map<String, Value>>,
+}
+
 /// What the hub's own trouble is: the area (`AgentError::problem`) and, for a storage failure, its cause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OwnProblem {
@@ -743,6 +752,9 @@ pub struct Agent {
     greeted: bool,
     /// True once an outbox that never assigned a number has been told where the sequence stands (`settle`).
     settled: bool,
+    /// Settlement failed on the hub's own storage: the stores it writes must take a write before the service is asked
+    /// again (`settlement_storage_works`).
+    settle_failed: bool,
     /// True while `halt.json` holds the sender's halt.
     halt_saved: bool,
     /// What went wrong in the last tick.
@@ -768,8 +780,6 @@ pub struct Agent {
     backlog_full: bool,
     /// Whether this tick captured.
     captured: bool,
-    /// Whether the last capture failed (storage).
-    capture_failed: bool,
     /// Whether the last tick failed (storage): no keep-alive heartbeat then.
     tick_failed: bool,
     /// `confirmed.json` could not be understood and the outbox has never assigned a number: something was confirmed
@@ -827,14 +837,29 @@ impl Agent {
                  queue was started (the service is told the queue was lost)"
             ));
             replaced = Some("outbox_replaced");
+        } else if set_aside_orphan_sidecars(&outbox_path, OUTBOX_FILE)? {
+            notices.push(format!(
+                "{OUTBOX_FILE} was missing but its write-ahead log or shared-memory file was not; the log was moved \
+                 to {OUTBOX_FILE}{DAMAGED_SUFFIX}-wal (it is not read into the new queue) and a new queue was \
+                 started (the service is told the queue was lost)"
+            ));
+            replaced = Some("outbox_replaced");
         }
         let outbox = Outbox::open(&outbox_path, &config.source_id, &config.key_id, key.clone())?;
         let pseudonyms_path = state_dir.join(PSEUDONYMS_FILE);
-        let pseudonyms_set_aside = set_aside_if_damaged(&pseudonyms_path, PSEUDONYMS_FILE)?;
+        let mut pseudonyms_set_aside = set_aside_if_damaged(&pseudonyms_path, PSEUDONYMS_FILE)?;
         if pseudonyms_set_aside {
             notices.push(format!(
                 "{PSEUDONYMS_FILE} was not a readable database; it was moved to {PSEUDONYMS_FILE}{DAMAGED_SUFFIX} and \
                  a new one was started (devices get new references)"
+            ));
+            replaced = replaced.or(Some("pseudonyms_replaced"));
+        } else if set_aside_orphan_sidecars(&pseudonyms_path, PSEUDONYMS_FILE)? {
+            pseudonyms_set_aside = true;
+            notices.push(format!(
+                "{PSEUDONYMS_FILE} was missing but its write-ahead log or shared-memory file was not; the log was \
+                 moved to {PSEUDONYMS_FILE}{DAMAGED_SUFFIX}-wal (it is not read into the new store) and a new one was \
+                 started (devices get new references)"
             ));
             replaced = replaced.or(Some("pseudonyms_replaced"));
         }
@@ -886,6 +911,9 @@ impl Agent {
             since_wall,
             persisted: true,
         });
+        // What the queued events reported, in case the process ended before the store took it (`queued_reports`).
+        let reported = queued_reports(&outbox, &pseudonyms)?;
+        let unsaved = reported.keys().cloned().collect();
         let backlog_cap = u64::try_from(settings.backlog_cap.max(1)).unwrap_or(u64::MAX);
         // Full only if it is: a mark and a queue above half are what a stop of another kind leaves too.
         let backlog_full = assigned.saturating_sub(acked) >= backlog_cap;
@@ -912,6 +940,7 @@ impl Agent {
             waiting_for: None,
             greeted: false,
             settled: false,
+            settle_failed: false,
             halt_saved: halt.is_some(),
             problem: None,
             confirmed_behind: None,
@@ -920,13 +949,12 @@ impl Agent {
             last_saved: None,
             backlog_cap,
             stop: None,
-            reported: HashMap::new(),
-            unsaved: BTreeSet::new(),
+            reported,
+            unsaved,
             trusted_before: false,
             capture_stop,
             backlog_full,
             captured: false,
-            capture_failed: false,
             tick_failed: false,
             confirmed_unknown,
             unreadable_said: false,
@@ -1065,6 +1093,12 @@ impl Agent {
             return Ok(());
         }
         if !self.greeted {
+            if self.settle_failed {
+                // No request while the storage settlement needs still fails: a heartbeat would say "alive, nothing
+                // to report".
+                self.settlement_storage_works()?;
+                self.settle_failed = false;
+            }
             // The first request of a run is a heartbeat, whatever waits (protocol §11).
             let outcome = self.sender.heartbeat()?;
             self.after(outcome)?;
@@ -1091,14 +1125,15 @@ impl Agent {
             return delivered;
         };
         if !self.settled && !self.settle()? {
-            self.waiting_for = self.waiting(true);
+            self.waiting_for = self.waiting(self.clock_trusted());
             return Ok(());
         }
         let capture = self.capture(wall, &at);
         // A heartbeat says "alive, nothing to report": only when that is true.
         let healthy = matches!(capture, Ok(None));
         let delivered = self.deliver(healthy, true);
-        self.waiting_for = self.waiting(true);
+        // Trusted at the start of the round; the clock may have jumped during its requests.
+        self.waiting_for = self.waiting(self.clock_trusted());
         match capture {
             Err(error) | Ok(Some(error)) => Err(error),
             Ok(None) => delivered,
@@ -1165,13 +1200,39 @@ impl Agent {
     }
 
     /// Where the sequence of an outbox that has never assigned a number starts, from `confirmed.json` (C) and the
-    /// service's `lastSeq` (S). False when it halted instead.
+    /// service's `lastSeq` (S). False when it halted instead, or when a reset is due and the clock is not trusted
+    /// now (the wall clock may have jumped during the very request whose answer called for it): it waits for a tick
+    /// whose clock is trusted.
     ///
     /// Crash safety: facts are forgotten first, the reset is declared second, the confirmed mark written last. A crash
     /// before the reset leaves an outbox that still has assigned nothing, so the next start comes back here with the
     /// same C (it has not moved) and asks S again; a crash after it leaves a queue whose first event is the reset,
-    /// delivered like any other.
+    /// delivered like any other. A failure before the reset is the same within a run: S is dropped, and once the
+    /// storage takes a write again the next attempt asks S again first (a heartbeat), since S may have moved
+    /// meanwhile and a reset is taken only at the number held now. Until then no request goes out.
     fn settle(&mut self) -> Result<bool, AgentError> {
+        let settled = self.settle_from_greeting();
+        if settled.is_err() {
+            // The answer settlement used is stale by the next attempt: it is dropped, and asked for again only once
+            // the storage works (`round`).
+            self.greeted = false;
+            self.settle_failed = true;
+            self.sender.forget_service_position();
+        }
+        settled
+    }
+
+    /// Whether the stores settlement writes take a write now, and the confirmed mark can be read.
+    fn settlement_storage_works(&mut self) -> Result<(), AgentError> {
+        self.pseudonyms.probe_write()?;
+        self.sender.outbox_mut().probe_write()?;
+        self.confirmed
+            .read()
+            .map_err(|error| AgentError::Io(CONFIRMED_FILE, error))?;
+        Ok(())
+    }
+
+    fn settle_from_greeting(&mut self) -> Result<bool, AgentError> {
         if self.sender.outbox().last_assigned()? != 0 {
             self.settled = true;
             return Ok(true);
@@ -1204,10 +1265,16 @@ impl Agent {
                 return Ok(false);
             }
         };
+        let reset = match reason {
+            Some(reason) => match self.trusted_wall() {
+                Some(at) => Some((reason, at)),
+                None => return Ok(false),
+            },
+            None => None,
+        };
         // What was reported may have sat in the lost queue: report every device again, under the same reference.
         self.forget_facts()?;
-        if let Some(reason) = reason {
-            let at = self.clock.wall_millis();
+        if let Some((reason, at)) = reset {
             self.sender.outbox_mut().declare_reset(held, reason, at)?;
             self.write_confirmed(held);
         }
@@ -1230,26 +1297,14 @@ impl Agent {
         if self.backlog_full {
             return Ok(None);
         }
-        // The stop is declared before what is captured now, unless capture itself was what failed: then only once
-        // it works again.
-        if !self.capture_failed {
-            self.end_stop(wall, at)?;
-        }
+        // A stop ends with the first part of this round that is stored, in the same transaction: its declaration
+        // first, before what is captured now. A capture that fails before then leaves the stop as it was, so one
+        // interruption is declared once, up to when capture really resumed.
+        let ending = self.stop_ending(wall, at)?;
         let sightings = self.observer.poll();
-        match self.report(sightings, wall, at) {
-            Err(error) => {
-                self.capture_failed = true;
-                Err(error)
-            }
-            Ok(unsaved) => {
-                self.captured = true;
-                if self.capture_failed {
-                    self.capture_failed = false;
-                    self.end_stop(wall, at)?;
-                }
-                Ok(unsaved)
-            }
-        }
+        let unsaved = self.report(sightings, wall, at, ending)?;
+        self.captured = true;
+        Ok(unsaved)
     }
 
     /// Capture did not happen this tick: remember since when, and keep the mark in the outbox once the stop is long
@@ -1292,22 +1347,17 @@ impl Agent {
         }
     }
 
-    /// Capture works again: a stop longer than `STOP_DECLARED_AFTER_SECONDS` is declared with one
-    /// `site_source.input_lost`, and the mark is cleared in the same transaction; a shorter one is forgotten.
-    fn end_stop(&mut self, wall: i64, at: &str) -> Result<(), AgentError> {
+    /// How the stop in capture, if there is one, ends once this round stores what it captured: a stop longer than
+    /// `STOP_DECLARED_AFTER_SECONDS` with one `site_source.input_lost` (its attributes here), a shorter one silently.
+    /// Nothing is written here: `commit` writes it with the round's first part (`StopEnding`).
+    fn stop_ending(&self, wall: i64, at: &str) -> Result<Option<StopEnding>, AgentError> {
         let Some(stop) = self.capture_stop else {
-            return Ok(());
+            return Ok(None);
         };
-        let long = self.is_long(stop);
-        let outbox = self.sender.outbox_mut();
-        let mark = outbox.capture_stop()?;
-        if !long {
-            if mark.is_some() {
-                outbox.clear_capture_stop()?;
-            }
-            self.capture_stop = None;
-            return Ok(());
+        if !self.is_long(stop) {
+            return Ok(Some(StopEnding { declaration: None }));
         }
+        let mark = self.sender.outbox().capture_stop()?;
         let mut attributes = Map::new();
         attributes.insert("trustOrigin".into(), Value::from("hub"));
         attributes.insert("reason".into(), Value::from("capture_stopped"));
@@ -1317,9 +1367,9 @@ impl Agent {
             attributes.insert("fromTime".into(), Value::from(from));
         }
         attributes.insert("toTime".into(), Value::from(at));
-        outbox.resume_capture("site_source.input_lost", at, &attributes)?;
-        self.capture_stop = None;
-        Ok(())
+        Ok(Some(StopEnding {
+            declaration: Some(attributes),
+        }))
     }
 
     /// Deliver what waits: up to `SENDS_PER_TICK` requests. A heartbeat goes only when `heartbeat` (the hub can say
@@ -1428,8 +1478,15 @@ impl Agent {
     }
 
     /// Report what this round saw: the events in one outbox transaction per `DEVICES_PER_COMMIT` devices (the
-    /// snapshots go with the last), and what was reported in one pseudonym-store transaction after each.
-    fn report(&mut self, sightings: Vec<Sighting>, moment: i64, at: &str) -> Result<Option<AgentError>, AgentError> {
+    /// snapshots go with the last, the end of a stop in capture with the first), and what was reported in one
+    /// pseudonym-store transaction after each.
+    fn report(
+        &mut self,
+        sightings: Vec<Sighting>,
+        moment: i64,
+        at: &str,
+        mut ending: Option<StopEnding>,
+    ) -> Result<Option<AgentError>, AgentError> {
         let mut unsaved = self.save_unsaved();
         let mut lasting = Vec::with_capacity(sightings.len());
         let mut ephemeral: BTreeMap<String, u64> = BTreeMap::new();
@@ -1488,7 +1545,7 @@ impl Agent {
                     }
                 }
             }
-            let failed = self.commit(plans, at)?;
+            let failed = self.commit(plans, at, ending.take())?;
             if unsaved.is_none() {
                 unsaved = failed;
             }
@@ -1496,22 +1553,43 @@ impl Agent {
         Ok(unsaved)
     }
 
-    /// Store what a round planned: the events in one transaction (all or none; `Err` when none), then what was
-    /// reported, kept in memory at once and in the store in one more (its failure is returned, and retried).
-    fn commit(&mut self, plans: Vec<Planned>, at: &str) -> Result<Option<AgentError>, AgentError> {
-        if plans.is_empty() {
+    /// Store what a round planned: the events in one transaction (all or none; `Err` when none), with the end of a
+    /// stop in capture when there is one (its declaration first), then what was reported, kept in memory at once and
+    /// in the store in one more (its failure is returned, and retried).
+    fn commit(
+        &mut self,
+        plans: Vec<Planned>,
+        at: &str,
+        ending: Option<StopEnding>,
+    ) -> Result<Option<AgentError>, AgentError> {
+        if plans.is_empty() && ending.is_none() {
             return Ok(None);
         }
-        let events: Vec<NewEvent<'_>> = plans
-            .iter()
-            .map(|plan| NewEvent {
+        let declaration = ending.as_ref().and_then(|ending| ending.declaration.as_ref());
+        let events: Vec<NewEvent<'_>> = declaration
+            .map(|attributes| NewEvent {
+                kind: "site_source.input_lost",
+                observed_at: at,
+                attributes,
+                pii: None,
+            })
+            .into_iter()
+            .chain(plans.iter().map(|plan| NewEvent {
                 kind: plan.kind,
                 observed_at: at,
                 attributes: &plan.attributes,
                 pii: plan.pii.as_ref(),
-            })
+            }))
             .collect();
-        self.sender.outbox_mut().append_all(&events)?;
+        self.sender
+            .outbox_mut()
+            .append_all_ending_stop(&events, ending.is_some())?;
+        if ending.is_some() {
+            self.capture_stop = None;
+        }
+        if plans.is_empty() {
+            return Ok(None);
+        }
         // After the events are durably in the outbox: what was reported is now what the hub last said.
         for plan in &plans {
             self.reported.insert(plan.subject.clone(), plan.facts.clone());
@@ -1909,23 +1987,131 @@ fn set_aside_if_damaged(path: &Path, what: &'static str) -> Result<bool, AgentEr
     if !database_is_damaged(path).map_err(|error| AgentError::Sqlite(what, error))? {
         return Ok(false);
     }
-    let sidecar = |suffix: &str| {
-        let mut name = path.as_os_str().to_owned();
-        name.push(suffix);
-        PathBuf::from(name)
-    };
-    let damaged = sidecar(DAMAGED_SUFFIX);
+    let damaged = with_suffix(path, DAMAGED_SUFFIX);
     std::fs::rename(path, &damaged).map_err(io_error)?;
     std::fs::set_permissions(&damaged, std::fs::Permissions::from_mode(0o600)).map_err(io_error)?;
+    // Stopping here (a failure, a power cut) leaves sidecars without their database: the next open sets them aside
+    // (`set_aside_orphan_sidecars`) before a new database is made.
+    move_sidecars_aside(path, what)?;
+    Ok(true)
+}
+
+/// If there is no database at `path` but its write-ahead log or shared-memory file is there (the database was moved
+/// away without them, or setting a damaged one aside stopped half way), set them aside as `set_aside_if_damaged` does,
+/// before a new database is made beside them: a log beside a database that is not its own can be read into it. True
+/// when it did.
+fn set_aside_orphan_sidecars(path: &Path, what: &'static str) -> Result<bool, AgentError> {
+    let present = |path: &Path| match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(AgentError::Io(what, error)),
+    };
+    if present(path)? || !(present(&with_suffix(path, "-wal"))? || present(&with_suffix(path, "-shm"))?) {
+        return Ok(false);
+    }
+    move_sidecars_aside(path, what)?;
+    Ok(true)
+}
+
+/// `path` with `suffix` added to its name.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// The write-ahead log of the database at `path` to `<path>.damaged-wal` (private, replacing an earlier one), its
+/// shared-memory file removed (it holds nothing of its own), the directory synced. Either may be missing.
+fn move_sidecars_aside(path: &Path, what: &'static str) -> Result<(), AgentError> {
+    let io_error = |error: io::Error| AgentError::Io(what, error);
     let ignore_missing = |result: io::Result<()>| match result {
         Err(error) if error.kind() != io::ErrorKind::NotFound => Err(io_error(error)),
         _ => Ok(()),
     };
-    ignore_missing(std::fs::rename(sidecar("-wal"), sidecar(".damaged-wal")))?;
-    ignore_missing(std::fs::remove_file(sidecar("-shm")))?;
+    let kept = with_suffix(path, ".damaged-wal");
+    ignore_missing(std::fs::rename(with_suffix(path, "-wal"), &kept))?;
+    ignore_missing(std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o600)))?;
+    ignore_missing(std::fs::remove_file(with_suffix(path, "-shm")))?;
     let directory = path.parent().unwrap_or(Path::new("."));
     fsync_directory(directory).map_err(io_error)?;
-    Ok(true)
+    Ok(())
+}
+
+/// How many queued events `queued_reports` reads at a time.
+const QUEUED_READ_CHUNK: usize = 500;
+
+/// What the events still queued reported about each subject, the last event of each winning: what the pseudonym
+/// store must hold. Facts are stored only after their event is queued, in another file, so a process that ends
+/// between the two leaves the store behind the queue, and a device that then returns to what the store holds would
+/// not be reported again. Kept in memory and saved with the next round, like any record the store has not taken.
+/// Events that report no facts, and references the store does not know, are passed over.
+fn queued_reports(
+    outbox: &Outbox,
+    pseudonyms: &Pseudonyms,
+) -> Result<HashMap<Subject, Map<String, Value>>, AgentError> {
+    let mut found: HashMap<Subject, Map<String, Value>> = HashMap::new();
+    let mut identities = None;
+    let mut from = None;
+    loop {
+        let events = outbox.pending(QUEUED_READ_CHUNK, from)?;
+        let Some(last) = events.last() else {
+            return Ok(found);
+        };
+        from = Some(last.seq.saturating_add(1));
+        let identities = match &mut identities {
+            Some(identities) => identities,
+            None => identities.insert(pseudonyms.identities_by_reference()?),
+        };
+        for stored in &events {
+            let Ok(Value::Object(event)) = serde_json::from_str::<Value>(&stored.json) else {
+                continue;
+            };
+            let kind = event.get("kind").and_then(Value::as_str).unwrap_or_default();
+            let (scope, reference, stamp) = match kind {
+                "site.device_appeared" | "site.device_changed" | "site.device_seen" => {
+                    ("device", "deviceRef", "toldAt")
+                }
+                "site.inventory_snapshot" => ("segment", "segmentRef", "snapshotAt"),
+                _ => continue,
+            };
+            let attributes = event.get("attributes").and_then(Value::as_object);
+            let moment = event
+                .get("observedAt")
+                .and_then(Value::as_str)
+                .and_then(clock::observed_at_millis);
+            let identity = attributes
+                .and_then(|attributes| attributes.get(reference))
+                .and_then(Value::as_str)
+                .and_then(|reference| identities.get(&(scope.to_owned(), reference.to_owned())));
+            let (Some(attributes), Some(moment), Some(identity)) = (attributes, moment, identity) else {
+                continue;
+            };
+            let subject = (scope.to_owned(), identity.clone());
+            let mut facts = match kind {
+                // Seen unchanged: what was reported before, told again now.
+                "site.device_seen" => match found.get(&subject) {
+                    Some(facts) => facts.clone(),
+                    None => match pseudonyms.facts(scope, identity) {
+                        Ok(facts) if !facts.is_empty() => facts,
+                        _ => continue,
+                    },
+                },
+                "site.inventory_snapshot" => Map::new(),
+                _ => {
+                    let pii = event.get("pii").and_then(Value::as_object);
+                    let personal = |name: &str| pii.and_then(|pii| pii.get(name)).cloned().unwrap_or(Value::Null);
+                    let mut facts = Map::new();
+                    let class = attributes.get("deviceClass").cloned().unwrap_or(Value::Null);
+                    facts.insert("class".into(), class);
+                    facts.insert("name".into(), personal("hostname"));
+                    facts.insert("address".into(), personal("ip"));
+                    facts
+                }
+            };
+            facts.insert(stamp.into(), Value::from(stored_text(moment)));
+            found.insert(subject, facts);
+        }
+    }
 }
 
 /// Whether something last done at `last` is due again at `now`, `every` milliseconds later. A `last` in the future

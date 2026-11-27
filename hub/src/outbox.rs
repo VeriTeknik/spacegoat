@@ -12,8 +12,8 @@
 //!
 //! The file belongs to one source. It also remembers what the service last confirmed, so a hub that lost everything
 //! else can still say truthfully where it stood (`declare_reset`), and that the hub has stopped capturing, and since
-//! when if that is a trusted time (`stop_capture`, `resume_capture`): that mark lives and dies with the queue it is
-//! about, and survives a restart.
+//! when if that is a trusted time (`stop_capture`, `append_all_ending_stop`): that mark lives and dies with the queue
+//! it is about, and survives a restart.
 //!
 //! A file that is not a database, or fails SQLite's own `quick_check`, is recognised as such (`database_is_damaged`)
 //! so the agent can set it aside and treat the queue as lost, rather than not start at all.
@@ -376,6 +376,18 @@ impl Outbox {
     /// Give several observations their places in the sequence, in order, in ONE transaction: all of them are stored,
     /// or none is and no number is used. Returns their sequence numbers.
     pub fn append_all(&mut self, events: &[NewEvent<'_>]) -> Result<Vec<u64>, OutboxError> {
+        self.append_all_ending_stop(events, false)
+    }
+
+    /// `append_all`, and when `ends_stop`, the mark of a stop in capture (`stop_capture`) cleared in the same
+    /// transaction: what says capture resumed (a `site_source.input_lost` among `events`, or the first events captured
+    /// after a stop too short to declare) and the mark's removal are durable together, or neither is. `events` may
+    /// then be empty.
+    pub fn append_all_ending_stop(
+        &mut self,
+        events: &[NewEvent<'_>],
+        ends_stop: bool,
+    ) -> Result<Vec<u64>, OutboxError> {
         let signer = Signer {
             source_id: &self.source_id,
             key_id: &self.key_id,
@@ -390,6 +402,9 @@ impl Outbox {
                 .ok_or(OutboxError::Damaged("the sequence is exhausted"))?;
             signer.store(&tx, seq, event.kind, event.observed_at, event.attributes, event.pii)?;
             numbers.push(seq);
+        }
+        if ends_stop {
+            tx.execute("DELETE FROM meta WHERE key = 'capture_stopped_at'", [])?;
         }
         tx.commit()?;
         Ok(numbers)
@@ -447,34 +462,12 @@ impl Outbox {
         Ok(())
     }
 
-    /// Clear the mark without saying anything: the stop was too short to declare.
-    pub fn clear_capture_stop(&mut self) -> Result<(), OutboxError> {
-        self.db
-            .execute("DELETE FROM meta WHERE key = 'capture_stopped_at'", [])?;
-        Ok(())
-    }
-
-    /// Append the event that says what was not captured, and clear the mark, in one transaction: a crash leaves
-    /// either both or neither. Returns the event's sequence number.
-    pub fn resume_capture(
-        &mut self,
-        kind: &str,
-        observed_at: &str,
-        attributes: &Map<String, Value>,
-    ) -> Result<u64, OutboxError> {
-        let signer = Signer {
-            source_id: &self.source_id,
-            key_id: &self.key_id,
-            key: &self.key,
-        };
+    /// A write that changes nothing (a counter rewritten as it is), to learn whether the queue takes writes now.
+    pub fn probe_write(&mut self) -> Result<(), OutboxError> {
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let seq = counter(&tx, "last_assigned")?
-            .checked_add(1)
-            .ok_or(OutboxError::Damaged("the sequence is exhausted"))?;
-        signer.store(&tx, seq, kind, observed_at, attributes, None)?;
-        tx.execute("DELETE FROM meta WHERE key = 'capture_stopped_at'", [])?;
+        tx.execute("UPDATE meta SET value = value WHERE key = 'last_acked'", [])?;
         tx.commit()?;
-        Ok(seq)
+        Ok(())
     }
 
     /// Undelivered events in order, exactly as they were stored: from `from_seq`, or from the first not confirmed.

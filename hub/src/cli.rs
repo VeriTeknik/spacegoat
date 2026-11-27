@@ -87,6 +87,17 @@ fn failed(stderr: &mut dyn Write, reason: impl Display) -> u8 {
     exit_code(false)
 }
 
+/// Write `text` to standard output whole and flush it: output that did not arrive is a failure of the command.
+fn emit(stdout: &mut dyn Write, text: &str) -> std::io::Result<()> {
+    stdout.write_all(text.as_bytes())?;
+    stdout.flush()
+}
+
+/// The exit code of a command that did what it was asked and only its output was lost: `done` says what it did.
+fn output_lost(stderr: &mut dyn Write, done: impl Display, error: std::io::Error) -> u8 {
+    failed(stderr, format!("{done}; its output could not be written: {error}"))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Help,
@@ -125,14 +136,14 @@ fn execute(
         Err(reason) => return could_not_start(stderr, format!("{USAGE}spacegoat-hub: error: {reason}")),
     };
     match command {
-        Command::Help => {
-            let _ = stdout.write_all(USAGE.as_bytes());
-            EXIT_OK
-        }
-        Command::Version => {
-            let _ = writeln!(stdout, "spacegoat-hub {}", env!("CARGO_PKG_VERSION"));
-            EXIT_OK
-        }
+        Command::Help => match emit(stdout, USAGE) {
+            Ok(()) => EXIT_OK,
+            Err(error) => output_lost(stderr, "nothing was done", error),
+        },
+        Command::Version => match emit(stdout, concat!("spacegoat-hub ", env!("CARGO_PKG_VERSION"), "\n")) {
+            Ok(()) => EXIT_OK,
+            Err(error) => output_lost(stderr, "nothing was done", error),
+        },
         Command::Keygen { state_dir, key_id } => keygen(&state_dir, &key_id, stdout, stderr),
         Command::PublicKey { state_dir, key_id } => public_key(&state_dir, key_id.as_deref(), stdout, stderr),
         Command::Run { config, simulate } => run_agent(&config, simulate, stderr, stop, signals),
@@ -257,8 +268,17 @@ fn keygen(state_dir: &Path, key_id: &str, stdout: &mut dyn Write, stderr: &mut d
         Ok(key) => key,
         Err(error) => return failed(stderr, error),
     };
-    print_public(&key, key_id, stdout);
-    EXIT_OK
+    match print_public(&key, key_id, stdout) {
+        Ok(()) => EXIT_OK,
+        Err(error) => output_lost(
+            stderr,
+            format!(
+                "the key was created as {key_id}; to see its public half: spacegoat-hub public-key --state-dir {}",
+                state_dir.display()
+            ),
+            error,
+        ),
+    }
 }
 
 /// The public half of the key that exists, for a `keygen` whose output was lost: nothing is created or changed. The
@@ -295,14 +315,18 @@ fn public_key(state_dir: &Path, given: Option<&str>, stdout: &mut dyn Write, std
             );
         }
     };
-    print_public(&key, &key_id, stdout);
-    EXIT_OK
+    match print_public(&key, &key_id, stdout) {
+        Ok(()) => EXIT_OK,
+        Err(error) => output_lost(stderr, "nothing was changed", error),
+    }
 }
 
 /// The public half and the id are what a person enters at registration. The private key is never shown.
-fn print_public(key: &ed25519_dalek::SigningKey, key_id: &str, stdout: &mut dyn Write) {
-    let _ = writeln!(stdout, "key id:     {key_id}");
-    let _ = writeln!(stdout, "public key: {}", signing::public_key_text(key));
+fn print_public(key: &ed25519_dalek::SigningKey, key_id: &str, stdout: &mut dyn Write) -> std::io::Result<()> {
+    emit(
+        stdout,
+        &format!("key id:     {key_id}\npublic key: {}\n", signing::public_key_text(key)),
+    )
 }
 
 /// The command that clears a halt on this hub, with the configuration's absolute path.
@@ -397,8 +421,10 @@ fn status(path: &Path, stdout: &mut dyn Write, stderr: &mut dyn Write) -> u8 {
     };
     let mut status = agent::read_status(&config, counters, halt, saved, &resume_command(path));
     status.read_only = writable == Writable::No;
-    let _ = writeln!(stdout, "{}", status.to_json_text());
-    EXIT_OK
+    match emit(stdout, &format!("{}\n", status.to_json_text())) {
+        Ok(()) => EXIT_OK,
+        Err(error) => output_lost(stderr, "the status was read", error),
+    }
 }
 
 /// What clearing a halt of `reason` means, and what a person checks first.
@@ -444,22 +470,34 @@ fn resume(path: &Path, from_service: bool, stdout: &mut dyn Write, stderr: &mut 
     match agent::resume_with(&config, options, &|path: &Path| std::fs::remove_file(path)) {
         Ok(Some(halt)) => {
             let since = halt.at.map(|at| format!(" (halted at {at})")).unwrap_or_default();
-            let _ = if from_service {
-                writeln!(
-                    stdout,
+            let said = if from_service {
+                format!(
                     "cleared the halt: {}{since}. At its next start the hub takes the service's number as its \
-                     starting point: a site_source.reset (queue_lost) there, also when the service holds nothing",
+                     starting point: a site_source.reset (queue_lost) there, also when the service holds nothing\n",
                     halt.reason
                 )
             } else {
-                writeln!(
-                    stdout,
-                    "cleared the halt: {}{since}. {}",
+                format!(
+                    "cleared the halt: {}{since}. {}\n",
                     halt.reason,
                     after_resume(HaltReason::from_text(&halt.reason))
                 )
             };
-            EXIT_OK
+            match emit(stdout, &said) {
+                Ok(()) => EXIT_OK,
+                Err(error) => {
+                    let decision = if from_service {
+                        "; the decision to take the service's state as the starting point was recorded"
+                    } else {
+                        ""
+                    };
+                    output_lost(
+                        stderr,
+                        format!("the halt was cleared: {}{decision}", halt.reason),
+                        error,
+                    )
+                }
+            }
         }
         Ok(None) => failed(stderr, "nothing to resume: the agent is not halted"),
         Err(error @ AgentError::AlreadyRunning(_)) => {
