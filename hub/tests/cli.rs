@@ -621,6 +621,17 @@ fn resume_says_per_reason_what_clearing_it_means() {
     }
 }
 
+/// Two greetings whose answers are below the confirmed mark, the back-off between them: the first is a suspicion,
+/// the second a `gap` halt.
+fn run_to_a_gap(hub: &Hub) {
+    let mut agent = hub.agent();
+    agent.tick().unwrap();
+    hub.clock
+        .advance_seconds(spacegoat_hub::sender::BACKOFF_FIRST_SECONDS as i64);
+    agent.tick().unwrap();
+    agent.close().unwrap();
+}
+
 #[test]
 fn resume_from_service_is_the_way_out_of_a_gap_also_when_the_service_holds_nothing() {
     for held in [3u64, 0] {
@@ -634,12 +645,12 @@ fn resume_from_service_is_the_way_out_of_a_gap_also_when_the_service_holds_nothi
         )
         .unwrap();
         hub.service.set_last_seq(held);
-        hub.run(2).close().unwrap();
+        run_to_a_gap(&hub);
         assert_eq!(status_of(&hub)["halted"], "gap", "{held}");
         // Plain resume clears it, and it comes back: the cause is still there.
         let plain = cli(&["resume", "--config", path(&hub.config_path)]);
         assert_eq!(plain.code, 0, "{}", plain.err);
-        hub.run(2).close().unwrap();
+        run_to_a_gap(&hub);
         assert_eq!(status_of(&hub)["halted"], "gap", "{held}");
         let ran = cli(&["resume", "--config", path(&hub.config_path), "--from-service"]);
         assert_eq!(ran.code, 0, "{}", ran.err);

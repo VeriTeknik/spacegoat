@@ -252,6 +252,9 @@ fn newer_version() -> io::Error {
     )
 }
 
+/// (scope, reference) -> the identity it stands for (`Pseudonyms::identities_by_reference`).
+pub type ReferenceIndex = HashMap<(String, String), String>;
+
 /// identity (how the hub recognises a device or a segment locally) -> the random reference it reports.
 #[derive(Debug)]
 pub struct Pseudonyms {
@@ -346,21 +349,31 @@ impl Pseudonyms {
     }
 
     /// Every reference with what it stands for: (scope, reference) -> identity.
-    pub fn identities_by_reference(&self) -> Result<HashMap<(String, String), String>, StateError> {
+    ///
+    /// A record whose scope, reference or identity is not text (this code never writes one: damage from outside) is
+    /// passed over and counted, the second value; a failure of the database itself is an error.
+    pub fn identities_by_reference(&self) -> Result<(ReferenceIndex, usize), StateError> {
         let mut statement = self.db.prepare("SELECT scope, ref, identity FROM refs")?;
         let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+            let text = |index: usize| -> rusqlite::Result<Option<String>> {
+                Ok(match row.get_ref(index)? {
+                    ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok().map(str::to_owned),
+                    _ => None,
+                })
+            };
+            Ok((text(0)?, text(1)?, text(2)?))
         })?;
         let mut found = HashMap::new();
+        let mut malformed = 0usize;
         for row in rows {
-            let (scope, reference, identity) = row?;
-            found.insert((scope, reference), identity);
+            match row? {
+                (Some(scope), Some(reference), Some(identity)) => {
+                    found.insert((scope, reference), identity);
+                }
+                _ => malformed = malformed.saturating_add(1),
+            }
         }
-        Ok(found)
+        Ok((found, malformed))
     }
 
     /// A write that changes nothing (one record rewritten as it is), to learn whether the store takes writes now.

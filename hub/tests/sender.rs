@@ -1243,13 +1243,14 @@ fn a_request_that_times_out_halves_the_batch_and_a_confirmed_one_lets_it_grow_ag
         assert_eq!(sender.trouble().map(|t| t.as_text()).as_deref(), Some("timeout"));
         clock.advance_seconds(BACKOFF_MAX_SECONDS as i64);
     }
-    // The service took all eight at the first request; the next answer that arrives confirms them.
+    // The service took all eight at the first request; the next answer that arrives confirms the two it carried
+    // (the rest are confirmed as they are sent again, as duplicates).
     assert_eq!(step(&mut sender), SendOutcome::Sent(2));
-    assert_eq!(sender.outbox().last_acked().unwrap(), 8);
+    assert_eq!(sender.outbox().last_acked().unwrap(), 2);
     fill(sender.outbox_mut(), &clock, 30);
     drain(&mut sender);
     // Back up by a quarter (at least one) per confirmed request, never straight to the size that just failed.
-    assert_eq!(counts_per_request(&service), [8, 4, 2, 3, 4, 5, 6, 7, 5]);
+    assert_eq!(counts_per_request(&service), [8, 4, 2, 3, 4, 5, 6, 7, 8, 3]);
 }
 
 #[test]
@@ -1483,6 +1484,8 @@ fn a_200_whose_counts_do_not_account_for_the_events_sent_confirms_nothing() {
         json!({"accepted": 0, "duplicates": 0, "lastSeq": 2}),
         json!({"accepted": 1, "duplicates": 0, "lastSeq": 2}),
         json!({"accepted": 2, "duplicates": 1, "lastSeq": 2}),
+        // The counts say both were taken, `lastSeq` says the second was not: the fields disagree, neither is trusted.
+        json!({"accepted": 2, "duplicates": 0, "lastSeq": 1}),
     ] {
         let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
         let mut outbox = open_outbox(&tmp, "outbox.sqlite");
@@ -1502,7 +1505,8 @@ fn a_200_whose_counts_do_not_account_for_the_events_sent_confirms_nothing() {
 #[test]
 fn a_smaller_retry_answered_with_the_whole_earlier_attempt_confirms_it() {
     // Four events went and the answer was lost; the retry carries two. The service counts the two as duplicates and
-    // says it holds four: `lastSeq` is cumulative, and all four are confirmed.
+    // says it holds four: `lastSeq` is cumulative, but only what a request carried is removed from the queue. The
+    // other two are confirmed when they are sent.
     let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
     let mut outbox = open_outbox(&tmp, "outbox.sqlite");
     fill(&mut outbox, &clock, 4);
@@ -1514,6 +1518,12 @@ fn a_smaller_retry_answered_with_the_whole_earlier_attempt_confirms_it() {
     service.push(Step::MaxEvents(2));
     assert_eq!(step(&mut sender), SendOutcome::RetryNow, "413: the batch is halved");
     assert_eq!(step(&mut sender), SendOutcome::Sent(2));
+    assert_eq!(sender.outbox().last_acked().unwrap(), 2);
+    assert_eq!(
+        step(&mut sender),
+        SendOutcome::Sent(2),
+        "the other two, counted as duplicates"
+    );
     assert_eq!(sender.outbox().last_acked().unwrap(), 4);
     assert!(sender.outbox().pending(10, None).unwrap().is_empty());
 }
@@ -1552,4 +1562,35 @@ fn a_queue_whose_answer_was_lost_still_drains_after_a_restart_without_a_halt() {
     assert_eq!(restarted.outbox().last_acked().unwrap(), 3);
     assert_eq!(service.accepted_seqs(), [1, 2, 3], "each once");
     assert_eq!(events_per_request(&service).last().unwrap(), &Some(vec![1, 2, 3]));
+}
+
+#[test]
+fn a_confirmation_reaching_past_the_request_removes_only_what_the_request_carried() {
+    // A queue of 501 events: the first 500 are the very events the service holds, event 501 is not. The first batch
+    // carries 1 to 500 and the service answers that it holds 501. Event 501 was never compared: it stays queued, and
+    // when it is sent the service tells the conflict.
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut ours = open_outbox(&tmp, "ours.sqlite");
+    fill(&mut ours, &clock, 500);
+    ours.close().unwrap();
+    std::fs::copy(tmp.join("ours.sqlite"), tmp.join("theirs.sqlite")).unwrap();
+    let mut theirs = open_outbox(&tmp, "theirs.sqlite");
+    theirs
+        .append("site.device_seen", &at(&clock, 0), &seen(), None)
+        .unwrap();
+    let mut other = make_sender(&service, theirs, &clock);
+    drain(&mut other);
+    assert_eq!(service.last_seq(), 501);
+    let mut ours = open_outbox(&tmp, "ours.sqlite");
+    ours.append("site.device_appeared", &at(&clock, 0), &appeared(), None)
+        .unwrap();
+    let mut sender = make_sender(&service, ours, &clock);
+    assert_eq!(step(&mut sender), SendOutcome::Sent(500));
+    assert_eq!(sender.outbox().last_acked().unwrap(), 500);
+    assert_eq!(
+        sender.outbox().pending(10, None).unwrap().len(),
+        1,
+        "event 501 still queued"
+    );
+    assert_eq!(step(&mut sender), SendOutcome::Halted(HaltReason::ReplayConflict));
 }

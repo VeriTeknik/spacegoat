@@ -23,7 +23,9 @@
 //!   stored and are delivered, and it and the ones after it are captured at the next tick; an event whose record could
 //!   not be stored is not appended again (what was reported is kept in memory for the run, and the store write is
 //!   retried). At open, what the events still queued reported counts as what was last reported (`queued_reports`):
-//!   a process that ended between the queue and the store leaves the store behind. A failure to capture or to store
+//!   a process that ended between the queue and the store leaves the store behind; and an event whose report the
+//!   store has not taken is not removed from the queue, even once confirmed, until the store has taken it (a
+//!   restart can then still learn it). A failure to capture or to store
 //!   never keeps what is queued from being delivered. A stored record that cannot be read, in any way, counts as
 //!   none: that device or segment is reported again, and it is said once a run;
 //! - the first request of a run is an empty heartbeat, even when events wait (protocol §11). Its answer gives the
@@ -755,6 +757,12 @@ pub struct Agent {
     /// Settlement failed on the hub's own storage: the stores it writes must take a write before the service is asked
     /// again (`settlement_storage_works`).
     settle_failed: bool,
+    /// The last answer settlement looked at was below the confirmed mark: one more such answer, with none at or above
+    /// it between, is a `gap`.
+    mark_lower_once: bool,
+    /// The first queued event whose reported facts the pseudonym store has not taken: it and those after it stay
+    /// queued (`Sender::hold_acks_from`) until the store has taken them, so a restart can still learn them.
+    unsaved_from: Option<u64>,
     /// True while `halt.json` holds the sender's halt.
     halt_saved: bool,
     /// What went wrong in the last tick.
@@ -912,7 +920,17 @@ impl Agent {
             persisted: true,
         });
         // What the queued events reported, in case the process ended before the store took it (`queued_reports`).
-        let reported = queued_reports(&outbox, &pseudonyms)?;
+        let QueuedReports {
+            facts: reported,
+            first_seq: unsaved_from,
+            malformed_references,
+        } = queued_reports(&outbox, &pseudonyms)?;
+        if malformed_references > 0 {
+            notices.push(format!(
+                "{PSEUDONYMS_FILE} holds {malformed_references} reference record(s) whose value is not text (damage \
+                 from outside this program); they were passed over"
+            ));
+        }
         let unsaved = reported.keys().cloned().collect();
         let backlog_cap = u64::try_from(settings.backlog_cap.max(1)).unwrap_or(u64::MAX);
         // Full only if it is: a mark and a queue above half are what a stop of another kind leaves too.
@@ -929,6 +947,7 @@ impl Agent {
         if let Some(halt) = &halt {
             sender.halt(HaltReason::from_text(&halt.reason));
         }
+        sender.hold_acks_from(unsaved_from);
         Ok(Self {
             config: config.clone(),
             clock,
@@ -941,6 +960,8 @@ impl Agent {
             greeted: false,
             settled: false,
             settle_failed: false,
+            mark_lower_once: false,
+            unsaved_from,
             halt_saved: halt.is_some(),
             problem: None,
             confirmed_behind: None,
@@ -1082,7 +1103,17 @@ impl Agent {
             .or(self.replaced.map(|area| OwnProblem { area, cause: None }))
     }
 
+    /// `round_body`, after giving the pseudonym store what it has not taken yet whenever queued events wait for it:
+    /// every round, so a full backlog or an untrusted clock (which capture nothing) cannot keep them waiting.
     fn round(&mut self) -> Result<(), AgentError> {
+        let unsaved = self.unsaved_from.and_then(|_| self.save_unsaved());
+        match (self.round_body(), unsaved) {
+            (Ok(()), Some(error)) => Err(error),
+            (result, _) => result,
+        }
+    }
+
+    fn round_body(&mut self) -> Result<(), AgentError> {
         if self.sender.halted().is_some() {
             self.waiting_for = None;
             return Ok(());
@@ -1092,7 +1123,11 @@ impl Agent {
             self.waiting_for = Some(WaitingFor::Clock);
             return Ok(());
         }
-        if !self.greeted {
+        // A greeting dropped because the clock was not trusted when a reset was due waits for a trusted clock: until
+        // then the untrusted round below takes its readings at its usual cadence (at once after a jump, then when a
+        // heartbeat is due), not one greeting per tick.
+        let clock_known_wrong = self.sender.clock_reading().is_some() && !self.clock_trusted();
+        if !self.greeted && !clock_known_wrong {
             if self.settle_failed {
                 // No request while the storage settlement needs still fails: a heartbeat would say "alive, nothing
                 // to report".
@@ -1259,16 +1294,32 @@ impl Agent {
             (Mark::Nothing | Mark::Confirmed(0), 0) => None,
             (Mark::Nothing | Mark::Confirmed(0), _) => Some(ResetReason::Reinstall),
             (Mark::Confirmed(confirmed), held) if held >= confirmed => Some(ResetReason::QueueLost),
-            // The service holds less than it once confirmed: it lost events. The hub does not cover for that.
+            // The service says it holds less than it once confirmed. Once is a suspicion (a stale read, something
+            // in between answering for it): nothing is settled or produced, the answer confirms nothing, and a fresh
+            // greeting follows the back-off. The next answer lower again, with none at or above the mark between,
+            // means the service lost events; the hub does not cover for that, and halts.
             (Mark::Confirmed(_), _) => {
-                self.sender.halt(HaltReason::Gap);
+                if self.mark_lower_once {
+                    self.sender.halt(HaltReason::Gap);
+                } else {
+                    self.mark_lower_once = true;
+                    self.greeted = false;
+                    self.sender.distrust_last_answer();
+                }
                 return Ok(false);
             }
         };
+        self.mark_lower_once = false;
         let reset = match reason {
             Some(reason) => match self.trusted_wall() {
                 Some(at) => Some((reason, at)),
-                None => return Ok(false),
+                None => {
+                    // Nothing was written. The answer is stale by the time the clock is trusted again: it is
+                    // dropped, and the next attempt asks the service again first.
+                    self.greeted = false;
+                    self.sender.forget_service_position();
+                    return Ok(false);
+                }
             },
             None => None,
         };
@@ -1463,6 +1514,7 @@ impl Agent {
         match self.pseudonyms.remember_all(&reports) {
             Ok(()) => {
                 self.unsaved.clear();
+                self.hold_from(None);
                 None
             }
             Err(error) => Some(error.into()),
@@ -1474,7 +1526,14 @@ impl Agent {
         self.pseudonyms.forget_facts()?;
         self.reported.clear();
         self.unsaved.clear();
+        self.hold_from(None);
         Ok(())
+    }
+
+    /// The first queued event whose facts the store has not taken (`unsaved_from`), for the agent and the sender.
+    fn hold_from(&mut self, from: Option<u64>) {
+        self.unsaved_from = from;
+        self.sender.hold_acks_from(from);
     }
 
     /// Report what this round saw: the events in one outbox transaction per `DEVICES_PER_COMMIT` devices (the
@@ -1581,7 +1640,8 @@ impl Agent {
                 pii: plan.pii.as_ref(),
             }))
             .collect();
-        self.sender
+        let numbers = self
+            .sender
             .outbox_mut()
             .append_all_ending_stop(&events, ending.is_some())?;
         if ending.is_some() {
@@ -1602,6 +1662,13 @@ impl Agent {
             Ok(()) => Ok(None),
             Err(error) => {
                 self.unsaved.extend(plans.into_iter().map(|plan| plan.subject));
+                // The first of this part's reports (after the declaration of a stop, which reports no facts).
+                let first = numbers.get(usize::from(declaration.is_some())).copied();
+                let from = match (self.unsaved_from, first) {
+                    (Some(held), Some(first)) => Some(held.min(first)),
+                    (held, first) => held.or(first),
+                };
+                self.hold_from(from);
                 Ok(Some(error.into()))
             }
         }
@@ -2037,6 +2104,15 @@ fn move_sidecars_aside(path: &Path, what: &'static str) -> Result<(), AgentError
     Ok(())
 }
 
+/// What `queued_reports` found: the facts the queued events reported, and how many reference records it passed over
+/// because they are not text.
+struct QueuedReports {
+    facts: HashMap<Subject, Map<String, Value>>,
+    /// The first queued event that reported facts: they are not known to be in the store until it takes them.
+    first_seq: Option<u64>,
+    malformed_references: usize,
+}
+
 /// How many queued events `queued_reports` reads at a time.
 const QUEUED_READ_CHUNK: usize = 500;
 
@@ -2045,22 +2121,29 @@ const QUEUED_READ_CHUNK: usize = 500;
 /// between the two leaves the store behind the queue, and a device that then returns to what the store holds would
 /// not be reported again. Kept in memory and saved with the next round, like any record the store has not taken.
 /// Events that report no facts, and references the store does not know, are passed over.
-fn queued_reports(
-    outbox: &Outbox,
-    pseudonyms: &Pseudonyms,
-) -> Result<HashMap<Subject, Map<String, Value>>, AgentError> {
+fn queued_reports(outbox: &Outbox, pseudonyms: &Pseudonyms) -> Result<QueuedReports, AgentError> {
     let mut found: HashMap<Subject, Map<String, Value>> = HashMap::new();
     let mut identities = None;
+    let mut malformed_references = 0;
+    let mut first_seq = None;
     let mut from = None;
     loop {
         let events = outbox.pending(QUEUED_READ_CHUNK, from)?;
         let Some(last) = events.last() else {
-            return Ok(found);
+            return Ok(QueuedReports {
+                facts: found,
+                first_seq,
+                malformed_references,
+            });
         };
         from = Some(last.seq.saturating_add(1));
         let identities = match &mut identities {
             Some(identities) => identities,
-            None => identities.insert(pseudonyms.identities_by_reference()?),
+            None => {
+                let (index, malformed) = pseudonyms.identities_by_reference()?;
+                malformed_references = malformed;
+                identities.insert(index)
+            }
         };
         for stored in &events {
             let Ok(Value::Object(event)) = serde_json::from_str::<Value>(&stored.json) else {
@@ -2110,6 +2193,7 @@ fn queued_reports(
             };
             facts.insert(stamp.into(), Value::from(stored_text(moment)));
             found.insert(subject, facts);
+            first_seq = first_seq.or(Some(stored.seq));
         }
     }
 }
