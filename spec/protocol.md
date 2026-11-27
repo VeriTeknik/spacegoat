@@ -203,15 +203,16 @@ A device with such an address starts as ephemeral; when the same address is seen
 
 | Status | Body | What the hub does |
 |---|---|---|
-| 200 | `{ "accepted": n, "duplicates": m, "lastSeq": k }` | Forgets everything up to `k` |
+| 200 | `{ "accepted": n, "duplicates": m, "lastSeq": k }` | When `n + m` is the number of events the request carried and `k` is not below the last of them: may remove those events from its queue. Otherwise the answer confirms nothing, and the hub asks again |
 | 400 | `{ "error": "schema" }` | Stops sending and shows the fault locally; the answer never says which field |
 | 401 | `{ "error": "unauthorized" }` | Shows the fault locally and tries again slowly (every five minutes) |
 | 409 | `{ "error": "seq_gap", "expectedSeq": k }` | Stops sending: the service lost events it had confirmed |
 | 409 | `{ "error": "replay_conflict", "sourceSeq": s }` | Stops sending and shows the fault locally |
 | 413 | `{ "error": "too_large" }` | Splits the batch |
-| 429 | `{ "error": "rate_limited" }` with `Retry-After` | Waits |
+| 429 | `{ "error": "rate_limited" }` with `Retry-After` | Waits what `Retry-After` says, but never longer than its liveness interval (section 11) allows |
 | 503 | `{ "error": "unavailable" }` | Backs off and tries again |
 
+A hub removes from its queue only events the answered request carried, up to `lastSeq`: an answer to an empty request confirms no queued event, and an event above the request's last one is confirmed only by an answer to a request that carries it.
 An event the service has already accepted is counted in `duplicates` and changes nothing, so sending a batch again after a lost answer is always safe.
 The service compares a repeated event with the one it has on record; a different event under a number already used is a `replay_conflict`.
 
@@ -237,6 +238,8 @@ Until the protocol gains a reason for expired events, such a hub stops with `sch
 
 A hub sends at least one request every 300 seconds: a batch when it has events, a heartbeat otherwise.
 A hub that stays silent for three times that long raises an alert at the service.
+A stopped hub (section 10) sends nothing, heartbeats included, so the service cannot tell it from a dead one: the silence alert is the signal.
+A hub that could not capture for a while declares it with `site_source.input_lost` when it resumes.
 
 The first request of a run is a heartbeat.
 Its answer tells the hub two things it must not guess: the service's clock (`Date`) and where the service stands in the hub's sequence (`lastSeq`).

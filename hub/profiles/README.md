@@ -1,10 +1,13 @@
 # Device profiles
 
-A profile describes one piece of hardware to the hub agent.
-The agent holds no hardware-specific branch: everything that differs between devices is declared here.
+Nothing reads profiles yet: this version of the agent has no profile loader and no hardware modules, and there are no profile files.
+This page is the planned shape.
 
-A profile is a TOML file named after the device, for example `raspberry-pi-5.toml`.
-The agent is started with one profile and refuses to start if the profile names a capability it has no module for.
+A profile will describe one piece of hardware to the hub agent.
+The agent is to hold no hardware-specific branch: everything that differs between devices is declared here.
+
+A profile will be a TOML file named after the device, for example `raspberry-pi-5.toml`.
+The agent will be started with one profile and refuse to start if the profile names a capability it has no module for.
 
 ## Shape
 

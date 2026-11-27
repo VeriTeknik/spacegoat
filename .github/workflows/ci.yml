@@ -12,6 +12,7 @@ jobs:
   spec:
     name: Spec vectors
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -25,3 +26,42 @@ jobs:
           done
       - name: The regulation mapping keeps its form
         run: sh docs/check-mapping.sh
+
+  hub:
+    name: Hub agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: hub
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The toolchain is the one hub/rust-toolchain.toml names: installed here, in hub/, where rustup reads that file.
+      - run: rustup toolchain install
+      - run: cargo --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: hub
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      # The static binary the hub ships as: built and tested for musl, as on a device.
+      - run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: cargo build --locked --release --target x86_64-unknown-linux-musl
+      - run: cargo test --locked --target x86_64-unknown-linux-musl
+
+  deny:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@81891abc19297b21343b15ef67dc61e4aea74fda # v2.1.4
+        with:
+          manifest-path: hub/Cargo.toml
+          command: check advisories licenses bans sources

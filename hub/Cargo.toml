@@ -1,0 +1,56 @@
+[package]
+name = "spacegoat-hub"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "AGPL-3.0-or-later"
+description = "SpaceGoat hub agent: observes the local network and sends signed, ordered evidence to a hub service"
+repository = "https://github.com/VeriTeknik/spacegoat"
+publish = false
+
+[lib]
+name = "spacegoat_hub"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spacegoat-hub"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+ed25519-dalek = "3"
+# gzip of the request body only; the pure-Rust backend (miniz_oxide), no C zlib.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+getrandom = { version = "0.4", default-features = false }
+rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
+serde_json = "1"
+sha2 = "0.11"
+# SIGTERM/SIGINT set a flag (`flag::register`, safe); no channel or iterator features, no thread.
+signal-hook = { version = "0.4.6", default-features = false }
+# The configuration file. `parse` is the parser; `serde` only because `toml::Table` lives behind it (serde_core, no
+# derive). No `std`, `display` or `preserve_order`.
+toml = { version = "1.2.3", default-features = false, features = ["parse", "serde"] }
+# Blocking HTTP/1.1 client. `rustls` = rustls with the ring provider (not aws-lc) and the compiled-in Mozilla roots
+# (webpki-roots), so a device image without a CA bundle still verifies the service. No gzip, cookies, json or proxy
+# features; redirects, environment proxies and HTTP-status-as-error are switched off in `sender.rs`.
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+# An arithmetic overflow in a release build stops the process (panic = "abort") instead of wrapping silently into a
+# wrong sequence number or time.
+overflow-checks = true
