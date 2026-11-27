@@ -29,17 +29,28 @@ It writes no file, opens no network connection and never executes anything it re
 | `1` | At least one check failed. |
 | `2` | The header is unreadable (export.md section 2), the file cannot be read, or the command line is wrong. |
 
-With `--self-test`, `0` means every file named in `expected.json` gave the expected exit status, check states, `redacted` count and `firstFailedSeq`; `1` means at least one disagreed; `2` means the directory or `expected.json` could not be read.
+With `--self-test`, `0` means every file named in `expected.json` gave the expected exit status, check states, `redacted` count and `firstFailedSeq`, compared in type as well as value (`false` is not `0`).
+`1` means at least one disagreed, `expected.json` names no file, a file it names is missing, or the directory holds a `.jsonl` it does not name.
+`2` means the directory or `expected.json` could not be read.
+
+The exit status is always `0`, `1` or `2`.
+If the report cannot be written (standard output closed, a broken pipe such as `| head -1`, any write error), the verifier never exits `0`: it exits `1` when a check failed and `2` otherwise, and says so on standard error when it can.
 
 ## What the report states
 
-- the source id, the range `fromSeq..toSeq`, the number of event lines read and the number of redacted events;
+- the source id, the range `fromSeq..toSeq`, and, when `fromSeq` is above 1, that the file starts at that number and not at 1;
+- the number of event lines read, the number of them that are well-formed events, and the number of redacted events;
 - the state of each of the five checks and the first failed sequence number;
 - the SHA-256 fingerprint of every public key in the header, with the reminder that it must be compared with the registration record;
 - the last sequence number, with the reminder that events after it cannot be known from the file;
-- each failure with its line, sequence number, check and reason.
+- each failure with its line, sequence number, check and reason;
+- a result line that states its own limit: `PASSED` means every event is consistent with the keys named in the file, and those keys are not verified by it.
 
-Text taken from the file is never printed, except the source id and key ids, which the header rules restrict to a safe alphabet.
+`--json` prints one object with the same facts, including `startsAtOne`, `eventLinesRead` and `eventsWellFormed`.
+
+Neither text from the file nor the file's name is printed raw.
+From the file, only the source id, key ids and numbers are printed, which the rules restrict to a safe alphabet.
+The file name is printed as an escaped ASCII literal, so control characters, a line break or bytes that are not UTF-8 in a name can neither forge a line of the report nor make printing fail.
 
 ## What it proves
 
@@ -58,6 +69,10 @@ This list is export.md section 7.
   An export says nothing about events after its last one.
   Events removed from the end of a file, together with a lowered `toSeq`, cannot be seen.
   The verifier states the last sequence number so that a reader can compare it with what the service reports for the source.
+- **Events before `fromSeq`.**
+  An export says nothing about events before its first one.
+  Events removed from the start of a file, together with a raised `fromSeq`, cannot be seen: such a file passes every check.
+  When `fromSeq` is above 1, the verifier says plainly that the file starts at that number and not at 1.
 - **That the keys are the registered keys.**
   The header names keys; whoever wrote the file chose them.
   That a key is the one a person registered for the hub must be checked against the registration record.
@@ -84,6 +99,13 @@ export.md states each of these; they are listed here because a verifier built in
 - An attribute of a sequence kind that is missing or not an integer fails `sequence`, not `form`; a declared gap starts at 1 or later.
 - An explicit `"piiCommitment": null` fails `form`: an event without personal data omits the field.
 - Key ids are matched in full, and the year `0000` is accepted in `observedAt`: the form is checked, not the plausibility of the time.
+- `-0` fails `form`, and object keys are compared after their escapes are decoded, so `"a"` and `"a"` in one object are a duplicate.
+- "The first event" is the first line after the header even when that line is broken.
+
+## Memory
+
+The verifier reads the whole file into memory before checking it.
+A 200 000-line file took about 67 MB.
 
 ## Speed
 

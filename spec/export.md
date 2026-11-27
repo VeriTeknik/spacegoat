@@ -92,10 +92,10 @@ A verifier does not judge an event's attributes against its kind (protocol secti
 These apply to every value on every line, the header included, at every depth:
 
 - the value rules of protocol section 2: strings, integers, booleans, `null`, objects and arrays only;
-- an integer is a JSON number written as an optional `-` and digits, with no fraction and no exponent, within ±(2^53 - 1); any other number (`1.5`, `1.0`, `1e3`) is a floating-point number and is refused;
+- an integer is a JSON number written as an optional `-` and digits, with no fraction and no exponent, within ±(2^53 - 1); any other number (`1.5`, `1.0`, `1e3`) is a floating-point number and is refused; `-0` is a second spelling of `0` and is refused;
 - object keys are non-empty printable ASCII (`0x20` to `0x7E`);
 - text is valid Unicode: a lone surrogate, written as a `\u` escape, is refused;
-- no object has the same key twice;
+- no object has the same key twice; keys are compared after their escapes are decoded, so `"a"` and `"a"` are the same key and an object holding both breaks the rule;
 - nothing is nested deeper than 64 levels: the line's object is level 1, and each object or array inside it adds one level, so a line may hold objects and arrays nested 63 deep below its own object; a deeper line breaks the rule however deep the verifier's parser could read it;
 - base64url text (public keys and signatures) is accepted only in its canonical spelling: no padding, and the unused low bits of the last character are zero, so that every key and signature has exactly one spelling.
 
@@ -142,6 +142,7 @@ Such a key lets anyone produce signatures that pass; the defence is the comparis
 
 The events are walked in file order.
 `previous` starts at `fromSeq` - 1; after each event it becomes that event's number (the number it occupies, for a line that failed `form`).
+"The first event" is the first line after the header, whether or not that line passed `form`: when the first line is broken, the line after it is never the first event, even if it is a gap declaration.
 An event with number `s` passes when one of these holds:
 
 - it is the first event, `s` equals `fromSeq`, and it is not a `site_source.gap_declared` or `site_source.reset` whose own rule below fails;
@@ -177,6 +178,10 @@ A `pii` value that has no canonical form has already failed `form`.
 
 A redacted event alone never makes a check fail.
 
+The exit status is always `0`, `1` or `2`.
+A verifier that cannot write or flush its report (a closed or missing standard output, a broken pipe, any write error) never exits `0`, because nobody saw the result: it exits `1` when a check failed and `2` otherwise, says so on standard error when standard error can be written, and does not end in an uncaught error.
+A verifier states the result together with its limit: a file that passes is consistent with the keys named in it, and those keys are not verified by the file (section 7).
+
 [`vectors/export/expected.json`](vectors/export/expected.json) gives, for each vector file, the exit status, the state of each check, `redacted` and `firstFailedSeq`.
 
 ## 7. What an export does not prove
@@ -185,6 +190,10 @@ A redacted event alone never makes a check fail.
   An export says nothing about events after its last one.
   Events removed from the end of a file, together with a lowered `toSeq`, cannot be seen.
   A verifier states the last sequence number so that a reader can compare it with what the service reports for the source.
+- **Events before `fromSeq`.**
+  An export says nothing about events before its first one.
+  Events removed from the start of a file, together with a raised `fromSeq`, cannot be seen: such a file passes every check.
+  When `fromSeq` is above 1, a verifier says plainly that the file starts at that number and not at 1.
 - **That the keys are the registered keys.**
   The header names keys; whoever wrote the file chose them.
   That a key is the one a person registered for the hub must be checked against the registration record.

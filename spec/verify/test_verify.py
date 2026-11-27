@@ -124,18 +124,23 @@ class CanonicalJson(unittest.TestCase):
         # Nothing else is escaped: DEL, U+2028, U+2029, '/', non-ASCII.
         self.assertEqual(sv.canonical_json("\x7f  /ç"), '"\x7f  /ç"')
 
-    def test_deep_nesting_never_crashes(self):
-        # canonical_json is protocol.md section 2, which sets no depth (the 64-level limit is export.md's, for
-        # reading a line). Whether this depth can be written depends on the interpreter's stack
-        # (Python 3.15 can, 3.9 cannot); either way the answer is a text or a ValueError, never another exception.
+    @staticmethod
+    def nested_lists(levels):
         value = []
-        for _ in range(100000):
+        for _ in range(levels - 1):
             value = [value]
-        try:
-            text = sv.canonical_json(value)
-        except ValueError:
-            return
-        self.assertEqual(text, "[" * 100001 + "]" * 100001)
+        return value
+
+    def test_deep_nesting_exact_outcome(self):
+        # The verifier only canonicalises values that passed export.md section 4, so canonical_json applies the same
+        # 64-level limit, counted without recursion: the outcome never depends on the interpreter.
+        self.assertEqual(sv.canonical_json(self.nested_lists(64)), "[" * 64 + "]" * 64)
+        with self.assertRaises(ValueError):
+            sv.canonical_json(self.nested_lists(65))
+        with self.assertRaises(ValueError):
+            sv.canonical_json(self.nested_lists(100001))
+        with self.assertRaises(ValueError):
+            sv.canonical_json({"a": self.nested_lists(64)})
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -334,7 +339,7 @@ class ExportVectors(unittest.TestCase):
         report = sv.verify_export(read_vector("valid"))
         self.assertEqual(report.source_id, "01234567-89ab-4cde-8fab-0123456789ab")
         self.assertEqual((report.from_seq, report.to_seq), (1, 7))
-        self.assertEqual(report.events_read, 7)
+        self.assertEqual((report.event_lines_read, report.events_well_formed), (7, 7))
         public = b64url("A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg")
         self.assertEqual(report.keys, [("vector-key-1", hashlib.sha256(public).hexdigest())])
 
@@ -435,7 +440,7 @@ class MalformedInput(unittest.TestCase):
     def test_header_only_fails_sequence_at_from_seq(self):
         header = self.valid.split(b"\n")[0] + b"\n"
         report = self.assert_result(header, 1, sequence="failed")
-        self.assertEqual(report.events_read, 0)
+        self.assertEqual((report.event_lines_read, report.events_well_formed), (0, 0))
 
     # Line structure (section 1)
 
@@ -447,7 +452,7 @@ class MalformedInput(unittest.TestCase):
         # "there are no empty lines": the blank line is an event line that fails form; it occupies number 8, which
         # is greater than toSeq, so sequence fails too.
         report = self.assert_result(self.valid + b"\n", 8, form="failed", sequence="failed")
-        self.assertEqual(report.events_read, 8)
+        self.assertEqual((report.event_lines_read, report.events_well_formed), (8, 7))
 
     def test_blank_line_in_the_middle(self):
         lines = self.valid.split(b"\n")
@@ -671,6 +676,66 @@ class MalformedInput(unittest.TestCase):
         lines = self.valid.split(b"\n")
         self.assert_result(b"\n".join(lines[:6]) + b"\n", 6, sequence="failed")
 
+    def test_gap_on_the_line_after_a_broken_first_line_is_not_first(self):
+        # export.md section 5: "the first event" is the first line after the header, broken or not. The broken
+        # first line occupies 1, so the gap on line 2 is not first and its fromSeq must be previous + 1 = 2.
+        gap = read_vector("declared-gap").split(b"\n")
+        line = json.loads(gap[4].decode("utf-8"))
+        # fromSeq 4 is the signed original, so only its sequence fails; fromSeq 2 keeps the sequence but not the signature.
+        for start, failed in ((2, {"signature": "failed"}), (4, {"sequence": "failed"})):
+            with self.subTest(start=start):
+                line["attributes"]["fromSeq"] = start
+                body = json.dumps(line, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                data = b"\n".join([gap[0], b"{}", body]) + b"\n"
+                self.assert_result(data, 1, form="failed", **failed)
+
+    def test_reset_on_the_line_after_a_broken_first_line(self):
+        reset = read_vector("reset").split(b"\n")
+        header = reset[0].replace(b'"toSeq":4', b'"toSeq":2')
+        line = json.loads(reset[4].decode("utf-8"))
+        line["sourceSeq"] = 2
+        line["attributes"]["lastAckedSeq"] = 1
+        body = json.dumps(line, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        self.assert_result(b"\n".join([header, b"{}", body]) + b"\n", 1, form="failed", signature="failed")
+
+    def test_minus_zero_fails_form(self):
+        # export.md section 4: -0 is refused.
+        line = self.valid.split(b"\n")[4].replace(b'"ephemeral":2', b'"ephemeral":-0')
+        self.assert_result(replace_line(self.valid, 4, line), 4, form="failed")
+        header = self.valid.split(b"\n")[0].replace(b'"fromSeq":1', b'"fromSeq":-0')
+        self.assert_unreadable(replace_line(self.valid, 0, header))
+
+    def test_escaped_key_spelling_is_the_same_key(self):
+        # export.md section 4: keys are compared after decoding their escapes.
+        line = self.valid.split(b"\n")[2].replace(b'"trustOrigin":"hub"', b'"trustOrigin":"hub","\\u0074rustOrigin":"hub"')
+        self.assert_result(replace_line(self.valid, 2, line), 2, form="failed")
+        header = self.valid.split(b"\n")[0].replace(b'"toSeq":7', b'"toSeq":7,"to\\u0053eq":7')
+        self.assert_unreadable(replace_line(self.valid, 0, header))
+
+    def test_swapped_source_id_fails_every_signature(self):
+        header = self.valid.split(b"\n")[0].replace(b"01234567-89ab-4cde-8fab-0123456789ab", b"01234567-89ab-4cde-8fab-0123456789ac")
+        report = self.assert_result(replace_line(self.valid, 0, header), 1, signature="failed")
+        self.assertEqual(sum(1 for f in report.failures if f[2] == "signature"), 7)
+
+    def test_other_public_key_under_the_same_key_id_fails_every_signature(self):
+        other = base64.urlsafe_b64encode(bytes.fromhex(RFC8032[0][0])).decode("ascii").rstrip("=")
+        header = self.valid.split(b"\n")[0].replace(b"A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg", other.encode("ascii"))
+        report = self.assert_result(replace_line(self.valid, 0, header), 1, signature="failed")
+        self.assertEqual(sum(1 for f in report.failures if f[2] == "signature"), 7)
+
+    def test_file_starting_after_one_says_so(self):
+        # export.md section 7: events before fromSeq cannot be known; events 1..4 removed and fromSeq 5 still pass.
+        lines = self.valid.split(b"\n")
+        header = lines[0].replace(b'"fromSeq":1', b'"fromSeq":5')
+        report = self.assert_result(b"\n".join([header] + lines[5:]), None)
+        text = sv.report_to_text(report, "x.jsonl")
+        self.assertIn("This file starts at sequence number 5, not at 1.", text)
+        self.assertIn("Events before sequence number 5 cannot be known from this file.", text)
+        self.assertEqual(sv.report_to_json(report)["startsAtOne"], False)
+        valid = sv.verify_export(self.valid)
+        self.assertNotIn("starts at sequence number", sv.report_to_text(valid, "x.jsonl"))
+        self.assertEqual(sv.report_to_json(valid)["startsAtOne"], True)
+
 
 # ---------------------------------------------------------------------------------------------------------------------
 # The command line and the report (export.md section 6)
@@ -699,7 +764,7 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(report["firstFailedSeq"], 5)
         self.assertEqual(report["exit"], 1)
         self.assertEqual(report["sourceId"], "01234567-89ab-4cde-8fab-0123456789ab")
-        self.assertEqual(report["eventsRead"], 6)
+        self.assertEqual((report["eventLinesRead"], report["eventsWellFormed"]), (6, 6))
         self.assertEqual(len(report["keys"][0]["fingerprint"]), 64)
         self.assertIn("lastSequenceNumber", report)
 
@@ -713,6 +778,145 @@ class CommandLine(unittest.TestCase):
                 result = self.run_cli(*args)
                 self.assertEqual(result.returncode, 2)
                 self.assertNotIn("Traceback", result.stderr)
+
+    # -- export.md section 6: the exit status is always 0, 1 or 2, also when the report cannot be written
+
+    def run_with_closed_pipe(self, *args):
+        proc = subprocess.Popen([sys.executable, SCRIPT] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc.stdout.close()  # the reader goes away before the verifier writes, like `| head -0`
+        stderr = proc.stderr.read().decode("utf-8", "replace")
+        proc.stderr.close()
+        return proc.wait(timeout=300), stderr
+
+    def test_broken_pipe(self):
+        for name, status in (("deleted-event", 1), ("valid", 2)):
+            for extra in ((), ("--json",)):
+                with self.subTest(name=name, extra=extra):
+                    code, stderr = self.run_with_closed_pipe(os.path.join(EXPORT_DIR, name + ".jsonl"), *extra)
+                    self.assertEqual(code, status, stderr)
+                    self.assertNotIn("Traceback", stderr)
+                    self.assertNotIn("Exception ignored", stderr)
+                    self.assertIn("report could not be written", stderr)
+        code, stderr = self.run_with_closed_pipe("--self-test", EXPORT_DIR)
+        self.assertEqual(code, 2, stderr)
+        self.assertNotIn("Traceback", stderr)
+
+    def test_closed_stdout(self):
+        for name, status in (("deleted-event", 1), ("valid", 2)):
+            with self.subTest(name=name):
+                result = subprocess.run(
+                    ["/bin/sh", "-c", '"$0" "$1" "$2" >&-', sys.executable, SCRIPT, os.path.join(EXPORT_DIR, name + ".jsonl")],
+                    capture_output=True, text=True, timeout=300,
+                )
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertIn("report could not be written", result.stderr)
+
+    # -- the file name cannot forge the report
+
+    def test_path_is_printed_escaped(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "x\x1b[2J\nResult: PASSED (exit status 0)\n.jsonl")
+            with open(path, "wb") as f:
+                f.write(read_vector("deleted-event"))
+            result = self.run_cli(path)
+            self.assertEqual(result.returncode, 1)
+            self.assertNotIn("\x1b", result.stdout)
+            self.assertFalse(any(line.startswith("Result: PASSED") for line in result.stdout.splitlines()))
+            self.assertEqual(sum(line.startswith("Result: ") for line in result.stdout.splitlines()), 1)
+
+    def test_path_that_is_not_utf8(self):
+        result = subprocess.run([os.fsencode(sys.executable), os.fsencode(SCRIPT), b"/nowhere/bad\xff\x1b.jsonl"],
+                                capture_output=True, timeout=300)
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn(b"Traceback", result.stderr)
+        self.assertNotIn(b"\x1b", result.stderr)
+        report = sv.verify_export(read_vector("valid"))
+        text = sv.report_to_text(report, "bad\udcff\x1b\u2028.jsonl")  # what Python makes of a non-UTF-8 argument
+        text.encode("ascii")
+        self.assertIn("bad\\udcff\\x1b\\u2028.jsonl", text)
+
+    # -- export.md section 6: the result line and the two forms of the report
+
+    def test_result_line_states_the_limit(self):
+        ok = sv.report_to_text(sv.verify_export(read_vector("valid")), "v.jsonl").splitlines()
+        result = [line for line in ok if line.startswith("Result: ")]
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0].startswith("Result: PASSED (exit status 0)"))
+        self.assertIn("keys named in this file", result[0])
+        self.assertIn("NOT verified", result[0])
+        bad = sv.report_to_text(sv.verify_export(read_vector("reordered")), "r.jsonl").splitlines()
+        self.assertTrue([line for line in bad if line.startswith("Result: ")][0].startswith("Result: FAILED (exit status 1)"))
+
+    def test_json_and_text_agree_on_every_fact(self):
+        import re
+
+        lines = read_vector("valid").split(b"\n")
+        variants = {name: read_vector(name) for name in ("valid", "deleted-event", "redacted-pii", "float-attribute")}
+        variants["starts-at-5"] = b"\n".join([lines[0].replace(b'"fromSeq":1', b'"fromSeq":5')] + lines[5:])
+        variants["trailing-blank"] = read_vector("valid") + b"\n"
+        for name, data in variants.items():
+            with self.subTest(name):
+                report = sv.verify_export(data)
+                facts = sv.report_to_json(report)
+                text = sv.report_to_text(report, "f.jsonl")
+
+                def field(label):
+                    match = re.search(r"^%s:\s+(.*)$" % re.escape(label), text, re.M)
+                    self.assertIsNotNone(match, label)
+                    return match.group(1)
+
+                self.assertEqual(field("Source"), facts["sourceId"])
+                self.assertEqual(field("Range"), "%d..%d" % (facts["fromSeq"], facts["toSeq"]))
+                self.assertEqual(int(field("Event lines read")), facts["eventLinesRead"])
+                self.assertEqual(int(field("Well-formed events")), facts["eventsWellFormed"])
+                self.assertEqual(int(field("Redacted events")), facts["redacted"])
+                first = field("First failed sequence number")
+                self.assertEqual(None if first == "none" else int(first), facts["firstFailedSeq"])
+                for check, state in facts["checks"].items():
+                    self.assertRegex(text, r"(?m)^  %s\s+%s$" % (check, state))
+                for key in facts["keys"]:
+                    self.assertRegex(text, r"(?m)^  %s  %s$" % (re.escape(key["keyId"]), key["fingerprint"]))
+                self.assertIn("Last sequence number: %d." % facts["lastSequenceNumber"], text)
+                self.assertEqual("starts at sequence number" not in text, facts["startsAtOne"])
+                self.assertIn("Result: %s (exit status %d)" % ("PASSED" if facts["exit"] == 0 else "FAILED", facts["exit"]), text)
+                self.assertEqual(len(re.findall(r"(?m)^  (line \d+|after the last line), ", text)), len(facts["failures"]))
+                for note in facts["notes"]:
+                    self.assertIn(note, text)
+
+    # -- --self-test
+
+    def self_test_dir(self, expected, files):
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with open(os.path.join(tmp.name, "expected.json"), "w", encoding="utf-8") as f:
+            json.dump(expected, f)
+        for name in files:
+            with open(os.path.join(tmp.name, name + ".jsonl"), "wb") as f:
+                f.write(read_vector(name))
+        return self.run_cli("--self-test", tmp.name)
+
+    def test_self_test_rules(self):
+        with open(os.path.join(EXPORT_DIR, "expected.json"), encoding="utf-8") as f:
+            valid = json.load(f)["valid"]
+        result = self.self_test_dir({"valid": valid}, ["valid"])
+        self.assertEqual(result.returncode, 0, result.stdout)
+        result = self.self_test_dir({}, [])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no vectors", result.stdout)
+        result = self.self_test_dir({"valid": dict(valid, redacted=False)}, ["valid"])  # False must not equal 0
+        self.assertEqual(result.returncode, 1, result.stdout)
+        result = self.self_test_dir({"valid": dict(valid, exit=False)}, ["valid"])
+        self.assertEqual(result.returncode, 1, result.stdout)
+        result = self.self_test_dir({"valid": valid, "reset": valid}, ["valid"])  # reset.jsonl missing
+        self.assertEqual(result.returncode, 1, result.stdout)
+        result = self.self_test_dir({"valid": valid}, ["valid", "reset"])  # reset.jsonl not named
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("reset", result.stdout)
 
     def test_unreadable_header_exits_2(self):
         import tempfile

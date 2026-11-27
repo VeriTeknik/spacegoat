@@ -185,14 +185,19 @@ def is_integer(value):
     return type(value) is int and -MAX_INT <= value <= MAX_INT
 
 
+MAX_DEPTH = 64  # E4: the outermost object or array is level 1; each object or array inside it adds one
+
+
 def check_value(value):
     """Raise ValueError unless every value, at every depth, keeps the value rules of P2 and E4.
 
-    Iterative, so a deeply nested value is judged instead of exhausting the stack.
+    Iterative, so a deeply nested value is judged instead of exhausting the stack. The 64-level limit of E4 applies
+    here too: the verifier only canonicalises values that passed E4, and the signed message nests its attributes
+    exactly as deep as the line does, so the limit never refuses a line that passed `form`.
     """
-    stack = [value]
+    stack = [(value, 1)]
     while stack:
-        item = stack.pop()
+        item, level = stack.pop()
         if item is None or isinstance(item, bool):
             continue
         if type(item) is int:
@@ -201,13 +206,13 @@ def check_value(value):
         elif isinstance(item, str):
             if not _text_ok(item):
                 raise ValueError("text that is not valid Unicode")
-        elif isinstance(item, dict):
-            for key, child in item.items():
-                if not _key_ok(key):
-                    raise ValueError("object key that is not non-empty printable ASCII")
-                stack.append(child)
-        elif isinstance(item, list):
-            stack.extend(item)
+        elif isinstance(item, (dict, list)):
+            if level > MAX_DEPTH:
+                raise ValueError("nested deeper than %d levels" % MAX_DEPTH)
+            children = item.values() if isinstance(item, dict) else item
+            if isinstance(item, dict) and not all(_key_ok(key) for key in item):
+                raise ValueError("object key that is not non-empty printable ASCII")
+            stack.extend((child, level + 1) for child in children)
         elif isinstance(item, float):
             raise ValueError("floating-point number")
         else:
@@ -249,7 +254,8 @@ _INT_TEXT = re.compile(r"-?(?:0|[1-9][0-9]*)")
 
 
 def _no_duplicate_keys(pairs):
-    """E4: no object has the same key twice."""
+    """E4: no object has the same key twice. The keys arrive here already decoded, so "a" and "\\u0061" are the
+    same key, as E4 says."""
     result = {}
     for key, value in pairs:
         if key in result:
@@ -267,16 +273,15 @@ def _refuse_constant(_text):
 
 
 def _parse_int(text):
-    """E4: an optional '-' and digits, within +-(2^53 - 1). Judged on the text before any conversion."""
+    """E4: an optional '-' and digits, within +-(2^53 - 1), and not -0. Judged on the text before any conversion."""
+    if text == "-0":
+        raise ValueError("integer -0 is refused")  # E4: a second spelling of 0
     if not _INT_TEXT.fullmatch(text) or len(text.lstrip("-")) > 16:
         raise ValueError("integer outside +-(2^53 - 1)")
     value = int(text)
     if not is_integer(value):
         raise ValueError("integer outside +-(2^53 - 1)")
     return value
-
-
-MAX_DEPTH = 64  # E4: the line's object is level 1; each object or array inside it adds one
 
 
 def _check_depth(text):
@@ -533,7 +538,8 @@ class Report:
         self.source_id = None
         self.from_seq = None
         self.to_seq = None
-        self.events_read = 0
+        self.event_lines_read = 0  # every line after the header, broken or not
+        self.events_well_formed = 0  # the event lines that passed `form`
         self.keys = []  # [(keyId, SHA-256 fingerprint hex)]
         self.failures = []  # [(file line number or None, sequence number, check, reason)]
 
@@ -586,8 +592,8 @@ def verify_export(lines):
     previous = from_seq - 1  # E5 `sequence`
     for index, raw in enumerate(lines[1:]):
         line_number = index + 2
-        first = index == 0
-        report.events_read += 1
+        first = index == 0  # E5: the first line after the header, whether or not it passes `form`
+        report.event_lines_read += 1
         try:
             event = read_event(raw)
         except ValueError as error:
@@ -600,6 +606,7 @@ def verify_export(lines):
             continue
 
         seq = event.seq
+        report.events_well_formed += 1
         if event.shape == "redacted":
             report.redacted += 1  # E6
 
@@ -638,6 +645,27 @@ NOT_PROVEN = (
     "still valid then (version 1 has no key revocation)."
 )
 MAX_LISTED = 50
+PASSED_LINE = (
+    "every event is consistent with the keys named in this file "
+    "(the keys themselves are NOT verified here: compare the fingerprints above)"
+)
+FAILED_LINE = "at least one check failed; the failures are listed above"
+
+
+def start_sentences(report):
+    """E7: events before fromSeq cannot be known; said plainly when the file does not start at 1."""
+    if report.from_seq == 1:
+        return []
+    return [
+        "This file starts at sequence number %d, not at 1." % report.from_seq,
+        "Events before sequence number %d cannot be known from this file." % report.from_seq,
+    ]
+
+
+def printable(text):
+    """A file name as an escaped, ASCII-only literal: control characters, non-ASCII and the surrogates Python uses for
+    bytes that are not UTF-8 are all escaped, so a name can neither forge a report line nor fail to print."""
+    return ascii(text)
 
 
 def report_to_json(report):
@@ -651,28 +679,36 @@ def report_to_json(report):
         "sourceId": report.source_id,
         "fromSeq": report.from_seq,
         "toSeq": report.to_seq,
+        "startsAtOne": report.from_seq == 1,
         "lastSequenceNumber": report.to_seq,
-        "eventsRead": report.events_read,
+        "eventLinesRead": report.event_lines_read,
+        "eventsWellFormed": report.events_well_formed,
         "keys": [{"keyId": key_id, "fingerprint": fp} for key_id, fp in report.keys],
         "failures": [
             {"line": line, "sourceSeq": seq, "check": check, "reason": reason}
             for line, seq, check, reason in report.failures
         ],
-        "notes": [KEYS_SENTENCE, END_SENTENCE, NOT_PROVEN],
+        "notes": start_sentences(report) + [KEYS_SENTENCE, END_SENTENCE, NOT_PROVEN],
+        "result": PASSED_LINE if report.exit_status == 0 else FAILED_LINE,
     }
 
 
 def report_to_text(report, path):
-    """The human-readable report. Only validated values from the file are printed (no free text from the input)."""
-    out = ["SpaceGoat evidence export verifier (export.md version 1)", "File:            %s" % path]
+    """The human-readable report. Nothing from the file is printed raw: only values its rules restrict to a safe
+    alphabet (source id, key ids, numbers); the file name is printed escaped."""
+    out = ["SpaceGoat evidence export verifier (export.md version 1)", "File:            %s" % printable(path)]
     if report.unreadable is not None:
         out += ["Unreadable header: %s." % report.unreadable, "Nothing else was checked.", "Exit status: 2"]
         return "\n".join(out) + "\n"
     out += [
-        "Source:          %s" % report.source_id,
-        "Range:           %d..%d" % (report.from_seq, report.to_seq),
-        "Events read:     %d" % report.events_read,
-        "Redacted events: %d" % report.redacted,
+        "Source:             %s" % report.source_id,
+        "Range:              %d..%d" % (report.from_seq, report.to_seq),
+    ]
+    out += start_sentences(report)
+    out += [
+        "Event lines read:   %d" % report.event_lines_read,
+        "Well-formed events: %d" % report.events_well_formed,
+        "Redacted events:    %d" % report.redacted,
         "",
         "Checks:",
     ]
@@ -691,7 +727,10 @@ def report_to_text(report, path):
         for line, seq, check, reason in report.failures[:MAX_LISTED]:
             where = "after the last line" if line is None else "line %d" % line
             out.append("  %s, sequence number %d: %s: %s" % (where, seq, check, reason))
-    out += ["", "Result: %s (exit status %d)" % ("PASSED" if report.exit_status == 0 else "FAILED", report.exit_status)]
+    if report.exit_status == 0:
+        out += ["", "Result: PASSED (exit status 0): %s." % PASSED_LINE]
+    else:
+        out += ["", "Result: FAILED (exit status %d): %s." % (report.exit_status, FAILED_LINE)]
     return "\n".join(out) + "\n"
 
 
@@ -700,21 +739,42 @@ def report_to_text(report, path):
 # =====================================================================================================================
 
 
+def _same(a, b):
+    """Equal in type as well as value, at every depth: True is not 1 and False is not 0."""
+    return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
 def self_test(directory):
+    """Returns (status, text): 0 every vector agrees, 1 one disagrees or there is none, 2 expected.json unreadable.
+
+    Every file named in expected.json must exist, and every .jsonl in the directory must be named there.
+    """
     try:
         with open(os.path.join(directory, "expected.json"), "rb") as f:
-            expected = read_json_object(f.read().replace(b"\n", b" ").rstrip())
+            expected = read_json_object(f.read().replace(b"\n", b" ").strip())
+        present = sorted(n[: -len(".jsonl")] for n in os.listdir(directory) if n.endswith(".jsonl"))
     except (OSError, ValueError) as error:
-        print("cannot read expected.json in %s: %s" % (directory, error), file=sys.stderr)
-        return 2
+        _say("cannot read expected.json in %s: %s" % (printable(directory), error))
+        return 2, ""
+    out = []
     disagreements = 0
+    if not expected:
+        out.append("no vectors: expected.json names no file")
+        disagreements += 1
+    for name in sorted(set(present) - set(expected)):
+        out.append("DIFFERS %s: the file is not named in expected.json" % printable(name))
+        disagreements += 1
     for name in sorted(expected):
         want = expected[name]
+        if name not in present:
+            out.append("DIFFERS %s: the file named in expected.json is missing" % printable(name))
+            disagreements += 1
+            continue
         try:
             with open(os.path.join(directory, name + ".jsonl"), "rb") as f:
                 report = verify_export(f.read())
         except OSError as error:
-            print("DIFFERS %s: cannot read the file (%s)" % (name, error))
+            out.append("DIFFERS %s: cannot read the file (%s)" % (printable(name), error.strerror))
             disagreements += 1
             continue
         got = {
@@ -723,21 +783,49 @@ def self_test(directory):
             "redacted": report.redacted,
             "firstFailedSeq": report.first_failed_seq,
         }
-        wrong = [field for field in got if not isinstance(want, dict) or want.get(field) != got[field]]
+        if not isinstance(want, dict):
+            want = {}
+        wrong = [field for field in got if field not in want or not _same(want[field], got[field])]
         if wrong:
             disagreements += 1
             for field in wrong:
-                want_value = want.get(field) if isinstance(want, dict) else None
-                print("DIFFERS %s: %s expected %s, got %s" % (name, field, json.dumps(want_value), json.dumps(got[field])))
+                out.append("DIFFERS %s: %s expected %s, got %s" % (
+                    printable(name), field, json.dumps(want.get(field)), json.dumps(got[field])))
         else:
-            print("ok      %s" % name)
-    print("%d vectors, %d disagree" % (len(expected), disagreements))
-    return 1 if disagreements else 0
+            out.append("ok      %s" % printable(name))
+    out.append("%d vectors, %d disagree" % (len(expected), disagreements))
+    return (1 if disagreements else 0), "\n".join(out) + "\n"
 
 
 # =====================================================================================================================
 # Command line
 # =====================================================================================================================
+
+
+def _say(message):
+    """A message on standard error, if standard error is usable at all."""
+    try:
+        sys.stderr.write("spacegoat_verify: %s\n" % message)
+        sys.stderr.flush()
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+def _emit(text, status):
+    """Write the report and return the exit status. E6: the exit status is always 0, 1 or 2.
+
+    If the report cannot be written or flushed (a closed or missing standard output, a broken pipe, any OSError),
+    the run ends with 1 when a check failed and 2 otherwise, never 0: nobody saw the report. os._exit skips the
+    interpreter's own flush at exit, which would hit the same broken stream and print a traceback.
+    """
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        return status
+    except (AttributeError, OSError, ValueError):
+        failed = 1 if status == 1 else 2
+        _say("the report could not be written to standard output; exit status %d" % failed)
+        os._exit(failed)
 
 
 def main(argv=None):
@@ -752,19 +840,20 @@ def main(argv=None):
     if (args.self_test is None) == (args.export is None):
         parser.error("give either an export file or --self-test VECTORS_DIR")
     if args.self_test is not None:
-        return self_test(args.self_test)
+        status, text = self_test(args.self_test)
+        return _emit(text, status) if text else status
     try:
         with open(args.export, "rb") as f:
-            data = f.read()
+            data = f.read()  # the whole file is read into memory (see README)
     except OSError as error:
-        print("cannot read %s: %s" % (args.export, error.strerror or error), file=sys.stderr)
+        _say("cannot read %s: %s" % (printable(args.export), error.strerror or "error"))
         return 2
     report = verify_export(data)
     if args.json:
-        print(json.dumps(report_to_json(report), sort_keys=True))
+        text = json.dumps(report_to_json(report), sort_keys=True) + "\n"
     else:
-        sys.stdout.write(report_to_text(report, args.export))
-    return report.exit_status
+        text = report_to_text(report, args.export)
+    return _emit(text, report.exit_status)
 
 
 if __name__ == "__main__":
