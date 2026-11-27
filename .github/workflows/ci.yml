@@ -24,6 +24,8 @@ jobs:
             jq empty "$f"
             echo "ok $f"
           done
+      - name: The regulation mapping keeps its form
+        run: sh docs/check-mapping.sh
 
   hub:
     name: Hub agent
