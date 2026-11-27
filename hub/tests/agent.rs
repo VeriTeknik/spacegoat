@@ -3108,3 +3108,62 @@ fn what_the_store_never_took_survives_a_confirmation_and_a_restart() {
     assert_eq!(agent.status().unwrap().pending, 0, "confirmed once the store took it");
     agent.close().unwrap();
 }
+
+#[test]
+fn a_backlog_of_held_events_stops_capture_at_the_cap_and_capture_resumes_once_the_store_takes_them() {
+    let hub = Hub::new();
+    let settings = agent::AgentSettings {
+        backlog_cap: 4,
+        ..agent::AgentSettings::default()
+    };
+    let observer = Steered::default();
+    let mut agent = Agent::open_with(&hub.config, Box::new(observer.clone()), hub.clock.as_clock(), settings).unwrap();
+    agent.tick().unwrap();
+    break_updates(&hub, true);
+    // New devices every round, whose reports the store cannot take: delivered, confirmed, kept.
+    let mut full = None;
+    for round in 0..10 {
+        observer.set(vec![sighting(&format!("odd:{round}"), "printer", None, None, None)]);
+        hub.clock.advance_seconds(sender::BACKOFF_MAX_SECONDS as i64);
+        let _ = agent.tick();
+        let status = agent.status().unwrap();
+        assert_eq!(
+            hub.service.last_seq(),
+            status.last_assigned_seq,
+            "delivered, round {round}"
+        );
+        if status.waiting_for.as_deref() == Some("backlog") {
+            full = Some(status);
+            break;
+        }
+    }
+    let full = full.expect("the backlog filled");
+    assert!(full.pending >= 4);
+    assert_eq!(
+        full.problem.as_deref(),
+        Some("pseudonyms_failed"),
+        "why it does not drain"
+    );
+    hub.clock.advance_seconds(sender::BACKOFF_MAX_SECONDS as i64);
+    let _ = agent.tick();
+    assert_eq!(
+        agent.status().unwrap().last_assigned_seq,
+        full.last_assigned_seq,
+        "capture stopped"
+    );
+    break_updates(&hub, false);
+    let requests = hub.service.requests().len();
+    hub.clock.advance_seconds(sender::BACKOFF_MAX_SECONDS as i64);
+    agent.tick().unwrap();
+    let status = agent.status().unwrap();
+    assert!(status.last_assigned_seq > full.last_assigned_seq, "capture resumed");
+    assert_eq!(status.problem, None);
+    assert!(
+        hub.service.requests()[requests..].iter().all(|record| record
+            .events
+            .as_ref()
+            .is_none_or(|events| events.iter().all(|seq| *seq > full.last_assigned_seq))),
+        "what was held was let go without being sent again"
+    );
+    agent.close().unwrap();
+}

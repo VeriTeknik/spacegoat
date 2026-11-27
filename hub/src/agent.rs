@@ -947,7 +947,7 @@ impl Agent {
         if let Some(halt) = &halt {
             sender.halt(HaltReason::from_text(&halt.reason));
         }
-        sender.hold_acks_from(unsaved_from);
+        sender.hold_acks_from(unsaved_from)?;
         Ok(Self {
             config: config.clone(),
             clock,
@@ -1514,8 +1514,8 @@ impl Agent {
         match self.pseudonyms.remember_all(&reports) {
             Ok(()) => {
                 self.unsaved.clear();
-                self.hold_from(None);
-                None
+                // Released: what the service already confirmed leaves the queue now.
+                self.hold_from(None).err()
             }
             Err(error) => Some(error.into()),
         }
@@ -1526,14 +1526,14 @@ impl Agent {
         self.pseudonyms.forget_facts()?;
         self.reported.clear();
         self.unsaved.clear();
-        self.hold_from(None);
+        self.hold_from(None)?;
         Ok(())
     }
 
     /// The first queued event whose facts the store has not taken (`unsaved_from`), for the agent and the sender.
-    fn hold_from(&mut self, from: Option<u64>) {
+    fn hold_from(&mut self, from: Option<u64>) -> Result<(), AgentError> {
         self.unsaved_from = from;
-        self.sender.hold_acks_from(from);
+        Ok(self.sender.hold_acks_from(from)?)
     }
 
     /// Report what this round saw: the events in one outbox transaction per `DEVICES_PER_COMMIT` devices (the
@@ -1668,7 +1668,7 @@ impl Agent {
                     (Some(held), Some(first)) => Some(held.min(first)),
                     (held, first) => held.or(first),
                 };
-                self.hold_from(from);
+                self.hold_from(from)?;
                 Ok(Some(error.into()))
             }
         }

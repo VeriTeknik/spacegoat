@@ -1594,3 +1594,88 @@ fn a_confirmation_reaching_past_the_request_removes_only_what_the_request_carrie
     );
     assert_eq!(step(&mut sender), SendOutcome::Halted(HaltReason::ReplayConflict));
 }
+
+// ---- Events the agent holds on to ----
+
+/// Steps until nothing more is sent, the clock moving past each back-off.
+fn send_all(sender: &mut Sender, clock: &TestClock, steps: usize) {
+    for _ in 0..steps {
+        let _ = step(sender);
+        clock.advance_seconds(BACKOFF_MAX_SECONDS as i64);
+    }
+}
+
+#[test]
+fn a_hold_keeps_events_queued_but_does_not_stop_delivery_behind_them() {
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 700);
+    let mut sender = make_sender(&service, outbox, &clock);
+    sender.hold_acks_from(Some(1)).unwrap();
+    send_all(&mut sender, &clock, 30);
+    assert_eq!(service.last_seq(), 700, "everything delivered");
+    assert_eq!(
+        sender.outbox().pending(1000, None).unwrap().len(),
+        700,
+        "and still queued"
+    );
+    // Released: what the service confirmed is let go at once, without another request.
+    let requests = service.requests().len();
+    sender.hold_acks_from(None).unwrap();
+    assert!(sender.outbox().pending(10, None).unwrap().is_empty());
+    assert_eq!(service.requests().len(), requests);
+    assert_eq!(service.accepted_seqs(), (1..=700).collect::<Vec<u64>>(), "each once");
+}
+
+#[test]
+fn only_held_events_left_sends_no_more_duplicates() {
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 3);
+    let mut sender = make_sender(&service, outbox, &clock);
+    sender.hold_acks_from(Some(1)).unwrap();
+    assert_eq!(step(&mut sender), SendOutcome::Sent(3), "a success, though held");
+    send_all(&mut sender, &clock, 6);
+    let carrying = service
+        .requests()
+        .iter()
+        .filter(|record| record.events.as_ref().is_some_and(|events| !events.is_empty()))
+        .count();
+    assert_eq!(carrying, 1, "the held events went once; only heartbeats since");
+}
+
+#[test]
+fn held_events_confirmed_before_a_restart_are_sent_once_more_as_duplicates() {
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 600);
+    let mut sender = make_sender(&service, outbox, &clock);
+    sender.hold_acks_from(Some(1)).unwrap();
+    send_all(&mut sender, &clock, 4);
+    assert_eq!(service.last_seq(), 600);
+    let outbox = sender.into_outbox();
+    let mut restarted = make_sender(&service, outbox, &clock);
+    send_all(&mut restarted, &clock, 4);
+    assert!(restarted.outbox().pending(10, None).unwrap().is_empty(), "drained");
+    assert_eq!(restarted.halted(), None);
+    assert_eq!(service.accepted_seqs(), (1..=600).collect::<Vec<u64>>(), "each once");
+}
+
+#[test]
+fn a_service_that_answers_twice_below_what_it_confirmed_of_held_events_halts_with_gap() {
+    // The service confirmed 1 to 3 in answer to the request that carried them; the hub holds them. Two answers
+    // below that are a loss, held or not.
+    let (tmp, clock, service) = (TempDir::new(), TestClock::new(), service());
+    let mut outbox = open_outbox(&tmp, "outbox.sqlite");
+    fill(&mut outbox, &clock, 3);
+    let mut sender = make_sender(&service, outbox, &clock);
+    sender.hold_acks_from(Some(1)).unwrap();
+    assert_eq!(step(&mut sender), SendOutcome::Sent(3));
+    service.set_last_seq(1);
+    assert_eq!(
+        sender.heartbeat().unwrap(),
+        SendOutcome::RetryLater(BACKOFF_FIRST_SECONDS)
+    );
+    clock.advance_seconds(BACKOFF_FIRST_SECONDS as i64);
+    assert_eq!(sender.heartbeat().unwrap(), SendOutcome::Halted(HaltReason::Gap));
+}
