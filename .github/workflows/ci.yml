@@ -24,6 +24,17 @@ jobs:
             jq empty "$f"
             echo "ok $f"
           done
+      # Every line of every export vector is JSON. float-attribute.jsonl passes too: a float is valid JSON and is
+      # refused only by the protocol, which is the verifier's business, not this step's.
+      - name: Every export vector line is well-formed JSON
+        run: |
+          set -eu
+          for f in spec/vectors/export/*.jsonl; do
+            jq -c . "$f" >/dev/null
+            echo "ok $f"
+          done
+          jq empty spec/vectors/export/expected.json
+          echo "ok spec/vectors/export/expected.json"
 
   hub:
     name: Hub agent
