@@ -26,6 +26,22 @@ jobs:
           done
       - name: The regulation mapping keeps its form
         run: sh docs/check-mapping.sh
+      # Every line of every export vector is JSON. float-attribute.jsonl passes too: a float is valid JSON and is
+      # refused only by the protocol, which is the verifier's business, not this step's.
+      - name: Every export vector line is well-formed JSON
+        run: |
+          set -eu
+          for f in spec/vectors/export/*.jsonl; do
+            jq -c . "$f" >/dev/null
+            echo "ok $f"
+          done
+          jq empty spec/vectors/export/expected.json
+          echo "ok spec/vectors/export/expected.json"
+      # The reference verifier is plain standard-library Python; the runner's python3 is enough.
+      - name: Reference verifier tests
+        run: python3 -m unittest spec/verify/test_verify.py
+      - name: Reference verifier agrees with every export vector
+        run: python3 spec/verify/spacegoat_verify.py --self-test spec/vectors/export
 
   hub:
     name: Hub agent

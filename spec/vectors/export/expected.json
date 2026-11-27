@@ -1,0 +1,122 @@
+{
+  "altered-event": {
+    "checks": {
+      "commitment": "ok",
+      "form": "ok",
+      "key": "ok",
+      "sequence": "ok",
+      "signature": "failed"
+    },
+    "exit": 1,
+    "firstFailedSeq": 3,
+    "redacted": 0
+  },
+  "bad-commitment": {
+    "checks": {
+      "commitment": "failed",
+      "form": "ok",
+      "key": "ok",
+      "sequence": "ok",
+      "signature": "ok"
+    },
+    "exit": 1,
+    "firstFailedSeq": 3,
+    "redacted": 0
+  },
+  "declared-gap": {
+    "checks": {
+      "commitment": "ok",
+      "form": "ok",
+      "key": "ok",
+      "sequence": "ok",
+      "signature": "ok"
+    },
+    "exit": 0,
+    "firstFailedSeq": null,
+    "redacted": 0
+  },
+  "deleted-event": {
+    "checks": {
+      "commitment": "ok",
+      "form": "ok",
+      "key": "ok",
+      "sequence": "failed",
+      "signature": "ok"
+    },
+    "exit": 1,
+    "firstFailedSeq": 5,
+    "redacted": 0
+  },
+  "float-attribute": {
+    "checks": {
+      "commitment": "ok",
+      "form": "failed",
+      "key": "ok",
+      "sequence": "ok",
+      "signature": "ok"
+    },
+    "exit": 1,
+    "firstFailedSeq": 4,
+    "redacted": 0
+  },
+  "redacted-pii": {
+    "checks": {
+      "commitment": "ok",
+      "form": "ok",
+      "key": "ok",
+      "sequence": "ok",
+      "signature": "ok"
+    },
+    "exit": 0,
+    "firstFailedSeq": null,
+    "redacted": 1
+  },
+  "reordered": {
+    "checks": {
+      "commitment": "ok",
+      "form": "ok",
+      "key": "ok",
+      "sequence": "failed",
+      "signature": "ok"
+    },
+    "exit": 1,
+    "firstFailedSeq": 6,
+    "redacted": 0
+  },
+  "reset": {
+    "checks": {
+      "commitment": "ok",
+      "form": "ok",
+      "key": "ok",
+      "sequence": "ok",
+      "signature": "ok"
+    },
+    "exit": 0,
+    "firstFailedSeq": null,
+    "redacted": 0
+  },
+  "unknown-key": {
+    "checks": {
+      "commitment": "ok",
+      "form": "ok",
+      "key": "failed",
+      "sequence": "ok",
+      "signature": "ok"
+    },
+    "exit": 1,
+    "firstFailedSeq": 5,
+    "redacted": 0
+  },
+  "valid": {
+    "checks": {
+      "commitment": "ok",
+      "form": "ok",
+      "key": "ok",
+      "sequence": "ok",
+      "signature": "ok"
+    },
+    "exit": 0,
+    "firstFailedSeq": null,
+    "redacted": 0
+  }
+}

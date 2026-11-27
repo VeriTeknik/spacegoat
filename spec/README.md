@@ -7,6 +7,10 @@ Licence: Apache-2.0 ([`LICENSE`](LICENSE)), so that anyone may build a compatibl
 |---|---|
 | [`protocol.md`](protocol.md) | What a hub sends, how it signs it, what the service answers |
 | [`vectors/signing.json`](vectors/signing.json) | Canonical JSON cases, signed events, a signed request and a personal-data commitment |
+| [`export.md`](export.md) | The evidence export: a file an auditor can check without SpaceGoat's software, and the checks a verifier runs |
+| [`vectors/export/`](vectors/export/) | Ten export files, four valid (one plain, one with redacted personal data, one with a declared gap, one with a reset) and six each broken in one way, and the expected result for each in `expected.json` |
+| [`verify/spacegoat_verify.py`](verify/spacegoat_verify.py) | A reference verifier for exports in one file of standard-library Python, written from these documents alone; see [`verify/README.md`](verify/README.md) |
+| [`verify/test_verify.py`](verify/test_verify.py) | Its tests: every signing vector, RFC 8032 tests 1 to 3, every export vector and malformed input |
 
 ## The vectors
 
@@ -21,5 +25,10 @@ The bytes are stated here rather than in the file so that secret scanners do not
 
 The first four `events` entries are also pinned, with the same signatures, in the test suite of the hub service.
 An implementation that reproduces every `messageHex` and every `signature` agrees with the service byte for byte.
+
+The export vectors in `vectors/export/` use the same key, listed in each header as `vector-key-1`.
+`unknown-key.jsonl` has one event signed by a **second published test key**, named `vector-key-2`, whose 32 private bytes are 32, 33, 34, ... 63.
+That key is deliberately absent from the header; never register it anywhere real either.
+The files are built by `hub/tests/export_vectors.rs` from fixed values only (times, nonces, UUIDs), so the suite rebuilds every file and compares it byte for byte with the one here.
 
 The addresses in the vectors are documentation ranges (`192.0.2.0/24`, and hardware addresses `00-00-5E-00-53-xx`, RFC 7042); the names are under `.example`.
